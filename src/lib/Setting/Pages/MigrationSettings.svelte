@@ -53,21 +53,31 @@
         {language.migrationLoadUpstreamBackup}
     </Button>
 
-    <h3 class="mb-1 text-lg font-bold mt-6">{language.importSaveFolderHeader}</h3>
-
-    <p class="text-sm text-textcolor2 mb-2">{language.importSaveZipDesc}</p>
-    <Button onclick={ImportFromSaveZip} className="mt-1">
-        {language.importSaveZip}
-    </Button>
-
-    <p class="text-sm text-textcolor2 mt-3 mb-2">{language.cleanupMigratedDesc}</p>
-    <Button onclick={CleanupMigratedFiles} className="mt-1">
-        {language.cleanupMigratedFiles}
-    </Button>
-
-    <!-- Legacy backup options — collapsed by default ─────────────────── -->
+    <!-- Save folder import (collapsed by default) ────────────────────── -->
     <div class="mt-6">
+        <ShAccordion name={language.migrationSaveFolderAccordion} variant="card">
+            <p class="text-textcolor2 text-sm leading-relaxed mb-3">{language.migrationSaveFolderDesc}</p>
+
+            <p class="text-textcolor2 text-sm leading-relaxed mb-2">{language.importSaveZipDesc}</p>
+            <div class="flex flex-col gap-2">
+                <Button onclick={ImportFromSaveZip} className="w-full">
+                    {language.importSaveZip}
+                </Button>
+            </div>
+
+            <p class="text-textcolor2 text-sm leading-relaxed mt-4 mb-2">{language.cleanupMigratedDesc}</p>
+            <div class="flex flex-col gap-2">
+                <Button onclick={CleanupMigratedFiles} className="w-full">
+                    {language.cleanupMigratedFiles}
+                </Button>
+            </div>
+        </ShAccordion>
+    </div>
+
+    <!-- Legacy backup options (collapsed by default) ──────────────────── -->
+    <div class="mt-3">
         <ShAccordion name={language.migrationLegacyAccordion} variant="card">
+            <p class="text-textcolor2 text-sm leading-relaxed mb-3">{language.migrationLegacyDesc}</p>
             <div class="flex flex-col gap-2">
                 <Button
                     onclick={async () => {

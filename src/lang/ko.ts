@@ -1691,6 +1691,9 @@ export const languageKorean = {
     migrationInfoBackupMoved: "서버 백업, 로컬 백업, 자동 스냅샷 관리는 [시스템 → 백업] 탭으로 이동했습니다.",
     migrationGotoBackupTab: "백업 탭 열기",
     migrationLegacyAccordion: "기존 리스 방식으로 백업 (레거시)",
+    migrationLegacyDesc: "원본 RisuAI 호환 포맷으로 백업·내보내기를 수행하는 보조 기능들입니다. 일반적인 백업 작업은 백업 탭을 사용하세요.",
+    migrationSaveFolderAccordion: "노드리스에서 save 폴더 가져오기",
+    migrationSaveFolderDesc: "이전에 사용하던 노드리스/RisuAI 인스턴스의 save 폴더를 NodeOnly로 가져올 때 사용합니다.",
     migrationLoadUpstreamBackup: "원본 리스 로컬 백업 불러오기",
 
     // 시스템 → 백업 탭

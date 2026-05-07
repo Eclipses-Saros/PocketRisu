@@ -1729,7 +1729,10 @@ export const languageEnglish = {
     migrationDesc: "Move data between RisuAI (or compatible systems) and NodeOnly: import from upstream, or export to upstream-compatible format.",
     migrationInfoBackupMoved: "Server backups, local backups, and DB snapshots have moved to [System → Backups].",
     migrationGotoBackupTab: "Open Backups tab",
-    migrationLegacyAccordion: "Legacy backup options (RisuAI-style)",
+    migrationLegacyAccordion: "RisuAI-style backup (legacy)",
+    migrationLegacyDesc: "Helpers for backing up and exporting in upstream RisuAI-compatible formats. Use the Backups tab for everyday backup tasks.",
+    migrationSaveFolderAccordion: "Import save folder from NodeRisu",
+    migrationSaveFolderDesc: "Use this to bring data over from a NodeRisu / RisuAI save folder you used previously.",
     migrationLoadUpstreamBackup: "Load upstream RisuAI local backup",
 
     // System → Backups tab
