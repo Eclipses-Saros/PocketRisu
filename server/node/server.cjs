@@ -21,7 +21,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -251,6 +251,14 @@ function normalizeOrphanFolderIds(dbObj) {
 
 async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     const { createBackup = false, migrationResult = null } = options;
+    // Convert legacy REMOTE-block layouts to inline format before decoding.
+    // If migration ran it overwrote database.bin, so the caller's `raw` is
+    // stale and we re-read from KV. Idempotent on the no-op path.
+    const migration = await migrateRemoteBlocksIfNeeded();
+    if (migration.ran) {
+        const fresh = kvGet('database/database.bin');
+        if (fresh) raw = fresh;
+    }
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
     let needsPersist = false;
 
@@ -412,11 +420,99 @@ function reassembleFullDb(strippedDb) {
     return full;
 }
 
+// ─── Remote-block migration ─────────────────────────────────────────────────
+//
+// Background: upstream RisuAI (and very early NodeOnly versions) split each
+// character's data out of database.bin into a separate `remotes/<chaId>.local.bin`
+// file. The main database.bin then carries a REMOTE pointer block instead of the
+// character payload. The server-side RisuSaveDecoder used to skip those blocks
+// outright, so any decode pass — /api/read, /api/chat-content fallback, chat
+// store init — saw the character as missing and lost its chats.
+//
+// NodeOnly never wanted this split (`disableRemoteSaving` is hardcoded to
+// true), so we one-shot convert any leftover REMOTE blocks to inline raw blocks
+// the first time a server with such data boots. The reencoded database.bin is
+// stored in legacy msgpack format, which has no block structure at all — so
+// the REMOTE code path becomes unreachable for future decodes.
+//
+// Idempotent via a KV marker. The marker lives in KV (not on disk) so a backup
+// import — which wipes most KV prefixes and INSERTs a new database.bin — naturally
+// clears it, letting the new contents be re-evaluated.
+
+const REMOTE_MIGRATION_MARKER_KEY = 'migration/disable-remote-saving';
+const REMOTE_MIGRATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
+
+function isRemoteMigrationDone() {
+    const value = kvGet(REMOTE_MIGRATION_MARKER_KEY);
+    return value !== null && value.length > 0;
+}
+
+function markRemoteMigrationDone() {
+    kvSet(REMOTE_MIGRATION_MARKER_KEY, REMOTE_MIGRATION_MARKER_VALUE);
+}
+
+/**
+ * Convert any leftover REMOTE blocks in database.bin into inline raw blocks.
+ * Safe to call repeatedly: idempotent via KV marker.
+ */
+async function migrateRemoteBlocksIfNeeded() {
+    if (isRemoteMigrationDone()) return { ran: false, reason: 'already-done' };
+
+    const raw = kvGet('database/database.bin');
+    if (!raw) {
+        markRemoteMigrationDone();
+        return { ran: false, reason: 'no-database' };
+    }
+
+    if (!hasRemoteBlocks(raw)) {
+        markRemoteMigrationDone();
+        return { ran: false, reason: 'no-remote-blocks' };
+    }
+
+    logger.info('[Migration] REMOTE blocks detected in database.bin; converting to inline format');
+
+    // Pre-migration backup so a botched migration can be rolled back manually.
+    // Use a dedicated prefix — `database/dbbackup-` is on a 20-snapshot rotation
+    // whose timestamp parser would assign this entry ts=0 (because of the
+    // non-numeric suffix), making it the first to evict. The migration safety
+    // net must outlive ordinary backup churn.
+    const backupKey = `migration-backup/pre-remote-fix-${Date.now()}.bin`;
+    kvCopyValue('database/database.bin', backupKey);
+
+    const dbObj = await decodeRisuSave(raw, {
+        resolveRemote: async (name) => {
+            const value = kvGet(`remotes/${name}.local.bin`);
+            return value || null;
+        },
+    });
+
+    const reEncoded = encodeRisuSaveLegacy(dbObj, 'compression');
+
+    // Single transaction so swap + GC + marker move together.
+    sqliteDb.transaction(() => {
+        kvSet('database/database.bin', Buffer.from(reEncoded));
+        kvDelPrefix('remotes/');
+        markRemoteMigrationDone();
+    })();
+
+    // Reset in-memory caches whose contents were derived from the pre-migration
+    // bytes — next reader recomputes from the migrated database.bin.
+    invalidateDbCache();
+    dbEtag = null;
+
+    const characterCount = Array.isArray(dbObj.characters) ? dbObj.characters.length : 0;
+    logger.info(`[Migration] Remote-block migration complete. Inlined ${characterCount} character(s); pre-migration backup at ${backupKey}`);
+    return { ran: true, characterCount, backupKey };
+}
+
 /**
  * Ensure fullChatStore is initialized. Loads from disk if needed.
  */
 async function ensureChatStore() {
     if (fullChatStore) return;
+    // Run remote-block migration first so the decode below sees an inline DB.
+    // Idempotent — skipped on every subsequent call.
+    await migrateRemoteBlocksIfNeeded();
     const raw = kvGet('database/database.bin');
     if (!raw) {
         fullChatStore = new Map();
@@ -2032,6 +2128,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
     kvDelPrefix('coldstorage/');
+    // Allow remote-block migration to re-evaluate against the new database.bin.
+    // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
+    // format only — but a fresh import is a clear "data changed" signal.)
+    kvDel(REMOTE_MIGRATION_MARKER_KEY);
     clearEntities();
 
     try {
@@ -4303,6 +4403,11 @@ function clearExistingData() {
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
+    // Clear remote-block migration marker — newly imported database.bin may
+    // contain REMOTE blocks (it usually does, since save-folder imports
+    // preserve upstream's split-character format) and we want the migration
+    // to re-evaluate against the new contents on the next ensureChatStore.
+    kvDel(REMOTE_MIGRATION_MARKER_KEY);
     clearEntities();
 }
 
@@ -5070,14 +5175,26 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             await flushPendingDb();
             kvCopyValue(key, DB_BLOB_KEY);
             invalidateDbCache();
+            // Snapshot may pre-date the remote-block migration. Clear the marker
+            // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
+            // bytes instead of skipping based on the prior post-migration state.
+            kvDel(REMOTE_MIGRATION_MARKER_KEY);
             // Pre-warm chat store from the just-restored blob so subsequent
             // /api/read fetches and patch-sync baselines see the new data.
+            // Use decodeDatabaseWithPersistentChatIds so it runs the migration
+            // (now unmarked) and refreshes stale raw if the snapshot was a
+            // REMOTE-block format.
             try {
                 const raw = kvGet(DB_BLOB_KEY);
                 if (raw) {
-                    const dbObj = await decodeRisuSave(raw);
+                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
+                        createBackup: false,
+                    });
                     initChatStore(dbObj);
-                    dbEtag = computeBufferEtag(Buffer.from(raw));
+                    // Migration may have rewritten database.bin — etag must
+                    // reflect the post-migration bytes the next /api/read sends.
+                    const finalRaw = kvGet(DB_BLOB_KEY);
+                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
                 }
             } catch (e) {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
@@ -5760,6 +5877,7 @@ async function getHttpsOptions() {
 async function startServer() {
     try {
         await migrateInlaysToFilesystem();
+        await migrateRemoteBlocksIfNeeded();
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
         let server;
