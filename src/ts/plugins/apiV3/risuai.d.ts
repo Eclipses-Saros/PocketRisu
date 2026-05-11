@@ -298,8 +298,6 @@ interface DatabaseSubset {
     pluginCustomStorage?: {[key: string]: any};
     /** AI temperature setting (0-100) */
     temperature?: number;
-    /** Ask before removing messages */
-    askRemoval?: boolean;
     /** Maximum context tokens */
     maxContext?: number;
     /** Maximum response tokens */
@@ -1325,7 +1323,7 @@ interface RisuaiPluginAPI {
      * @returns DatabaseSubset object (limited to allowed keys) or null if consent not given
      *
      * Allowed keys: characters, modules, enabledModules, moduleIntergration,
-     * pluginV2, personas, plugins, pluginCustomStorage, temperature, askRemoval,
+     * pluginV2, personas, plugins, pluginCustomStorage, temperature,
      * maxContext, maxResponse, frequencyPenalty, PresensePenalty, theme,
      * textTheme, lineHeight, seperateModelsForAxModels, seperateModels,
      * customCSS, guiHTML, colorSchemeName, characterOrder, selectedPersona

@@ -741,7 +741,6 @@ await Risuai.setDatabaseLite(db);
 - `plugins`
 - `pluginCustomStorage`
 - `temperature`
-- `askRemoval`
 - `maxContext`
 - `maxResponse`
 - `frequencyPenalty`

@@ -159,8 +159,6 @@ export const helpKo = {
         "hypaV3EmbeddingRequestsPerMinute": "유사도 검색 시 분당 최대 임베딩 모델 요청 수입니다.",
         "hypaV3EmbeddingMaxConcurrent": "유사도 검색 시 최대 동시 임베딩 모델 요청 수입니다.",
         "useNodeOnlyScrollButton": "스크롤 시 채팅 메시지 간 이동 버튼을 표시합니다. 스크롤 중 나타나고 1.5초 후 사라집니다.",
-        "askRemoval": "채팅, 캐릭터, 페르소나, 프리셋 등을 삭제할 때 확인 다이얼로그를 띄웁니다. 비활성화하면 휴지통 아이콘을 누른 즉시 삭제됩니다.",
-        "instantRemove": "채팅 메시지 하나를 삭제할 때, 그 메시지 이후의 모든 메시지도 함께 삭제합니다. 끄면 해당 메시지만 삭제됩니다.",
         "confirmReroll": "메시지를 재생성(reroll)할 때 확인 다이얼로그를 띄웁니다. 실수로 응답을 날리는 것을 막고 싶을 때 켜세요.",
         "sendWithEnter": "Enter 키로 메시지를 전송합니다. 끄면 Shift+Enter가 전송 단축키가 되고, Enter는 줄바꿈이 됩니다.",
         "fixedChatTextarea": "채팅 입력창의 높이를 고정합니다. 끄면 입력 내용에 따라 입력창이 자동으로 늘어납니다.",

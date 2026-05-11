@@ -11,22 +11,6 @@ import { getCurrentChat, getDatabase, loadTogglesFromChat } from '../storage/dat
 export const accessibilitySettingsItems: SettingItem[] = [
     // Checkboxes
     {
-        id: 'acc.askRemoval',
-        type: 'check',
-        labelKey: 'askRemoval',
-        bindKey: 'askRemoval',
-        helpKey: 'askRemoval',
-        keywords: ['ask', 'removal', 'confirm', 'delete']
-    },
-    {
-        id: 'acc.instantRemove',
-        type: 'check',
-        labelKey: 'instantRemove',
-        bindKey: 'instantRemove',
-        helpKey: 'instantRemove',
-        keywords: ['instant', 'remove', 'delete']
-    },
-    {
         id: 'acc.confirmReroll',
         type: 'check',
         labelKey: 'confirmReroll',

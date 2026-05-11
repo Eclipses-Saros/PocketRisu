@@ -2,7 +2,6 @@
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
-    import { longpress } from "src/ts/gui/longtouch"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
@@ -15,7 +14,7 @@
     import { type Unsubscriber } from "svelte/store"
     import { v4 as uuidv4, v4 } from 'uuid'
     import { language } from "../../lang"
-    import { alertClear, alertConfirm, alertInput, alertRequestData, alertWait, notifyInfo } from "../../ts/alert"
+    import { alertClear, alertConfirm, alertConfirmMulti, alertInput, alertRequestData, alertWait, notifyInfo, notifySuccess, type AlertAction } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo } from "../../ts/storage/database.svelte"
@@ -85,33 +84,31 @@
     let translated = $state(false)
     let partialEditEnabled = $state(true)
 
-    async function rm(e:MouseEvent, rec?:boolean){
-        if(e.shiftKey){
-            let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
-            msg = msg.slice(0, idx)
-            DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
-            return
-        }
+    async function rm(){
+        const messages = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
+        const cascadeCount = messages.length - idx
 
-        const rm = DBState.db.askRemoval ? await alertConfirm(language.removeChat) : true
-        if(rm){
-            if(DBState.db.instantRemove || rec){
-                const r = await alertConfirm(language.instantRemoveConfirm)
-                let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
-                if(!r){
-                    msg = msg.slice(0, idx)
-                }
-                else{
-                    msg.splice(idx, 1)
-                }
-                DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
-            }
-            else{
-                let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
-                msg.splice(idx, 1)
-                DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
-            }
+        const actions: AlertAction[] = [
+            { label: language.removeMessageOnly, variant: 'destructive' },
+        ]
+        if(cascadeCount > 1){
+            actions.push({
+                label: language.removeMessageAndAfter.replace('{}', cascadeCount.toString()),
+                variant: 'destructive',
+            })
         }
+        const sel = await alertConfirmMulti(language.removeChat, actions)
+        if(sel < 0) return
+        let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
+        if(sel === 1){
+            msg = msg.slice(0, idx)
+            notifySuccess(language.messagesRemoved.replace('{}', cascadeCount.toString()))
+        }
+        else{
+            msg.splice(idx, 1)
+            notifySuccess(language.messageRemoved)
+        }
+        DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
     }
 
     async function edit(){
@@ -456,8 +453,8 @@
         {#if isComment}
             <button
                 class="flex items-center hover:text-red-400 transition-colors button-icon-remove"
-                onclick={async (e) => {
-                    await rm(e, true)
+                onclick={async () => {
+                    await rm()
                 }}
             >
                 <TrashIcon size={20} />
@@ -735,7 +732,7 @@
             {/if}
         </button>
     {/if}
-    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={(e) => rm(e, false)} use:longpress={(e) => rm(e, true)}>
+    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={rm}>
         <TrashIcon size={20}/>
 
         {#if showNames}

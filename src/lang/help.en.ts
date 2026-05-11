@@ -273,10 +273,6 @@ export const helpEn = {
             "Higher values use more chat context to determine similarity.",
         useNodeOnlyScrollButton:
             "Shows navigation buttons to jump between chat messages while scrolling. Buttons appear on scroll and fade out after 1.5 seconds.",
-        askRemoval:
-            "Show a confirmation dialog before deleting chats, characters, personas, presets, and similar items. When disabled, pressing the trash icon deletes immediately.",
-        instantRemove:
-            "When deleting one chat message, also delete every message after it. When off, only the selected message is deleted.",
         confirmReroll:
             "Ask for confirmation before regenerating a message. Enable this if you want protection against accidentally losing a response.",
         sendWithEnter:
