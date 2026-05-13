@@ -59,4 +59,4 @@ Tìm địa chỉ chính xác qua mục PC của bạn trong danh sách thiết 
 
 ---
 
-← [Quay lại README](../../README.vi.md)
+← [Quay lại README](../../i18n/README.vi.md)

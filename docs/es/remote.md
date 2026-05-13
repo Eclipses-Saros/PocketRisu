@@ -59,4 +59,4 @@ Encuentra la dirección exacta a través de la entrada de tu PC en la lista de d
 
 ---
 
-← [Volver al README](../../README.es.md)
+← [Volver al README](../../i18n/README.es.md)

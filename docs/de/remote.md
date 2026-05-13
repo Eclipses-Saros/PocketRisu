@@ -59,4 +59,4 @@ Finden Sie die genaue Adresse über den Eintrag Ihres PCs in der Geräteliste de
 
 ---
 
-← [Zurück zur README](../../README.de.md)
+← [Zurück zur README](../../i18n/README.de.md)

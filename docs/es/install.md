@@ -220,4 +220,4 @@ pnpm runserver
 
 ---
 
-← [Volver al README](../../README.es.md)
+← [Volver al README](../../i18n/README.es.md)

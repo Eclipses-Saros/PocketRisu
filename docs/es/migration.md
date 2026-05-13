@@ -68,4 +68,4 @@ Apropiado para grandes conjuntos de datos (varios GB o más). Requiere acceso di
 
 ---
 
-← [Volver al README](../../README.es.md)
+← [Volver al README](../../i18n/README.es.md)

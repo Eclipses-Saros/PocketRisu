@@ -59,4 +59,4 @@ https://我的PC名稱.tail某某.ts.net
 
 ---
 
-← [返回 README](../../README.zh-Hant.md)
+← [返回 README](../../i18n/README.zh-Hant.md)

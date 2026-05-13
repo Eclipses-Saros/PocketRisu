@@ -220,4 +220,4 @@ pnpm runserver
 
 ---
 
-← [Quay lại README](../../README.vi.md)
+← [Quay lại README](../../i18n/README.vi.md)

@@ -220,4 +220,4 @@ pnpm runserver
 
 ---
 
-← [返回 README](../../README.cn.md)
+← [返回 README](../../i18n/README.cn.md)

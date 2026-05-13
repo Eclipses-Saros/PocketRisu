@@ -68,4 +68,4 @@ Phù hợp cho dữ liệu lớn (vài GB trở lên). Yêu cầu quyền truy c
 
 ---
 
-← [Quay lại README](../../README.vi.md)
+← [Quay lại README](../../i18n/README.vi.md)

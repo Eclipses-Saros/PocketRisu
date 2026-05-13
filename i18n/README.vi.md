@@ -1,16 +1,18 @@
 <p align="center">
-  <img src="assets/pocketrisu-banner-1024.png" alt="PocketRisu" width="900" />
+  <img src="../assets/pocketrisu-banner-1024.png" alt="PocketRisu — Nền tảng Trò chuyện Nhập vai AI Tự lưu trữ" width="900" />
 </p>
 
+<h1 align="center">PocketRisu — Trò chuyện Nhập vai AI Tự lưu trữ</h1>
+
 <p align="center">
-  <a href="README.md">English</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.cn.md">简体中文</a> | <a href="README.es.md">Español</a> | <strong>Tiếng Việt</strong> | <a href="README.zh-Hant.md">繁體中文</a>
+  <a href="../README.md">English</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.cn.md">简体中文</a> | <a href="README.es.md">Español</a> | <strong>Tiếng Việt</strong> | <a href="README.zh-Hant.md">繁體中文</a>
 </p>
 
 <p align="center">
   <a href="https://github.com/PocketRisu/PocketRisu/releases">
     <img alt="Latest Release" src="https://img.shields.io/github/v/release/PocketRisu/PocketRisu?label=latest" />
   </a>
-  <a href="LICENSE">
+  <a href="../LICENSE">
     <img alt="License: GPL-3.0" src="https://img.shields.io/github/license/PocketRisu/PocketRisu" />
   </a>
   <a href="https://nodejs.org/">
@@ -18,15 +20,15 @@
   </a>
 </p>
 
-> 🌐 README này được dịch bằng máy. Để có thông tin chính xác nhất, vui lòng tham khảo phiên bản [tiếng Anh](README.md) hoặc [tiếng Hàn](README.ko.md). Hoan nghênh đóng góp.
+> 🌐 README này được dịch bằng máy. Để có thông tin chính xác nhất, vui lòng tham khảo phiên bản [tiếng Anh](../README.md) hoặc [tiếng Hàn](README.ko.md). Hoan nghênh đóng góp.
 
 PocketRisu là một nền tảng trò chuyện nhập vai AI tự lưu trữ, chạy trên PC hoặc máy chủ cá nhân của bạn và truy cập từ PC, máy tính bảng và điện thoại thông minh qua trình duyệt web.
 
 <p align="center">
   <table>
     <tr>
-      <td align="center"><img src="assets/screenshots/screenshot-pc-chat.png" alt="Trò chuyện trên PC" height="420" /></td>
-      <td align="center"><img src="assets/screenshots/screenshot-mobile-chat.png" alt="Trò chuyện trên di động" height="420" /></td>
+      <td align="center"><img src="../assets/screenshots/screenshot-pc-chat.png" alt="Trò chuyện trên PC" height="420" /></td>
+      <td align="center"><img src="../assets/screenshots/screenshot-mobile-chat.png" alt="Trò chuyện trên di động" height="420" /></td>
     </tr>
     <tr>
       <td align="center"><b>PC</b></td>
@@ -38,9 +40,9 @@ PocketRisu là một nền tảng trò chuyện nhập vai AI tự lưu trữ, c
 
 ## Tài liệu
 
-- [Hướng dẫn cài đặt](docs/vi/install.md)
-- [Hướng dẫn di chuyển từ RisuAI](docs/vi/migration.md)
-- [Truy cập từ xa](docs/vi/remote.md)
+- [Hướng dẫn cài đặt](../docs/vi/install.md)
+- [Hướng dẫn di chuyển từ RisuAI](../docs/vi/migration.md)
+- [Truy cập từ xa](../docs/vi/remote.md)
 
 
 ## Tương thích với RisuAI
@@ -52,7 +54,7 @@ PocketRisu được phát triển từ [RisuAI](https://github.com/kwaroran/Risu
 - Module, lorebook, preset
 - Tệp sao lưu (`.bin`) tương thích hai chiều
 
-Để di chuyển từ cài đặt RisuAI hiện có, xem [hướng dẫn di chuyển](docs/vi/migration.md).
+Để di chuyển từ cài đặt RisuAI hiện có, xem [hướng dẫn di chuyển](../docs/vi/migration.md).
 
 
 ## Tính năng
@@ -79,4 +81,4 @@ PocketRisu được phát triển từ [RisuAI](https://github.com/kwaroran/Risu
 
 ## Giấy phép
 
-[GPL-3.0](LICENSE)
+[GPL-3.0](../LICENSE)

@@ -1,16 +1,18 @@
 <p align="center">
-  <img src="assets/pocketrisu-banner-1024.png" alt="PocketRisu" width="900" />
+  <img src="../assets/pocketrisu-banner-1024.png" alt="PocketRisu — Selbst gehostete KI-Rollenspiel-Chat-Plattform" width="900" />
 </p>
 
+<h1 align="center">PocketRisu — Selbst gehostete KI-Rollenspiel-Chat-Plattform</h1>
+
 <p align="center">
-  <a href="README.md">English</a> | <a href="README.ko.md">한국어</a> | <strong>Deutsch</strong> | <a href="README.cn.md">简体中文</a> | <a href="README.es.md">Español</a> | <a href="README.vi.md">Tiếng Việt</a> | <a href="README.zh-Hant.md">繁體中文</a>
+  <a href="../README.md">English</a> | <a href="README.ko.md">한국어</a> | <strong>Deutsch</strong> | <a href="README.cn.md">简体中文</a> | <a href="README.es.md">Español</a> | <a href="README.vi.md">Tiếng Việt</a> | <a href="README.zh-Hant.md">繁體中文</a>
 </p>
 
 <p align="center">
   <a href="https://github.com/PocketRisu/PocketRisu/releases">
     <img alt="Latest Release" src="https://img.shields.io/github/v/release/PocketRisu/PocketRisu?label=latest" />
   </a>
-  <a href="LICENSE">
+  <a href="../LICENSE">
     <img alt="License: GPL-3.0" src="https://img.shields.io/github/license/PocketRisu/PocketRisu" />
   </a>
   <a href="https://nodejs.org/">
@@ -18,15 +20,15 @@
   </a>
 </p>
 
-> 🌐 Diese README wurde maschinell übersetzt. Für die genauesten Informationen siehe die [englische](README.md) oder [koreanische](README.ko.md) Version. Beiträge willkommen.
+> 🌐 Diese README wurde maschinell übersetzt. Für die genauesten Informationen siehe die [englische](../README.md) oder [koreanische](README.ko.md) Version. Beiträge willkommen.
 
 PocketRisu ist eine selbstgehostete KI-Rollenspiel-Chat-Plattform, die Sie auf Ihrem PC oder persönlichen Server betreiben und über einen Webbrowser von PC, Tablet und Smartphone aus nutzen.
 
 <p align="center">
   <table>
     <tr>
-      <td align="center"><img src="assets/screenshots/screenshot-pc-chat.png" alt="PC-Chat" height="420" /></td>
-      <td align="center"><img src="assets/screenshots/screenshot-mobile-chat.png" alt="Mobiler Chat" height="420" /></td>
+      <td align="center"><img src="../assets/screenshots/screenshot-pc-chat.png" alt="PC-Chat" height="420" /></td>
+      <td align="center"><img src="../assets/screenshots/screenshot-mobile-chat.png" alt="Mobiler Chat" height="420" /></td>
     </tr>
     <tr>
       <td align="center"><b>PC</b></td>
@@ -38,9 +40,9 @@ PocketRisu ist eine selbstgehostete KI-Rollenspiel-Chat-Plattform, die Sie auf I
 
 ## Dokumentation
 
-- [Installationsanleitung](docs/de/install.md)
-- [RisuAI-Migrationsleitfaden](docs/de/migration.md)
-- [Fernzugriff](docs/de/remote.md)
+- [Installationsanleitung](../docs/de/install.md)
+- [RisuAI-Migrationsleitfaden](../docs/de/migration.md)
+- [Fernzugriff](../docs/de/remote.md)
 
 
 ## RisuAI-Kompatibilität
@@ -52,7 +54,7 @@ PocketRisu ist von [RisuAI](https://github.com/kwaroran/RisuAI) abgeleitet und f
 - Module, Lorebooks, Presets
 - Backup-Dateien (`.bin`) mit bidirektionaler Kompatibilität
 
-Für die Migration von einer bestehenden RisuAI-Installation siehe den [Migrationsleitfaden](docs/de/migration.md).
+Für die Migration von einer bestehenden RisuAI-Installation siehe den [Migrationsleitfaden](../docs/de/migration.md).
 
 
 ## Funktionen
@@ -79,4 +81,4 @@ Für die Migration von einer bestehenden RisuAI-Installation siehe den [Migratio
 
 ## Lizenz
 
-[GPL-3.0](LICENSE)
+[GPL-3.0](../LICENSE)

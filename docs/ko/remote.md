@@ -57,4 +57,4 @@ https://내PC이름.tail어쩌구.ts.net
 
 ---
 
-← [README로 돌아가기](../../README.ko.md)
+← [README로 돌아가기](../../i18n/README.ko.md)

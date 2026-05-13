@@ -68,4 +68,4 @@ Geeignet für große Datenmengen (mehrere GB oder mehr). Erfordert direkten Date
 
 ---
 
-← [Zurück zur README](../../README.de.md)
+← [Zurück zur README](../../i18n/README.de.md)
