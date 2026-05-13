@@ -340,7 +340,7 @@ async function main() {
     log(`Update complete! ${current} → ${latest}`);
     log('');
     if (isWin) {
-        log('Restart by running PocketRisu.bat');
+        log('Restart by running PocketRisu.exe');
     } else {
         log('Restart by running ./start.sh');
     }
