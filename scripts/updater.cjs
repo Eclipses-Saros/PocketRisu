@@ -13,7 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const REPO = 'mrbart3885/Risuai-NodeOnly';
+const REPO = 'PocketRisu/PocketRisu';
 const ROOT = path.resolve(__dirname, '..');
 
 const isWin = process.platform === 'win32';
@@ -43,7 +43,7 @@ function httpsGet(url, redirectCount = 0) {
     return new Promise((resolve, reject) => {
         if (redirectCount > MAX_REDIRECTS) return reject(new Error('Too many redirects'));
         const get = url.startsWith('https') ? https.get : http.get;
-        get(url, { headers: { 'User-Agent': 'RisuAI-Updater' } }, (res) => {
+        get(url, { headers: { 'User-Agent': 'PocketRisu-Updater' } }, (res) => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 return httpsGet(res.headers.location, redirectCount + 1).then(resolve, reject);
             }
@@ -63,7 +63,7 @@ function downloadToFile(url, dest, redirectCount = 0) {
         if (redirectCount > MAX_REDIRECTS) return reject(new Error('Too many redirects'));
         const file = fs.createWriteStream(dest);
         const get = url.startsWith('https') ? https.get : http.get;
-        get(url, { headers: { 'User-Agent': 'RisuAI-Updater' } }, (res) => {
+        get(url, { headers: { 'User-Agent': 'PocketRisu-Updater' } }, (res) => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 file.close();
                 fs.unlinkSync(dest);
@@ -254,7 +254,7 @@ async function main() {
             log('Restoring files already moved to backup...');
             restoreBackupIntoRoot(backupDir, true);
             error(isWin
-                ? 'Update failed because some files are in use. Close the running RisuAI window/console first, then run update.bat again.'
+                ? 'Update failed because some files are in use. Close the running PocketRisu window/console first, then run update.bat again.'
                 : 'Update failed because some files are in use. Stop the running server first, then try again.');
         }
     }
@@ -340,7 +340,7 @@ async function main() {
     log(`Update complete! ${current} → ${latest}`);
     log('');
     if (isWin) {
-        log('Restart by running RisuAI.bat');
+        log('Restart by running PocketRisu.bat');
     } else {
         log('Restart by running ./start.sh');
     }
