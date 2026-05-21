@@ -582,7 +582,6 @@ export const languageChinese = {
     "textColor": "文字颜色",
     "classicRisu": "经典叡苏",
     "highcontrast": "高对比度",
-    "quickPreset": "可通过 Ctrl +（默认顺序编号）快速切换默认。",
     "requestretrys": "请求失败时重试",
     "utilityBot": "工具机器人",
     "ShowLog": "显示请求记录",

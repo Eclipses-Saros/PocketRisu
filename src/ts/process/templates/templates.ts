@@ -2,7 +2,7 @@ import type { botPreset } from "../../storage/database.svelte";
 import type { NAISettings } from "../models/nai";
 
 
-export const prebuiltPresets = {
+export const prebuiltPresets: Record<string, botPreset> = {
   "NAI": {
     "name": "Carefree",
     "apiType": "gemini-3-flash-preview",

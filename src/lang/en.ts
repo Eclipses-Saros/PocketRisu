@@ -652,7 +652,6 @@ export const languageEnglish = {
     textColor: "Text Color",
     classicRisu: "Classic Risu",
     highcontrast: "High-Contrast",
-    quickPreset: "You can quickly change preset by Ctrl + (Index of Preset)",
     requestretrys: "Request Retrys when Fail",
     utilityBot: "Utility Bot",
     ShowLog: "Show Request Logs",

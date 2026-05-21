@@ -14,6 +14,7 @@ import type { OobaChatCompletionRequestParams } from '../model/ooba';
 import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../process/memory/hypav3'
 import { normalizeTranslatorPresetState, type TranslatorPreset } from '../translator/presets'
 import { safeStructuredClone } from '../polyfill';
+import { v4 as uuidv4 } from 'uuid';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -158,9 +159,19 @@ export function setDatabase(data:Database){
         data.proxyKey = ""
     }
     if(checkNullish(data.botPresets)){
-        let defaultPreset = presetTemplate
+        let defaultPreset = createBotPresetTemplate()
         defaultPreset.name = "Default"
         data.botPresets = [defaultPreset]
+    }
+    // Ensure every botPreset has a stable string id (idempotent).
+    // Required for chat binding and new model preset system; physical store
+    // (db.botPresetsId index) remains the source of truth for active preset.
+    if (Array.isArray(data.botPresets)) {
+        for (const preset of data.botPresets) {
+            if (preset && !preset.id) {
+                preset.id = uuidv4()
+            }
+        }
     }
     if(checkNullish(data.botPresetsId)){
         data.botPresetsId = 0
@@ -929,6 +940,11 @@ export interface Database{
     waifuWidth:number
     waifuWidth2:number
     botPresets:botPreset[]
+    /**
+     * @deprecated New code: use getActiveBotPreset() / setActiveBotPresetById() helpers.
+     * Kept as the physical store for upstream RisuAI .bin backup compatibility.
+     * Reorder/delete must go through withStableActivePreset() to keep this in sync.
+     */
     botPresetsId:number
     themePresets:themePreset[]
     themePresetsId:number
@@ -1565,6 +1581,7 @@ export function purgeUnsupportedGroupChats(db: Database): number {
     return before - db.characters.length
 }
 export interface botPreset{
+    id?: string
     name?:string
     apiType?: string
     openAIKey?: string
@@ -2055,6 +2072,7 @@ export const defaultOoba:OobaSettings = {
 
 
 export const presetTemplate:botPreset = {
+    id: '',
     name: "New Preset",
     apiType: "gemini-3-flash-preview",
     openAIKey: "",
@@ -2164,6 +2182,74 @@ export const defaultSdDataFunc = () =>{
     return safeStructuredClone(defaultSdData)
 }
 
+// ─────────────────────────────────────────────────────────────
+// botPreset id-based helper layer
+//
+// Physical storage stays index-based (db.botPresetsId: number) for upstream
+// RisuAI .bin backup compatibility. New code (chat binding etc.) should use
+// these helpers so reorder/delete operations stay stable: withStableActivePreset
+// preserves the active preset by id while the underlying array is mutated.
+// ─────────────────────────────────────────────────────────────
+
+export function createBotPresetTemplate(): botPreset {
+    const preset = safeStructuredClone(presetTemplate)
+    preset.id = uuidv4()
+    return preset
+}
+
+export function getActiveBotPreset(): botPreset | null {
+    const db = getDatabase()
+    if (!Array.isArray(db.botPresets) || db.botPresetsId < 0 || db.botPresetsId >= db.botPresets.length) {
+        return null
+    }
+    return db.botPresets[db.botPresetsId] ?? null
+}
+
+export function getActiveBotPresetId(): string | undefined {
+    return getActiveBotPreset()?.id || undefined
+}
+
+export function getBotPresetById(id: string): botPreset | null {
+    const db = getDatabase()
+    if (!id || !Array.isArray(db.botPresets)) return null
+    return db.botPresets.find((p) => p?.id === id) ?? null
+}
+
+export function getBotPresetIndexById(id: string): number {
+    const db = getDatabase()
+    if (!id || !Array.isArray(db.botPresets)) return -1
+    return db.botPresets.findIndex((p) => p?.id === id)
+}
+
+export function setActiveBotPresetById(id: string | undefined): void {
+    const db = getDatabase()
+    if (id === undefined) {
+        db.botPresetsId = -1
+        return
+    }
+    const idx = getBotPresetIndexById(id)
+    if (idx >= 0) {
+        db.botPresetsId = idx
+    }
+}
+
+/**
+ * Run a botPresets mutation (reorder / splice) while preserving which preset
+ * is active by its stable string id. Replaces ad-hoc index-recalculation code
+ * paths and keeps db.botPresetsId in sync with the active preset's new index.
+ */
+export function withStableActivePreset(fn: () => void): void {
+    const activeId = getActiveBotPresetId()
+    fn()
+    const db = getDatabase()
+    if (activeId) {
+        const newIdx = getBotPresetIndexById(activeId)
+        db.botPresetsId = newIdx >= 0 ? newIdx : 0
+    } else if (Array.isArray(db.botPresets) && db.botPresetsId >= db.botPresets.length) {
+        db.botPresetsId = Math.max(0, db.botPresets.length - 1)
+    }
+}
+
 export function saveCurrentPreset(){
     let db = getDatabase()
     let pres = db.botPresets
@@ -2172,6 +2258,7 @@ export function saveCurrentPreset(){
         return
     }
     const savedPreset:botPreset =  {
+        id: pres[db.botPresetsId]?.id || uuidv4(),
         name: pres[db.botPresetsId].name,
         apiType: db.apiType,
         openAIKey: db.openAIKey,
@@ -2268,6 +2355,7 @@ export function copyPreset(id:number){
     let db = getDatabase()
     let pres = db.botPresets
     const newPres = safeStructuredClone(pres[id])
+    newPres.id = uuidv4()
     newPres.name += " Copy"
     db.botPresets.push(newPres)
 }
@@ -2710,6 +2798,7 @@ export async function importPreset(f:{
         pr.NAISettings.mirostat_lr = pre.parameters.mirostat_lr
         pr.NAISettings.mirostat_tau = pre.parameters.mirostat_tau
         pr.name = pre.name ?? "Imported"
+        pr.id = uuidv4()
         db.botPresets.push(pr)
         return
     }
@@ -2815,10 +2904,12 @@ export async function importPreset(f:{
             })
         }
         pr.name = "Imported ST Preset"
+        pr.id = uuidv4()
         db.botPresets.push(pr)
         return
     }
     pre.name ??= "Imported"
+    pre.id = uuidv4()
     if(!Array.isArray(db.botPresets)){
         db.botPresets = []
     }

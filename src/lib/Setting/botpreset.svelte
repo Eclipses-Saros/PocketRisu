@@ -1,7 +1,8 @@
 <script lang="ts">
     import { alertCardExport, alertConfirm, notifyError } from "../../ts/alert";
     import { language } from "../../lang";
-    import { changeToPreset, copyPreset, downloadPreset, importPreset } from "../../ts/storage/database.svelte";
+    import { changeToPreset, copyPreset, downloadPreset, importPreset, saveCurrentPreset, withStableActivePreset } from "../../ts/storage/database.svelte";
+    import { v4 as uuidv4 } from "uuid";
     import { DBState } from 'src/ts/stores.svelte';
     import { CopyIcon, Share2Icon, PencilIcon, HardDriveUploadIcon, PlusIcon, TrashIcon, XIcon, GitCompare } from "@lucide/svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
@@ -27,23 +28,14 @@
         if (fromIndex === toIndex) return;
         if (fromIndex < 0 || toIndex < 0 || fromIndex >= DBState.db.botPresets.length || toIndex > DBState.db.botPresets.length) return;
 
-        let botPresets = [...DBState.db.botPresets];
-        const movedItem = botPresets.splice(fromIndex, 1)[0];
-        if (!movedItem) return;
-
-        const adjustedToIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
-        botPresets.splice(adjustedToIndex, 0, movedItem);
-
-        const currentId = DBState.db.botPresetsId;
-        if (currentId === fromIndex) {
-            DBState.db.botPresetsId = adjustedToIndex;
-        } else if (fromIndex < currentId && adjustedToIndex >= currentId) {
-            DBState.db.botPresetsId = currentId - 1;
-        } else if (fromIndex > currentId && adjustedToIndex <= currentId) {
-            DBState.db.botPresetsId = currentId + 1;
-        }
-
-        DBState.db.botPresets = botPresets;
+        withStableActivePreset(() => {
+            const botPresets = [...DBState.db.botPresets];
+            const movedItem = botPresets.splice(fromIndex, 1)[0];
+            if (!movedItem) return;
+            const adjustedToIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
+            botPresets.splice(adjustedToIndex, 0, movedItem);
+            DBState.db.botPresets = botPresets;
+        });
     }
 
     function handlePresetDrop(targetIndex: number, e) {
@@ -170,9 +162,6 @@
                 {#if editMode}
                     <TextInput bind:value={DBState.db.botPresets[i].name} placeholder="string" padding={false}/>
                 {:else}
-                    {#if i < 9}
-                        <span class="w-2 text-center mr-2 text-textcolor2">{i + 1}</span>
-                    {/if}
                     {#if preset.image}
                         <img src={preset.image} alt="icon" class="mr-2 min-w-6 min-h-6 w-6 h-6 rounded-md" decoding="async"/>
 
@@ -225,11 +214,24 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${preset.name}`)
                         if(d){
-                            changeToPreset(0)
-                            let botPresets = DBState.db.botPresets
-                            botPresets.splice(i, 1)
-                            DBState.db.botPresets = botPresets
-                            changeToPreset(0, false)
+                            // Flush in-flight top-level edits (db.mainPrompt etc.) into
+                            // the currently active preset BEFORE mutating the array —
+                            // otherwise editing-while-deleting another preset would lose
+                            // the active preset's pending changes (no auto-save calls
+                            // saveCurrentPreset; only copy/change/download do).
+                            saveCurrentPreset()
+                            const removingActive = i === DBState.db.botPresetsId
+                            withStableActivePreset(() => {
+                                const botPresets = DBState.db.botPresets
+                                botPresets.splice(i, 1)
+                                DBState.db.botPresets = botPresets
+                            })
+                            if (removingActive) {
+                                // Active preset was deleted — reset to slot 0 without
+                                // re-saving (save was just done; the active preset no
+                                // longer exists in the array).
+                                changeToPreset(0, false)
+                            }
                         }
                     }} onkeydown={(e) => {
                         if(e.key === 'Enter' && e.currentTarget instanceof HTMLElement){
@@ -266,6 +268,7 @@
             <button class="text-textcolor2 hover:text-primary cursor-pointer mr-1" onclick={() => {
                 let botPresets = DBState.db.botPresets
                 let newPreset = safeStructuredClone(prebuiltPresets.OAI2)
+                newPreset.id = uuidv4()
                 newPreset.name = `New Preset`
                 botPresets.push(newPreset)
 
@@ -284,7 +287,6 @@
                 <PencilIcon size={18}/>
             </button>
         </div>
-        <span class="text-textcolor2 text-sm">{language.quickPreset}</span>
     </div>
 </div>
 

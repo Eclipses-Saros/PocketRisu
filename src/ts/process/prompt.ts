@@ -1,5 +1,6 @@
 import { tokenizeAccurate } from "../tokenizer";
 import { getDatabase, presetTemplate, setDatabase } from "../storage/database.svelte";
+import { v4 as uuidv4 } from "uuid";
 import { alertError, notifySuccess } from "../alert";
 import type { OobaChatCompletionRequestParams } from "../model/ooba";
 
@@ -275,6 +276,7 @@ export const OobaParams = [
 
 export function promptConvertion(files:{ name: string, content: string, type:string }[]){
     let preset = safeStructuredClone(presetTemplate)
+    preset.id = uuidv4()
     let instData = {
         "system_prompt": "",
         "input_sequence": "",

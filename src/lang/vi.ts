@@ -582,7 +582,6 @@ export const languageVietnamese = {
     "textColor": "Văn bản màu",
     "classicRisu": "Risu cổ điển",
     "highcontrast": "Độ tương phản cao",
-    "quickPreset": "Bạn có thể nhanh chóng thay đổi cài đặt trước bằng Ctrl + (Chỉ mục cài sẵn)",
     "requestretrys": "Yêu cầu thử lại khi thất bại",
     "utilityBot": "Bot tiện ích",
     "ShowLog": "Hiển thị nhật ký yêu cầu",

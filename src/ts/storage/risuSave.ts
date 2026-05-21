@@ -1,6 +1,6 @@
 import { Packr, Unpackr, decode } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
-import { getDatabase, presetTemplate, type Database } from "./database.svelte";
+import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
 
@@ -577,7 +577,7 @@ export class RisuSaveDecoder {
         }
         //to fix botpreset bugs
         if(!Array.isArray(db.botPresets) || db.botPresets.length === 0){
-            db.botPresets = [presetTemplate]
+            db.botPresets = [createBotPresetTemplate()]
             db.botPresetsId = 0
         }
         console.log('Decoded RisuSave data', db);

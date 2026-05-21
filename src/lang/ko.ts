@@ -646,7 +646,6 @@ export const languageKorean = {
     "textColor": "텍스트 색상",
     "classicRisu": "클래식 Risu",
     "highcontrast": "고대비",
-    "quickPreset": "Ctrl + (프리셋 번호)로 프리셋을 빠르게 변경할 수 있습니다",
     "requestretrys": "실패 시 재요청 횟수",
     "utilityBot": "유틸리티 봇",
     "ShowLog": "리퀘스트 로그 보기",

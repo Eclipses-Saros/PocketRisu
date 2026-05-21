@@ -582,7 +582,6 @@ export const languageGerman = {
     "textColor": "Textfarbe",
     "classicRisu": "Klassisches Risu",
     "highcontrast": "Hoher Kontrast",
-    "quickPreset": "Sie können die Voreinstellung schnell ändern mit Strg + (Index der Voreinstellung)",
     "requestretrys": "Anforderungsversuche bei Fehlschlag",
     "utilityBot": "Dienstbot",
     "ShowLog": "Anforderungsprotokolle anzeigen",

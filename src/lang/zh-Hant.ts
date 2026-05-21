@@ -640,7 +640,6 @@ export const languageChineseTraditional = {
     "textColor": "文字顏色",
     "classicRisu": "經典 Risu",
     "highcontrast": "高對比度",
-    "quickPreset": "可透過 Ctrl +（序號）快速切換預設。",
     "requestretrys": "請求失敗時重試",
     "utilityBot": "工具機器人",
     "ShowLog": "顯示請求記錄",

@@ -1,6 +1,6 @@
 import { get } from "svelte/store"
-import { alertMd, alertSelect, notifyInfo, alertWait, doingAlert, alertRequestLogs } from "./alert"
-import { changeToPreset as changeToPreset2, getDatabase  } from "./storage/database.svelte"
+import { alertMd, alertSelect, alertWait, doingAlert, alertRequestLogs } from "./alert"
+import { getDatabase  } from "./storage/database.svelte"
 import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
@@ -176,64 +176,6 @@ export function initHotkey(){
         }
 
 
-        if(ev.ctrlKey){
-            switch (ev.key){
-                case "1":{
-                    changeToPreset(0)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "2":{
-                    changeToPreset(1)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "3":{
-                    changeToPreset(2)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "4":{
-                    changeToPreset(3)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "5":{
-                    changeToPreset(4)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "6":{
-                    changeToPreset(5)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "7":{
-                    changeToPreset(6)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "8":{
-                    changeToPreset(7)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "9":{
-                    changeToPreset(8)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-            }
-        }
         if(ev.key === 'Escape'){
             // 모달(AlertComp 팝업 또는 Sh*Dialog)이 열려있을 땐 전역 ESC 동작을 중단한다.
             // bits-ui Dialog는 preventDefault만 하고 stopPropagation은 하지 않기 때문에,
@@ -418,15 +360,4 @@ export function initMobileGesture(){
     }, {
         passive: true
     })
-}
-
-function changeToPreset(num:number){
-    if(!doingAlert()){
-        let db = getDatabase()
-        let pres = db.botPresets
-        if(pres.length > num){
-            notifyInfo(`Changed to Preset: ${pres[num].name}`)
-            changeToPreset2(num)
-        }
-    }
 }
