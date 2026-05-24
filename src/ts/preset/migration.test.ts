@@ -1,6 +1,8 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { LLMFormat } from '../model/types'
-import { analyzeModelPresetMigration } from './migration'
+import { analyzeModelPresetMigration, applyModelPresetMigration } from './migration'
+import type { ModelPresetMigrationApplyTarget } from './migration'
+import type { MigrationReport } from './types'
 
 describe('analyzeModelPresetMigration', () => {
     test('plans custom OpenAI-compatible models without leaking key material into ids', () => {
@@ -284,7 +286,7 @@ describe('analyzeModelPresetMigration', () => {
     })
 
     test('does not mutate input during dry-run', () => {
-        const db = {
+        const db: ModelPresetMigrationApplyTarget = {
             customModels: [{
                 id: 'xcustom:::main',
                 internalId: 'model',
@@ -303,5 +305,235 @@ describe('analyzeModelPresetMigration', () => {
         analyzeModelPresetMigration(db)
 
         expect(JSON.stringify(db)).toBe(before)
+    })
+
+    test('applies migration report without storing secrets in migration summary', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            customModels: [{
+                id: 'xcustom:::main',
+                internalId: 'gpt-custom',
+                url: 'https://example.test/v1/chat/completions',
+                format: LLMFormat.OpenAICompatible,
+                key: 'sk-secret',
+                name: 'Main Custom',
+                params: '',
+                flags: [],
+            }],
+            aiModel: 'xcustom:::main',
+            botPresets: [{
+                id: 'bot-a',
+                aiModel: 'pluginmodel:::cpm',
+            }],
+        }
+        const report = analyzeModelPresetMigration(db)
+
+        applyModelPresetMigration(db, report)
+
+        expect(db.modelPresets).toHaveLength(1)
+        expect(db.modelPresets?.[0]).toMatchObject({
+            id: report.createdModelPresets[0].id,
+            migrationSource: {
+                sourceKind: 'custom',
+                sourcePath: 'customModels.xcustom:::main',
+            },
+            apiKeyRef: expect.any(String),
+            profileSnapshot: {
+                profileId: 'openai-compatible:custom',
+                adapterKind: 'openai-compatible',
+                modelId: 'gpt-custom',
+            },
+        })
+        expect(db.modelBinding).toEqual({ kind: 'modelPreset', id: report.createdModelPresets[0].id })
+        expect(db.botPresets?.[0].modelBinding).toEqual({ kind: 'pluginModel', id: 'pluginmodel:::cpm' })
+        expect(Object.values(db.apiKeyPool ?? {})).toEqual([
+            expect.objectContaining({
+                provider: 'openai-compatible:custom',
+                key: 'sk-secret',
+            }),
+        ])
+        expect(db.modelPresetMigrationVersion).toBe(1)
+        expect(JSON.stringify(db.modelPresetMigrationReport)).not.toContain('sk-secret')
+        expect(JSON.stringify(report)).not.toContain('sk-secret')
+    })
+
+    test('applies task bindings and avoids numeric owner id collisions', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            aiModel: 'gpt-4o',
+            seperateModelsForAxModels: true,
+            seperateModels: {
+                memory: 'gemini-2.5-pro',
+                translate: 'pluginmodel:::translator',
+            },
+            botPresets: [{
+                name: 'No Id',
+                aiModel: 'gpt-4o-mini',
+            }, {
+                id: '0',
+                name: 'Looks Like Numeric Index',
+                aiModel: 'gpt-4o',
+            }],
+        }
+        const report = analyzeModelPresetMigration(db)
+
+        applyModelPresetMigration(db, report)
+
+        expect(db.taskModelBindings?.memory).toEqual({
+            kind: 'modelPreset',
+            id: report.createdModelPresets.find((preset) => preset.sourcePath === 'db.seperateModels.memory')?.id,
+        })
+        expect(db.taskModelBindings?.translate).toEqual({ kind: 'pluginModel', id: 'pluginmodel:::translator' })
+        expect(report.botPresetBindings.find((binding) => binding.sourcePath === 'botPresets.index:0.aiModel')).toMatchObject({
+            ownerId: 'index:0',
+            binding: { kind: 'modelPreset', id: expect.any(String) },
+        })
+        expect(db.botPresets?.[0].modelBinding).toEqual({
+            kind: 'modelPreset',
+            id: report.createdModelPresets.find((preset) => preset.sourcePath === 'botPresets.index:0.aiModel')?.id,
+        })
+        expect(db.botPresets?.[1].modelBinding).toEqual({
+            kind: 'modelPreset',
+            id: report.createdModelPresets.find((preset) => preset.sourcePath === 'botPresets.0.aiModel')?.id,
+        })
+    })
+
+    test('reapplying migration upserts by source path instead of duplicating presets or keys', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            customModels: [{
+                id: 'xcustom:::main',
+                internalId: 'model-a',
+                url: 'https://example.test/v1/chat/completions',
+                format: LLMFormat.OpenAICompatible,
+                key: 'sk-secret-a',
+                name: 'Main Custom',
+                params: '',
+                flags: [],
+            }],
+            aiModel: 'xcustom:::main',
+        }
+        const firstReport = analyzeModelPresetMigration(db)
+        vi.useFakeTimers()
+        vi.setSystemTime(1000)
+        applyModelPresetMigration(db, firstReport)
+        const keyId = Object.keys(db.apiKeyPool ?? {})[0]
+        if (keyId && db.apiKeyPool) {
+            db.apiKeyPool[keyId].name = 'User Named Key'
+            db.apiKeyPool[keyId].createdAt = 123
+        }
+        if (db.modelPresets?.[0]) {
+            db.modelPresets[0].notes = 'user note'
+            db.modelPresets[0].orphanValues = { oldField: true }
+            db.modelPresets[0].inlineCredential = { kind: 'external' }
+            db.modelPresets[0].fallbackModelPresetIds = ['fallback-a']
+            db.modelPresets[0].pinned = true
+            db.modelPresets[0].order = 7
+        }
+
+        db.customModels[0].internalId = 'model-b'
+        db.customModels[0].key = 'sk-secret-b'
+        const secondReport = analyzeModelPresetMigration(db)
+        vi.setSystemTime(2000)
+        applyModelPresetMigration(db, secondReport)
+
+        expect(db.modelPresets).toHaveLength(1)
+        expect(db.modelPresets?.[0]).toMatchObject({
+            id: secondReport.createdModelPresets[0].id,
+            userValues: {
+                endpointUrl: 'https://example.test/v1/chat/completions',
+                modelId: 'model-b',
+                params: '',
+                flags: [],
+            },
+            notes: 'user note',
+            orphanValues: { oldField: true },
+            inlineCredential: { kind: 'external' },
+            fallbackModelPresetIds: ['fallback-a'],
+            pinned: true,
+            order: 7,
+            createdAt: 1000,
+            updatedAt: 2000,
+        })
+        expect(db.modelBinding).toEqual({ kind: 'modelPreset', id: secondReport.createdModelPresets[0].id })
+        expect(Object.values(db.apiKeyPool ?? {})).toHaveLength(1)
+        expect(Object.values(db.apiKeyPool ?? {})[0]).toMatchObject({
+            name: 'User Named Key',
+            key: 'sk-secret-b',
+            createdAt: 123,
+            updatedAt: 2000,
+        })
+        vi.useRealTimers()
+    })
+
+    test('applies chat bindings from a report', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            characters: [{
+                chats: [{
+                    id: 'chat-a',
+                    name: 'Chat A',
+                }],
+            }],
+        }
+        const report: MigrationReport = {
+            version: 1,
+            createdModelPresets: [],
+            globalBindings: [],
+            botPresetBindings: [],
+            chatBindings: [{
+                scope: 'chat',
+                ownerId: 'chat-a',
+                targetTask: 'memory',
+                sourcePath: 'characters.0.chats.0.memory',
+                binding: { kind: 'modelPreset', id: 'preset-memory' },
+            }, {
+                scope: 'chat',
+                ownerId: '0.0',
+                targetTask: 'submodel',
+                sourcePath: 'characters.0.chats.0.subModel',
+                binding: { kind: 'pluginModel', id: 'pluginmodel:::sub' },
+            }],
+            pluginBindings: [],
+            manualRequired: [],
+            skippedBias: [],
+            preservedLegacyFields: [],
+            warnings: [],
+        }
+
+        applyModelPresetMigration(db, report)
+
+        expect(db.characters?.[0].chats?.[0].taskModelBindings?.memory).toEqual({ kind: 'modelPreset', id: 'preset-memory' })
+        expect(db.characters?.[0].chats?.[0].subModelBinding).toEqual({ kind: 'pluginModel', id: 'pluginmodel:::sub' })
+    })
+
+    test('applies manualRequired bindings for unsupported legacy models', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            aiModel: 'novelai',
+        }
+        const report = analyzeModelPresetMigration(db)
+
+        applyModelPresetMigration(db, report)
+
+        expect(db.modelBinding).toEqual({
+            kind: 'manualRequired',
+            reason: 'Unsupported legacy model: novelai',
+            legacySource: 'db.aiModel',
+        })
+        expect(db.modelPresetMigrationReport).toMatchObject({
+            manualRequiredCount: 1,
+            createdModelPresetCount: 0,
+        })
+    })
+
+    test('applies bias-only migration summary without creating presets', () => {
+        const db: ModelPresetMigrationApplyTarget = {
+            bias: [['token', 1]],
+        }
+        const report = analyzeModelPresetMigration(db)
+
+        applyModelPresetMigration(db, report)
+
+        expect(db.modelPresets).toEqual([])
+        expect(db.modelPresetMigrationReport).toMatchObject({
+            createdModelPresetCount: 0,
+            skippedBiasCount: 1,
+        })
     })
 })

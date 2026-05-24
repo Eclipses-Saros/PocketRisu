@@ -1,11 +1,19 @@
 import { LLMFormat } from '../model/types'
 import type {
+    ApiKeyPoolEntry,
     ManualMigrationItem,
     MigrationBindingScope,
     MigrationReport,
+    ModelBindingFields,
     ModelBinding,
+    ModelPreset,
+    ModelPresetMigrationSummary,
+    PlannedBinding,
     PlannedModelPreset,
+    PlannedPluginBinding,
+    ResolvedModelProfileSnapshot,
     ResolvedTask,
+    TaskModelBindings,
 } from './types'
 
 type LegacyCustomModel = {
@@ -97,6 +105,31 @@ type BindingTarget = {
     sourcePath: string
 }
 
+type MutableModelBindingFields = {
+    modelBinding?: ModelBindingFields['modelBinding']
+    subModelBinding?: ModelBindingFields['subModelBinding']
+    taskModelBindings?: TaskModelBindings
+}
+
+type MutableChat = MutableModelBindingFields & {
+    id?: string
+    name?: string
+}
+
+export type ModelPresetMigrationApplyTarget = ModelPresetMigrationInput & MutableModelBindingFields & {
+    modelPresets?: ModelPreset[]
+    apiKeyPool?: Record<string, ApiKeyPoolEntry>
+    modelPresetMigrationVersion?: number
+    modelPresetMigrationAppliedAt?: number
+    modelPresetMigrationReport?: ModelPresetMigrationSummary
+    botPresets?: Array<LegacyBotPreset & MutableModelBindingFields>
+    characters?: Array<{
+        chats?: MutableChat[]
+    }>
+}
+
+export type MigrationSnapshotResolver = (planned: PlannedModelPreset) => ResolvedModelProfileSnapshot | undefined
+
 export function analyzeModelPresetMigration(db: ModelPresetMigrationInput): MigrationReport {
     const report: MigrationReport = {
         version: 1,
@@ -161,6 +194,44 @@ export function analyzeModelPresetMigration(db: ModelPresetMigrationInput): Migr
     return report
 }
 
+export function applyModelPresetMigration(
+    db: ModelPresetMigrationApplyTarget,
+    report: MigrationReport,
+    resolveSnapshot?: MigrationSnapshotResolver,
+): void {
+    if (report.version !== 1) {
+        throw new Error(`Unsupported ModelPreset migration report version: ${report.version}`)
+    }
+
+    const appliedAt = Date.now()
+    db.modelPresets = Array.isArray(db.modelPresets) ? db.modelPresets : []
+    db.apiKeyPool = db.apiKeyPool && typeof db.apiKeyPool === 'object' && !Array.isArray(db.apiKeyPool)
+        ? db.apiKeyPool
+        : {}
+
+    for (const planned of report.createdModelPresets) {
+        upsertApiKeyPoolEntry(db, planned, appliedAt)
+        upsertModelPreset(db, planned, appliedAt, resolveSnapshot)
+    }
+
+    for (const binding of report.globalBindings) {
+        applyScopedBinding(db, binding)
+    }
+    for (const binding of report.botPresetBindings) {
+        applyScopedBinding(db, binding)
+    }
+    for (const binding of report.chatBindings) {
+        applyScopedBinding(db, binding)
+    }
+    for (const binding of report.pluginBindings) {
+        applyScopedBinding(db, binding)
+    }
+
+    db.modelPresetMigrationVersion = report.version
+    db.modelPresetMigrationAppliedAt = appliedAt
+    db.modelPresetMigrationReport = summarizeMigrationReport(report, appliedAt)
+}
+
 function addGlobalBindings(
     report: MigrationReport,
     plannedById: Map<string, PlannedModelPreset>,
@@ -201,7 +272,7 @@ function addBotPresetBindings(
     db: ModelPresetMigrationInput,
 ): void {
     for (const [index, preset] of (db.botPresets ?? []).entries()) {
-        const ownerId = preset.id || String(index)
+        const ownerId = botPresetOwnerId(preset, index)
         const sourcePrefix = `botPresets.${ownerId}`
 
         if (hasPresetReverseProxyConfig(preset)) {
@@ -559,6 +630,229 @@ function addDeprecatedItems(report: MigrationReport, db: ModelPresetMigrationInp
             })
         }
     }
+}
+
+function upsertApiKeyPoolEntry(
+    db: ModelPresetMigrationApplyTarget,
+    planned: PlannedModelPreset,
+    now: number,
+): void {
+    const credentialPath = planned.credentialSource?.sourcePath
+    if (!credentialPath || !db.apiKeyPool) return
+
+    const key = readLegacyStringAtPath(db, credentialPath)
+    if (!key) return
+
+    const id = apiKeyPoolIdForSourcePath(credentialPath)
+    const existing = db.apiKeyPool[id]
+    db.apiKeyPool[id] = {
+        id,
+        name: existing?.name || `Migrated ${credentialPath}`,
+        provider: existing?.provider || planned.profileId,
+        key,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+    }
+}
+
+function upsertModelPreset(
+    db: ModelPresetMigrationApplyTarget,
+    planned: PlannedModelPreset,
+    now: number,
+    resolveSnapshot?: MigrationSnapshotResolver,
+): void {
+    if (!db.modelPresets) return
+
+    const existingIndex = db.modelPresets.findIndex((preset) =>
+        preset.migrationSource?.sourcePath === planned.sourcePath ||
+        preset.id === planned.id
+    )
+    const existing = existingIndex >= 0 ? db.modelPresets[existingIndex] : undefined
+    const apiKeyRef = apiKeyPoolRefForPlanned(db, planned)
+    const preset: ModelPreset = {
+        id: planned.id,
+        name: existing?.name || planned.name,
+        notes: existing?.notes,
+        sourceProfile: existing?.sourceProfile,
+        migrationSource: {
+            sourceKind: planned.sourceKind,
+            sourcePath: planned.sourcePath,
+            configHash: configHashFromPlannedId(planned.id),
+        },
+        profileSnapshot: resolveSnapshot?.(planned) || createFallbackMigrationSnapshot(planned),
+        userValues: cloneJsonLike(planned.userValues) as Record<string, unknown>,
+        orphanValues: existing?.orphanValues,
+        apiKeyRef,
+        inlineCredential: existing?.inlineCredential,
+        fallbackModelPresetIds: existing?.fallbackModelPresetIds,
+        pinned: existing?.pinned,
+        order: existing?.order,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+    }
+
+    if (existingIndex >= 0) {
+        db.modelPresets[existingIndex] = preset
+    } else {
+        db.modelPresets.push(preset)
+    }
+}
+
+function applyScopedBinding(
+    db: ModelPresetMigrationApplyTarget,
+    binding: PlannedBinding | PlannedPluginBinding,
+): void {
+    const target = binding.scope === 'global'
+        ? db
+        : binding.scope === 'botPreset'
+            ? findBotPresetForBinding(db, binding.ownerId)
+            : findChatForBinding(db, binding.ownerId)
+    if (!target) return
+    setBinding(target, binding.targetTask, binding.binding)
+}
+
+function setBinding(target: MutableModelBindingFields, task: ResolvedTask, binding: ModelBinding): void {
+    if (task === 'model') {
+        target.modelBinding = binding
+        return
+    }
+    if (task === 'submodel') {
+        target.subModelBinding = binding
+        return
+    }
+    target.taskModelBindings = target.taskModelBindings || {}
+    target.taskModelBindings[task] = binding
+}
+
+function findBotPresetForBinding(
+    db: ModelPresetMigrationApplyTarget,
+    ownerId: string | undefined,
+): (LegacyBotPreset & MutableModelBindingFields) | undefined {
+    if (!ownerId || !Array.isArray(db.botPresets)) return undefined
+    if (ownerId.startsWith('index:')) {
+        const index = Number(ownerId.slice('index:'.length))
+        return Number.isInteger(index) ? db.botPresets[index] : undefined
+    }
+    const byId = db.botPresets.find((preset) => preset.id === ownerId)
+    if (byId) return byId
+    const index = Number(ownerId)
+    return Number.isInteger(index) ? db.botPresets[index] : undefined
+}
+
+function findChatForBinding(
+    db: ModelPresetMigrationApplyTarget,
+    ownerId: string | undefined,
+): MutableChat | undefined {
+    if (!ownerId || !Array.isArray(db.characters)) return undefined
+    for (const character of db.characters) {
+        const found = character.chats?.find((chat) => chat.id === ownerId)
+        if (found) return found
+    }
+    const indexMatch = /^(\d+)\.(\d+)$/.exec(ownerId)
+    if (!indexMatch) return undefined
+    return db.characters[Number(indexMatch[1])]?.chats?.[Number(indexMatch[2])]
+}
+
+function summarizeMigrationReport(report: MigrationReport, appliedAt: number): ModelPresetMigrationSummary {
+    return {
+        version: report.version,
+        appliedAt,
+        createdModelPresetCount: report.createdModelPresets.length,
+        botPresetBindingCount: report.botPresetBindings.length,
+        chatBindingCount: report.chatBindings.length,
+        pluginBindingCount: report.pluginBindings.length,
+        manualRequiredCount: report.manualRequired.length,
+        skippedBiasCount: report.skippedBias.length,
+        warnings: report.warnings.slice(),
+    }
+}
+
+function createFallbackMigrationSnapshot(planned: PlannedModelPreset): ResolvedModelProfileSnapshot {
+    return {
+        profileId: planned.profileId,
+        profileVersion: 1,
+        providerBaseId: providerBaseIdForProfile(planned.profileId),
+        adapterKind: adapterKindForProfile(planned.profileId),
+        auth: { kind: authKindForProfile(planned.profileId), fields: planned.credentialSource ? ['apiKey'] : undefined },
+        endpoint: { kind: 'static', url: planned.endpointUrl },
+        modelId: planned.modelId || planned.profileId,
+        schema: [],
+        uiSchema: { groups: [], fields: [] },
+        defaults: {},
+        capabilities: ['streaming'],
+    }
+}
+
+function providerBaseIdForProfile(profileId: string): string {
+    if (profileId.startsWith('openai-compatible:')) return 'openai-compatible'
+    return profileId.split(':')[0] || profileId
+}
+
+function adapterKindForProfile(profileId: string): ResolvedModelProfileSnapshot['adapterKind'] {
+    if (profileId.startsWith('anthropic:')) return 'anthropic-messages'
+    if (profileId.startsWith('google:')) return 'google-gemini'
+    return 'openai-compatible'
+}
+
+function authKindForProfile(profileId: string): ResolvedModelProfileSnapshot['auth']['kind'] {
+    if (profileId.startsWith('ollama:')) return 'none'
+    if (profileId.startsWith('anthropic:')) return 'x-api-key'
+    if (profileId.startsWith('google:')) return 'query'
+    return 'bearer'
+}
+
+function readLegacyStringAtPath(db: ModelPresetMigrationApplyTarget, sourcePath: string): string | undefined {
+    const value = readLegacyValueAtPath(db, sourcePath)
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function readLegacyValueAtPath(db: ModelPresetMigrationApplyTarget, sourcePath: string): unknown {
+    if (sourcePath.startsWith('db.')) {
+        return readPathSegments(db as Record<string, unknown>, sourcePath.slice(3).split('.'))
+    }
+    if (sourcePath.startsWith('customModels.')) {
+        const [, id, ...rest] = sourcePath.split('.')
+        const customModel = (db.customModels ?? []).find((model) => model.id === id)
+        return readPathSegments(customModel as Record<string, unknown> | undefined, rest)
+    }
+    if (sourcePath.startsWith('botPresets.')) {
+        const [, id, ...rest] = sourcePath.split('.')
+        const preset = findBotPresetForBinding(db, id)
+        return readPathSegments(preset as Record<string, unknown> | undefined, rest)
+    }
+    return undefined
+}
+
+function readPathSegments(source: Record<string, unknown> | undefined, segments: string[]): unknown {
+    let value: unknown = source
+    for (const segment of segments) {
+        if (value === null || typeof value !== 'object') return undefined
+        value = (value as Record<string, unknown>)[segment]
+    }
+    return value
+}
+
+function apiKeyPoolIdForSourcePath(sourcePath: string): string {
+    return `migrated-key:${hashStable(sourcePath)}`
+}
+
+function apiKeyPoolRefForPlanned(
+    db: ModelPresetMigrationApplyTarget,
+    planned: PlannedModelPreset,
+): string | undefined {
+    const sourcePath = planned.credentialSource?.sourcePath
+    if (!sourcePath || !db.apiKeyPool) return undefined
+    const id = apiKeyPoolIdForSourcePath(sourcePath)
+    return db.apiKeyPool[id] ? id : undefined
+}
+
+function botPresetOwnerId(preset: LegacyBotPreset, index: number): string {
+    return preset.id || `index:${index}`
+}
+
+function configHashFromPlannedId(id: string): string {
+    const index = id.lastIndexOf(':')
+    return index >= 0 ? id.slice(index + 1) : ''
 }
 
 function createPlannedPreset(args: {

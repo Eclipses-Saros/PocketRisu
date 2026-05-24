@@ -1290,6 +1290,9 @@ export interface Database{
         flags: LLMFlags[]
     }[]
     modelPresets: ModelPreset[]
+    modelBinding?: ModelBindingFields['modelBinding']
+    subModelBinding?: ModelBindingFields['subModelBinding']
+    taskModelBindings?: ModelBindingFields['taskModelBindings']
     modelPresetMigrationVersion?: number
     modelPresetMigrationAppliedAt?: number
     modelPresetMigrationReport?: ModelPresetMigrationSummary

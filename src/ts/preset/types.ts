@@ -165,6 +165,11 @@ export interface ModelPreset {
     name: string
     notes?: string
     sourceProfile?: ModelPresetSourceProfile
+    migrationSource?: {
+        sourceKind: string
+        sourcePath: string
+        configHash: string
+    }
     profileSnapshot: ResolvedModelProfileSnapshot
     userValues: Record<string, unknown>
     orphanValues?: Record<string, unknown>
