@@ -43,13 +43,29 @@ export function resolveSnapshot(registry: RegistryCache, profileId: string): Res
         auth: profile.auth,
         endpoint: profile.endpoint,
         modelId: profile.modelId,
-        schema: mergeSchemas(baseProvider.requestSchema, profile.schema),
+        schema: backfillSchemaDefaults(
+            mergeSchemas(baseProvider.requestSchema, profile.schema),
+            profile,
+        ),
         uiSchema: mergeUiSchemas(baseProvider.uiSchema, profile.uiSchema),
         defaults: { ...(baseProvider.defaultBody ?? {}), ...profile.defaults },
         bodyTemplate: profile.bodyTemplate,
         headerTemplate: { ...(baseProvider.defaultHeaders ?? {}), ...(profile.headerTemplate ?? {}) },
         capabilities: profile.capabilities ?? baseProvider.capabilities,
     }
+}
+
+function backfillSchemaDefaults(
+    schema: RegistryFieldSchema[],
+    profile: ModelProfile,
+): RegistryFieldSchema[] {
+    if (!profile.modelId) return schema
+    return schema.map((field) => {
+        if (field.key === 'modelId' && field.default === undefined) {
+            return { ...field, default: profile.modelId }
+        }
+        return field
+    })
 }
 
 function findProfile(

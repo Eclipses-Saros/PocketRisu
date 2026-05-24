@@ -174,6 +174,8 @@ export interface ModelPreset {
     profileSnapshot: ResolvedModelProfileSnapshot
     userValues: Record<string, unknown>
     orphanValues?: Record<string, unknown>
+    customBody?: Record<string, unknown>
+    customHeaders?: Record<string, string>
     apiKeyRef?: string
     inlineCredential?: unknown
     fallbackModelPresetIds?: string[]

@@ -50,6 +50,121 @@ describe('resolveSnapshot', () => {
         expect(snapshot.defaults).toMatchObject({ location: 'us-central1' })
     })
 
+    test('backfills modelId schema field default from profile.modelId when missing', () => {
+        const baseProvider: BaseProviderDefinition = {
+            id: 'demo',
+            version: 1,
+            displayName: 'Demo',
+            adapterKind: 'openai-compatible',
+            authKinds: ['bearer'],
+            endpointKinds: ['static'],
+            requestSchema: [
+                {
+                    key: 'apiKey',
+                    type: 'string',
+                    label: 'API Key',
+                    secret: true,
+                    mapsTo: { target: 'auth', path: 'apiKey' },
+                },
+                {
+                    key: 'modelId',
+                    type: 'string',
+                    label: 'Model ID',
+                    mapsTo: { target: 'body', path: 'model' },
+                },
+            ],
+            uiSchema: { groups: [], fields: [] },
+            sourceUrls: ['https://example.test'],
+        }
+        const profile: ModelProfile = {
+            id: 'demo:gpt-5',
+            version: 1,
+            displayName: 'GPT-5',
+            providerBaseId: 'demo',
+            profileTier: 'standard',
+            modelId: 'gpt-5',
+            endpoint: { kind: 'static', url: 'https://demo.test/v1' },
+            auth: { kind: 'bearer', fields: ['apiKey'] },
+            defaults: {},
+            schema: [],
+            uiSchema: { groups: [], fields: [] },
+            sourceUrls: [],
+        }
+        const cache: RegistryCache = {
+            schemaVersion: 4,
+            registries: {
+                synthetic: {
+                    fetchedAt: 0,
+                    baseProviders: { demo: baseProvider },
+                    profiles: { 'demo:gpt-5': profile },
+                },
+            },
+        }
+        const snapshot = resolveSnapshot(cache, 'demo:gpt-5')
+        const modelIdField = snapshot.schema.find((f) => f.key === 'modelId')
+        expect(modelIdField?.default).toBe('gpt-5')
+    })
+
+    test('does not overwrite explicit modelId default and skips empty profile.modelId', () => {
+        const baseProvider: BaseProviderDefinition = {
+            id: 'demo',
+            version: 1,
+            displayName: 'Demo',
+            adapterKind: 'openai-compatible',
+            authKinds: ['bearer'],
+            endpointKinds: ['static'],
+            requestSchema: [
+                {
+                    key: 'modelId',
+                    type: 'string',
+                    label: 'Model ID',
+                    default: 'explicit-default',
+                    mapsTo: { target: 'body', path: 'model' },
+                },
+            ],
+            uiSchema: { groups: [], fields: [] },
+            sourceUrls: [],
+        }
+        const profileExplicit: ModelProfile = {
+            id: 'demo:a',
+            version: 1,
+            displayName: 'A',
+            providerBaseId: 'demo',
+            profileTier: 'standard',
+            modelId: 'profile-model',
+            endpoint: { kind: 'static', url: 'https://demo.test/v1' },
+            auth: { kind: 'bearer', fields: ['apiKey'] },
+            defaults: {},
+            schema: [],
+            uiSchema: { groups: [], fields: [] },
+            sourceUrls: [],
+        }
+        const profileEmptyModel: ModelProfile = {
+            ...profileExplicit,
+            id: 'demo:custom',
+            modelId: '',
+        }
+        const cache: RegistryCache = {
+            schemaVersion: 4,
+            registries: {
+                synthetic: {
+                    fetchedAt: 0,
+                    baseProviders: { demo: baseProvider },
+                    profiles: {
+                        'demo:a': profileExplicit,
+                        'demo:custom': profileEmptyModel,
+                    },
+                },
+            },
+        }
+        const explicitSnap = resolveSnapshot(cache, 'demo:a')
+        expect(explicitSnap.schema.find((f) => f.key === 'modelId')?.default)
+            .toBe('explicit-default')
+        const customSnap = resolveSnapshot(cache, 'demo:custom')
+        expect(customSnap.schema.find((f) => f.key === 'modelId')?.default)
+            .toBe('explicit-default')
+    })
+
     test('throws RegistryProfileNotFoundError for unknown profile ids', () => {
         expect(() => resolveSnapshot(registry, 'unknown:profile')).toThrowError(RegistryProfileNotFoundError)
     })
