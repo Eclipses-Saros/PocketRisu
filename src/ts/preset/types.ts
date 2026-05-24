@@ -293,3 +293,74 @@ export interface MigrationReport {
     preservedLegacyFields: DeprecatedMigrationItem[]
     warnings: string[]
 }
+
+export type SnapshotChangeKind = 'added' | 'removed' | 'modified'
+
+export interface SnapshotSchemaFieldChange {
+    key: string
+    changeKind: SnapshotChangeKind
+    fromType?: RegistryFieldType
+    toType?: RegistryFieldType
+    modifiedAttributes?: string[]
+}
+
+export interface SnapshotUiFieldChange {
+    key: string
+    changeKind: SnapshotChangeKind
+    modifiedAttributes?: string[]
+}
+
+export interface SnapshotUiGroupChange {
+    id: string
+    changeKind: SnapshotChangeKind
+}
+
+export interface SnapshotDiff {
+    profileId: string
+    fromVersion: number
+    toVersion: number
+    providerBaseChanged: boolean
+    adapterKindChanged: boolean
+    modelIdChanged: boolean
+    endpointChanged: boolean
+    authChanged: boolean
+    capabilitiesChanged: boolean
+    defaultsChanged: boolean
+    bodyTemplateChanged: boolean
+    headerTemplateChanged: boolean
+    schemaChanges: SnapshotSchemaFieldChange[]
+    uiSchemaFieldChanges: SnapshotUiFieldChange[]
+    uiSchemaGroupChanges: SnapshotUiGroupChange[]
+}
+
+export type ProfileUpdateAvailability =
+    | { status: 'no-source' }
+    | { status: 'profile-missing'; profileId: string }
+    | { status: 'current'; profileId: string; version: number }
+    | {
+        status: 'available'
+        profileId: string
+        fromVersion: number
+        toVersion: number
+        latestSnapshot: ResolvedModelProfileSnapshot
+        latestSourceProfile: ModelPresetSourceProfile
+    }
+    | {
+        status: 'downgrade'
+        profileId: string
+        currentVersion: number
+        registryVersion: number
+    }
+
+export interface OrphanedUserValue {
+    key: string
+    value: unknown
+    reason: 'removed' | 'type-changed'
+}
+
+export interface ProfileSnapshotUpdateResult {
+    preset: ModelPreset
+    diff: SnapshotDiff
+    movedToOrphan: OrphanedUserValue[]
+    newFieldKeys: string[]
+}
