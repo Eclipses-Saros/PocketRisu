@@ -39,6 +39,7 @@ export function resolveSnapshot(registry: RegistryCache, profileId: string): Res
         profileId: profile.id,
         profileVersion: profile.version,
         providerBaseId: profile.providerBaseId,
+        providerBaseVersion: baseProvider.version,
         adapterKind: baseProvider.adapterKind,
         auth: profile.auth,
         endpoint: profile.endpoint,

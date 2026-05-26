@@ -91,6 +91,7 @@ function makeSnapshot(overrides: Partial<ResolvedModelProfileSnapshot> = {}): Re
         profileId: 'demo:standard',
         profileVersion: 1,
         providerBaseId: 'demo',
+        providerBaseVersion: 1,
         adapterKind: 'openai-compatible',
         auth: { kind: 'bearer', fields: ['apiKey'] },
         endpoint: { kind: 'static', url: 'https://demo.test/v1/chat/completions' },
@@ -187,6 +188,7 @@ describe('getProfileUpdateAvailability', () => {
             registryId: 'synthetic',
             profileId: 'demo:standard',
             profileVersion: 2,
+            providerBaseVersion: 1,
             fetchedAt: 999,
         })
     })
@@ -227,6 +229,7 @@ describe('getProfileUpdateAvailability', () => {
             registryId: 'remote',
             profileId: 'demo:standard',
             profileVersion: 2,
+            providerBaseVersion: 1,
             fetchedAt: 1234,
         })
     })
@@ -246,6 +249,100 @@ describe('getProfileUpdateAvailability', () => {
             profileId: 'demo:standard',
             currentVersion: 5,
             registryVersion: 2,
+        })
+    })
+
+    test('returns available when only the base provider version bumped', () => {
+        // Mirrors the Anthropic max_tokens scenario (option B+C round 1 P1):
+        // base provider v1 → v2 introduces a new `defaultBody` but the profile
+        // version stays the same. Detection should now flag the update so the
+        // user can refresh the snapshot.
+        const preset = makePreset({
+            sourceProfile: {
+                registryId: 'synthetic',
+                profileId: 'demo:standard',
+                profileVersion: 1,
+                providerBaseVersion: 1,
+                fetchedAt: 100,
+            },
+        })
+        const registry = makeRegistry(
+            [makeProfile({ version: 1 })],
+            [makeBaseProvider({ version: 2, defaultBody: { max_tokens: 4096 } })],
+        )
+        const result = getProfileUpdateAvailability(preset, registry, { now: () => 500 })
+        if (result.status !== 'available') throw new Error(`expected available, got ${result.status}`)
+        expect(result.latestSnapshot.providerBaseVersion).toBe(2)
+        expect(result.latestSourceProfile.providerBaseVersion).toBe(2)
+        expect(result.latestSourceProfile.profileVersion).toBe(1)
+    })
+
+    test('treats legacy sourceProfile (no providerBaseVersion) as current to avoid mass update noise', () => {
+        // Presets persisted before providerBaseVersion existed leave the field
+        // undefined. Detection treats undefined as "matches latest" so legacy
+        // presets do not flood the UI with update cards on every base bump.
+        // Adapter-side safety nets (e.g., ANTHROPIC_FALLBACK_MAX_TOKENS)
+        // cover the functional gap for those legacy snapshots.
+        const preset = makePreset({
+            sourceProfile: {
+                registryId: 'synthetic',
+                profileId: 'demo:standard',
+                profileVersion: 1,
+                // providerBaseVersion intentionally omitted
+                fetchedAt: 100,
+            },
+        })
+        const registry = makeRegistry(
+            [makeProfile({ version: 1 })],
+            [makeBaseProvider({ version: 2 })],
+        )
+        expect(getProfileUpdateAvailability(preset, registry)).toEqual({
+            status: 'current',
+            profileId: 'demo:standard',
+            version: 1,
+        })
+    })
+
+    test('available when both profile version and base provider version bumped', () => {
+        const preset = makePreset({
+            sourceProfile: {
+                registryId: 'synthetic',
+                profileId: 'demo:standard',
+                profileVersion: 1,
+                providerBaseVersion: 1,
+                fetchedAt: 100,
+            },
+        })
+        const registry = makeRegistry(
+            [makeProfile({ version: 2 })],
+            [makeBaseProvider({ version: 2 })],
+        )
+        const result = getProfileUpdateAvailability(preset, registry, { now: () => 700 })
+        if (result.status !== 'available') throw new Error(`expected available, got ${result.status}`)
+        expect(result.fromVersion).toBe(1)
+        expect(result.toVersion).toBe(2)
+        expect(result.latestSourceProfile.providerBaseVersion).toBe(2)
+    })
+
+    test('returns downgrade when source providerBaseVersion is higher than registry', () => {
+        const preset = makePreset({
+            sourceProfile: {
+                registryId: 'synthetic',
+                profileId: 'demo:standard',
+                profileVersion: 1,
+                providerBaseVersion: 5,
+                fetchedAt: 100,
+            },
+        })
+        const registry = makeRegistry(
+            [makeProfile({ version: 1 })],
+            [makeBaseProvider({ version: 2 })],
+        )
+        expect(getProfileUpdateAvailability(preset, registry)).toEqual({
+            status: 'downgrade',
+            profileId: 'demo:standard',
+            currentVersion: 1,
+            registryVersion: 1,
         })
     })
 })
@@ -474,6 +571,7 @@ describe('applyProfileSnapshotUpdate', () => {
             registryId: 'synthetic',
             profileId: 'demo:standard',
             profileVersion: 3,
+            providerBaseVersion: 1,
             fetchedAt: 600,
         })
 

@@ -142,6 +142,11 @@ export interface ModelPresetSourceProfile {
     registryId: string
     profileId: string
     profileVersion: number
+    // Optional for backwards compatibility: presets persisted before this
+    // field existed will have it undefined. Profile-update detection treats
+    // undefined as "unknown, backfill on next resolve" to avoid showing a
+    // spurious update card on every legacy preset.
+    providerBaseVersion?: number
     fetchedAt: number
 }
 
@@ -149,6 +154,7 @@ export interface ResolvedModelProfileSnapshot {
     profileId: string
     profileVersion: number
     providerBaseId: string
+    providerBaseVersion: number
     adapterKind: AdapterKind
     auth: RegistryAuth
     endpoint: RegistryEndpoint

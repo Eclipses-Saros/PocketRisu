@@ -826,6 +826,12 @@ function createFallbackMigrationSnapshot(planned: PlannedModelPreset): ResolvedM
         profileId: planned.profileId,
         profileVersion: 1,
         providerBaseId: providerBaseIdForProfile(planned.profileId),
+        // Required for snapshot completeness. Migrations applied without a
+        // registry resolver also skip writing `sourceProfile`, so this value
+        // never reaches `getProfileUpdateAvailability` — it returns 'no-source'
+        // first. Re-running migration with the bundled resolver fills the real
+        // snapshot (and sourceProfile) from the registry.
+        providerBaseVersion: 1,
         adapterKind: adapterKindForProfile(planned.profileId),
         auth: { kind: authKindForProfile(planned.profileId), fields: planned.credentialSource ? ['apiKey'] : undefined },
         endpoint: { kind: 'static', url: planned.endpointUrl },

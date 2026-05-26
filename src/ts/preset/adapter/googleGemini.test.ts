@@ -11,6 +11,7 @@ function makeSnapshot(overrides: Partial<ResolvedModelProfileSnapshot> = {}): Re
         profileId: 'demo:google',
         profileVersion: 1,
         providerBaseId: 'google',
+        providerBaseVersion: 1,
         adapterKind: 'google-gemini',
         auth: { kind: 'x-goog-api-key', fields: ['apiKey'] },
         endpoint: { kind: 'static', url: 'https://demo.test/v1beta/models' },

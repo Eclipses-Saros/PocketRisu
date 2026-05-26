@@ -634,6 +634,7 @@ describe('analyzeModelPresetMigration', () => {
             registryId: 'bundled',
             profileId: 'google:standard',
             profileVersion: 1,
+            providerBaseVersion: 1,
             fetchedAt: expect.any(Number),
         })
         // x-goog-api-key auth flows through both the registry snapshot and the
@@ -687,6 +688,7 @@ describe('analyzeModelPresetMigration', () => {
             registryId: 'bundled',
             profileId: 'openai-compatible:custom',
             profileVersion: 1,
+            providerBaseVersion: 1,
             fetchedAt: expect.any(Number),
         })
         expect(preset?.userValues.endpointUrl).toBe('https://reverse.test/v1/chat/completions')

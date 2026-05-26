@@ -11,6 +11,7 @@ function makeSnapshot(overrides: Partial<ResolvedModelProfileSnapshot> = {}): Re
         profileId: 'demo:anthropic',
         profileVersion: 1,
         providerBaseId: 'anthropic',
+        providerBaseVersion: 1,
         adapterKind: 'anthropic-messages',
         auth: { kind: 'x-api-key', fields: ['apiKey'] },
         endpoint: { kind: 'static', url: 'https://demo.test/v1/messages' },

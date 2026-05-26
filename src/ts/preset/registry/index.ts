@@ -20,6 +20,7 @@ export function bundledMigrationResolver(): MigrationSnapshotResolver {
                 registryId,
                 profileId: snapshot.profileId,
                 profileVersion: snapshot.profileVersion,
+                providerBaseVersion: snapshot.providerBaseVersion,
                 fetchedAt: Date.now(),
             },
         }

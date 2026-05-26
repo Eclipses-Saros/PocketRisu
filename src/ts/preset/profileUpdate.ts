@@ -51,11 +51,22 @@ export function getProfileUpdateAvailability(
 
     const currentVersion = source.profileVersion
     const latestVersion = latestSnapshot.profileVersion
+    const currentBaseVersion = source.providerBaseVersion
+    const latestBaseVersion = latestSnapshot.providerBaseVersion
+    // Optional field on the source profile (legacy presets persisted before
+    // it existed leave it undefined). Treat undefined as "matches latest" so
+    // legacy presets do not light up a spurious update card on every
+    // base-provider bump. Once they go through an update apply they pick up
+    // the providerBaseVersion and start participating in normal detection.
+    const baseVersionsMatch = currentBaseVersion === undefined
+        || currentBaseVersion === latestBaseVersion
+    const baseVersionDowngrade = currentBaseVersion !== undefined
+        && currentBaseVersion > latestBaseVersion
 
-    if (currentVersion === latestVersion) {
+    if (currentVersion === latestVersion && baseVersionsMatch) {
         return { status: 'current', profileId: source.profileId, version: currentVersion }
     }
-    if (currentVersion > latestVersion) {
+    if (currentVersion > latestVersion || baseVersionDowngrade) {
         return {
             status: 'downgrade',
             profileId: source.profileId,
@@ -75,6 +86,7 @@ export function getProfileUpdateAvailability(
             registryId: source.registryId,
             profileId: source.profileId,
             profileVersion: latestVersion,
+            providerBaseVersion: latestBaseVersion,
             fetchedAt: now(),
         },
     }
@@ -149,6 +161,7 @@ export function applyProfileSnapshotUpdate(
         sourceProfile = {
             ...preset.sourceProfile,
             profileVersion: latestSnapshot.profileVersion,
+            providerBaseVersion: latestSnapshot.providerBaseVersion,
             fetchedAt: updatedAt,
         }
     }
