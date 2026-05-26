@@ -7,7 +7,7 @@ import {
     decodeJwtHeaderForTest,
     decodeJwtPayloadForTest,
 } from './jwt'
-import { getTestKeyPair, makeServiceAccountFixture as fixture } from './testFixtures'
+import { getTestKeyPair, makeServiceAccountFixture as fixture } from './__testFixtures'
 
 const fixedNow = () => 1_700_000_000_000
 

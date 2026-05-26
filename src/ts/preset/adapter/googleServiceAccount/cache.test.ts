@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { createServiceAccountTokenCache } from './cache'
 import type { ExchangeServiceAccountInput } from './token'
-import { makeServiceAccountFixture } from './testFixtures'
+import { makeServiceAccountFixture } from './__testFixtures'
 
 interface ExchangeCall {
     scope: string | undefined

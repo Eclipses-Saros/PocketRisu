@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { ModelPresetAdapterError } from '../error'
 import { exchangeServiceAccountForAccessToken } from './token'
-import { makeServiceAccountFixture } from './testFixtures'
+import { makeServiceAccountFixture } from './__testFixtures'
 
 interface CapturedCall {
     url: string
