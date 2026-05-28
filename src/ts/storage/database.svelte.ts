@@ -1919,6 +1919,7 @@ export interface Chat{
     modules?:string[]
     id?:string
     bindedPersona?:string
+    bindedBotPreset?:string
     fmIndex?:number
     hypaV3Data?:SerializableHypaV3Data
     folderId?:string

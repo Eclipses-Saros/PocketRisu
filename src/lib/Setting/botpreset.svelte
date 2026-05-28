@@ -3,7 +3,10 @@
     import { language } from "../../lang";
     import { changeToPreset, copyPreset, downloadPreset, importPreset, saveCurrentPreset, withStableActivePreset } from "../../ts/storage/database.svelte";
     import { v4 as uuidv4 } from "uuid";
-    import { DBState } from 'src/ts/stores.svelte';
+    import { DBState, presetSelectCallback, settingsOpen } from 'src/ts/stores.svelte';
+    import { get } from 'svelte/store';
+    import { openSettings, SettingsRoute } from 'src/ts/routing';
+    import ShButton from '../UI/GUI/ShButton.svelte';
     import { CopyIcon, Share2Icon, PencilIcon, HardDriveUploadIcon, PlusIcon, TrashIcon, XIcon, GitCompare } from "@lucide/svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import { prebuiltPresets } from "src/ts/process/templates/templates";
@@ -18,6 +21,14 @@
     }
 
     let { close = () => {} }: Props = $props();
+
+    // Clear any pending preset-select callback when the modal unmounts,
+    // so a stale callback can't fire on a later open.
+    $effect(() => {
+        return () => {
+            presetSelectCallback.set(null);
+        };
+    });
 
     let showDiffModal = $state(false)
     let selectedDiffPreset = $state<number | null>(null)
@@ -82,13 +93,22 @@
 <div class="absolute w-full h-full z-40 bg-black/50 flex justify-center items-center">
     <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-y-auto">
         <div class="flex items-center text-textcolor mb-4">
-            <h2 class="mt-0 mb-0">{language.presets}</h2>
+            <h2 class="mt-0 mb-0">{language.promptPresets}</h2>
             <div class="grow flex justify-end">
                 <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer items-center" onclick={close}>
                     <XIcon size={24}/>
                 </button>
             </div>
         </div>
+        {#if !$settingsOpen}
+            <ShButton variant="default" size="default" className="w-full mb-4" onclick={() => {
+                close()
+                openSettings(SettingsRoute.PromptPreset)
+            }}>
+                <PencilIcon size={16}/>
+                <span class="ml-1">{language.presetEdit}</span>
+            </ShButton>
+        {/if}
         {#each DBState.db.botPresets as preset, i}
             <div class="w-full transition-all duration-200"
                 class:h-0.5={!isDragging || dragOverIndex !== i}
@@ -112,10 +132,16 @@
             
             <button onclick={() => {
                 if(!editMode){
-                    changeToPreset(i)
+                    const cb = get(presetSelectCallback)
+                    if (cb) {
+                        presetSelectCallback.set(null)
+                        cb(i)
+                    } else {
+                        changeToPreset(i)
+                    }
                     close()
                 }
-            }} 
+            }}
             class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer" 
             class:bg-selected={i === DBState.db.botPresetsId}
             class:draggable-preset={!editMode}

@@ -30,6 +30,8 @@ export const SettingsRoute = {
     Prompt: 13 as const,
     Module: 14 as const,
     Hotkey: 15 as const,
+    ModelPreset: 16 as const,
+    PromptPreset: 17 as const,
     RemoteAccess: 21 as const,
     System: 22 as const,
     InlayImageGallery: 23 as const,

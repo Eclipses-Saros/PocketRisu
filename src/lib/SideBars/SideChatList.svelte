@@ -21,7 +21,7 @@
     import { language } from "src/lang";
     import Toggles from "./Toggles.svelte";
     import PersonaBind from "./PersonaBind.svelte";
-    import PresetBind from "./PresetBind.svelte";
+    import PromptBind from "./PromptBind.svelte";
     import ModelList from "../UI/ModelList.svelte";
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte";
 
@@ -481,7 +481,7 @@
 
         {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground' && !$chatDeselected}
             {#if DBState.db.showPresetInSidebar}
-                <PresetBind />
+                <PromptBind />
             {/if}
             {#if DBState.db.showModelInSidebar}
                 <div class="flex flex-col gap-1 mt-4">
