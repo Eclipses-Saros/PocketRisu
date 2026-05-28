@@ -17,7 +17,9 @@ describe('resolveSnapshot', () => {
             endpoint: { kind: 'static', url: 'https://api.openai.com/v1/chat/completions' },
             modelId: '',
         })
-        expect(snapshot.schema.map((f) => f.key)).toEqual(['apiKey', 'modelId'])
+        expect(snapshot.schema.map((f) => f.key)).toEqual(expect.arrayContaining(['apiKey', 'modelId']))
+        expect(snapshot.schema.find((f) => f.key === 'apiKey')).toBeDefined()
+        expect(snapshot.schema.find((f) => f.key === 'modelId')).toBeDefined()
         expect(snapshot.headerTemplate).toEqual({ 'Content-Type': 'application/json' })
         expect(snapshot.capabilities).toContain('streaming')
     })

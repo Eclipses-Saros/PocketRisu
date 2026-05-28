@@ -18,6 +18,25 @@
 
     const fieldKey = $derived(schemaField.key);
 
+    // stringArray widget: textarea one-per-line, syncs to/from userValues[key]: string[]
+    let stringArrayText = $state('');
+    let stringArrayInitialized = $state(false);
+
+    $effect(() => {
+        if (uiField.widget !== 'string-array') return;
+        if (stringArrayInitialized) return;
+        const v = userValues[fieldKey];
+        stringArrayText = Array.isArray(v) ? v.join('\n') : '';
+        stringArrayInitialized = true;
+    });
+
+    $effect(() => {
+        if (uiField.widget !== 'string-array') return;
+        if (!stringArrayInitialized) return;
+        const lines = stringArrayText.split('\n').map(s => s.trim()).filter(Boolean);
+        userValues[fieldKey] = lines.length === 0 ? undefined : lines;
+    });
+
     // JSON widget: stringify on read, parse on write. Errors surface inline.
     // We seed jsonText from userValues once on mount, then user edits jsonText
     // and an $effect parses+commits on every change (invalid JSON keeps the
@@ -113,6 +132,27 @@
         </SelectInput>
     {:else if uiField.widget === 'toggle'}
         <CheckInput bind:check={userValues[fieldKey] as boolean} name={schemaField.label} />
+    {:else if uiField.widget === 'combobox'}
+        <input
+            type="text"
+            class="bg-darkbg border border-darkborderc rounded-md px-3 py-2 text-textcolor focus:outline-hidden focus:ring-2 focus:ring-borderc"
+            bind:value={userValues[fieldKey] as string}
+            placeholder={uiField.placeholder ?? ''}
+            list={`combobox-${fieldKey}`}
+        />
+        <datalist id={`combobox-${fieldKey}`}>
+            {#each schemaField.enum ?? [] as opt}
+                <option value={String(opt.value)}>{opt.label}</option>
+            {/each}
+        </datalist>
+    {:else if uiField.widget === 'string-array'}
+        <TextAreaInput
+            bind:value={stringArrayText}
+            placeholder={uiField.placeholder ?? '한 줄에 하나씩'}
+            fullwidth
+            autocomplete="off"
+            height="20"
+        />
     {:else if uiField.widget === 'json' || uiField.widget === 'key-value'}
         <TextAreaInput
             bind:value={jsonText}

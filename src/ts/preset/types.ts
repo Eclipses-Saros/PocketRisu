@@ -33,6 +33,8 @@ export type RegistryWidget =
     | 'select'
     | 'segmented'
     | 'toggle'
+    | 'combobox'
+    | 'string-array'
     | 'json'
     | 'key-value'
 
