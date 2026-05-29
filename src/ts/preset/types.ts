@@ -152,6 +152,18 @@ export interface BaseProviderDefinition {
     sourceUrls: string[]
 }
 
+export type RegistryTokenizer =
+    | 'tik'
+    | 'mistral'
+    | 'novelai'
+    | 'claude'
+    | 'llama'
+    | 'llama3'
+    | 'novellist'
+    | 'gemma'
+    | 'cohere'
+    | 'deepseek'
+
 export interface ModelProfile {
     id: string
     version: number
@@ -165,6 +177,7 @@ export interface ModelProfile {
     lifecycle?: RegistryLifecycle
     tags?: string[]
     sortOrder?: number
+    recommendedTokenizer?: RegistryTokenizer
     modelId: string
     endpoint: RegistryEndpoint
     auth: RegistryAuth
@@ -206,6 +219,7 @@ export interface ResolvedModelProfileSnapshot {
     headerTemplate?: Record<string, string>
     capabilities?: RegistryCapability[]
     limits?: ModelLimits
+    recommendedTokenizer?: RegistryTokenizer
 }
 
 export interface ModelPreset {
@@ -232,6 +246,10 @@ export interface ModelPreset {
     //   key={{none}}        — delete body[key] (or headers if header::)
     // Stored as raw text so the UI round-trips exactly what the user typed.
     additionalParamsText?: string
+    // Per-ModelPreset tokenizer override. When undefined, the tokenize call
+    // falls back to profile.recommendedTokenizer, then db.customTokenizer
+    // (legacy global), then a sane default based on the adapter kind.
+    tokenizerOverride?: RegistryTokenizer
     apiKeyRef?: string
     inlineCredential?: unknown
     fallbackModelPresetIds?: string[]

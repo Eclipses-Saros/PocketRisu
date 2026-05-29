@@ -55,6 +55,7 @@ export function resolveSnapshot(registry: RegistryCache, profileId: string): Res
         headerTemplate: { ...(baseProvider.defaultHeaders ?? {}), ...(profile.headerTemplate ?? {}) },
         capabilities: profile.capabilities ?? baseProvider.capabilities,
         limits: mergeLimits(baseProvider.limits, profile.limits),
+        recommendedTokenizer: profile.recommendedTokenizer,
     }
 }
 

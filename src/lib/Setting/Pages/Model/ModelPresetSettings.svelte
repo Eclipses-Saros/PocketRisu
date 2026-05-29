@@ -5,6 +5,9 @@
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import SchemaFormRenderer from "src/lib/UI/GUI/SchemaFormRenderer.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
+    import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
+    import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
+    import { tokenizerList } from "src/ts/tokenizer";
     import ModelPresetBasicInfo from "./ModelPresetBasicInfo.svelte";
     import { language } from "src/lang";
     import { DBState, openModelProfileBrowser } from "src/ts/stores.svelte";
@@ -137,6 +140,19 @@
                     userValues={editingPreset.userValues}
                     visibility="advanced"
                 />
+                <div class="flex flex-col gap-1 mt-6">
+                    <span class="text-sm text-textcolor">{language.tokenizerOverride}</span>
+                    <span class="text-xs text-textcolor2">{language.tokenizerOverrideHelp}</span>
+                    <SelectInput
+                        className="mt-2"
+                        bind:value={editingPreset.tokenizerOverride as string}
+                    >
+                        <OptionInput value="">{language.tokenizerAuto}{editingPreset.profileSnapshot.recommendedTokenizer ? ` (${editingPreset.profileSnapshot.recommendedTokenizer})` : ''}</OptionInput>
+                        {#each tokenizerList as [value, label]}
+                            <OptionInput {value}>{label}</OptionInput>
+                        {/each}
+                    </SelectInput>
+                </div>
                 <div class="flex flex-col gap-1 mt-6">
                     <span class="text-sm text-textcolor">{language.additionalParams}</span>
                     <span class="text-xs text-textcolor2">{language.additionalParamsHelp}</span>
