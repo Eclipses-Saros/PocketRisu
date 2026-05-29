@@ -223,6 +223,15 @@ export interface ModelPreset {
     orphanValues?: Record<string, unknown>
     customBody?: Record<string, unknown>
     customHeaders?: Record<string, string>
+    // Freeform "additional parameters" textarea. One line per entry.
+    // Same legacy syntax as customModels[].params, parsed via
+    // applyAdditionalParameters at wire time. Supports:
+    //   key=value           — body[key] = value (auto type: string/num/bool/null)
+    //   key=json::{...}     — body[key] = JSON.parse(...)
+    //   header::Name=value  — headers[Name] = value
+    //   key={{none}}        — delete body[key] (or headers if header::)
+    // Stored as raw text so the UI round-trips exactly what the user typed.
+    additionalParamsText?: string
     apiKeyRef?: string
     inlineCredential?: unknown
     fallbackModelPresetIds?: string[]

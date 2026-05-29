@@ -4,6 +4,7 @@
     import SettingTabs from "src/lib/UI/GUI/SettingTabs.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import SchemaFormRenderer from "src/lib/UI/GUI/SchemaFormRenderer.svelte";
+    import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import ModelPresetBasicInfo from "./ModelPresetBasicInfo.svelte";
     import { language } from "src/lang";
     import { DBState, openModelProfileBrowser } from "src/ts/stores.svelte";
@@ -136,6 +137,17 @@
                     userValues={editingPreset.userValues}
                     visibility="advanced"
                 />
+                <div class="flex flex-col gap-1 mt-6">
+                    <span class="text-sm text-textcolor">{language.additionalParams}</span>
+                    <span class="text-xs text-textcolor2">{language.additionalParamsHelp}</span>
+                    <TextAreaInput
+                        bind:value={editingPreset.additionalParamsText}
+                        placeholder={'reasoning=json::{"effort":"max"}\nheader::X-Trace-Id=abc'}
+                        fullwidth
+                        autocomplete="off"
+                        height="32"
+                    />
+                </div>
             {/if}
         {/if}
     {/if}

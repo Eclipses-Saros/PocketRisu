@@ -47,6 +47,14 @@ export function buildPreparedRequest(ctx: AdapterRequestContext): AdapterPrepare
     if (ctx.preset.customHeaders) {
         Object.assign(headers, ctx.preset.customHeaders)
     }
+    // Freeform "additional parameters" textarea (legacy customModels syntax).
+    // Routes `header::` prefix to headers, everything else to body. Sits
+    // AFTER customBody so user-typed overrides have the final say, but
+    // BEFORE applyAuth so auth headers cannot be hijacked.
+    const additionalText = ctx.preset.additionalParamsText
+    if (typeof additionalText === 'string' && additionalText.trim().length > 0) {
+        applyAdditionalParamsText(body, headers, additionalText)
+    }
 
     let url = baseUrl
     for (const [k, v] of queryAdditions) {
@@ -164,4 +172,61 @@ function setNested(obj: Record<string, unknown>, path: string, value: unknown): 
         cur = cur[part] as Record<string, unknown>
     }
     cur[parts[parts.length - 1]] = value
+}
+
+// Apply the freeform textarea (one entry per line) to body+headers.
+// Mirrors the legacy customModels params syntax (see process/request/shared.ts
+// applyAdditionalParameters) so existing users' muscle memory carries over:
+//   key=value           — body[key] = auto-typed value
+//   key.path=value      — body[key][path] = value (dot-notation supported)
+//   key=json::{...}     — body[key] = JSON.parse(...)
+//   header::Name=value  — headers[Name] = value
+//   key={{none}}        — delete body[key] (or headers if header:: prefix)
+// Implemented inline (not via shared.ts import) to avoid pulling
+// getDatabase into the adapter, which causes a Vite SSR cycle.
+function applyAdditionalParamsText(
+    body: Record<string, unknown>,
+    headers: Record<string, string>,
+    text: string,
+): void {
+    for (const raw of text.split('\n')) {
+        const line = raw.trim()
+        if (line.length === 0 || line.startsWith('#')) continue
+        const eqIdx = line.indexOf('=')
+        if (eqIdx <= 0) continue
+        const key = line.slice(0, eqIdx).trim()
+        const value = line.slice(eqIdx + 1)
+        if (key.length === 0) continue
+
+        if (value === '{{none}}') {
+            if (key.startsWith('header::')) delete headers[key.slice(8)]
+            else delete body[key]
+            continue
+        }
+        if (key.startsWith('header::')) {
+            headers[key.slice(8)] = value
+            continue
+        }
+        if (value.startsWith('json::')) {
+            try {
+                setNested(body, key, JSON.parse(value.slice(6)))
+            } catch {}
+            continue
+        }
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+            setNested(body, key, value.slice(1, -1))
+            continue
+        }
+        if (value === 'true' || value === 'false') {
+            setNested(body, key, value === 'true')
+            continue
+        }
+        if (value === 'null') {
+            setNested(body, key, null)
+            continue
+        }
+        const num = Number(value)
+        setNested(body, key, Number.isNaN(num) ? value : num)
+    }
 }

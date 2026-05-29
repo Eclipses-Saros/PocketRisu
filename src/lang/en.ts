@@ -962,6 +962,7 @@ export const languageEnglish = {
     log: "Log",
     popularityLevelDesc: "Popularity increases with downloads, etc. to estimate, 3.7 popularity is about 1 downloads.",
     additionalParams: "Additional Parameters",
+    additionalParamsHelp: "One per line. Supports `key=value`, `key=json::{...}`, `header::Name=value`, `key={{none}}`.",
     heightMode: "Height Mode",
     useAdvancedEditor: "Use Advanced Editor",
     noWaitForTranslate: "No Wait for Translate",
