@@ -131,6 +131,15 @@ async function prepareOpenAiBody(
     prepared.body.messages = options.messages.map(toWireMessage)
     prepared.body.model = modelId
     prepared.body.stream = stream
+    // Tool-coupled fields are rejected by OpenAI-compatible APIs when no tools
+    // are present ("parallel_tool_calls is only allowed when tools are
+    // specified"). Profiles may default these (e.g. gpt-5.5 ships
+    // parallel_tool_calls: true), so strip them on tool-less (text) requests.
+    const hasTools = Array.isArray(prepared.body.tools) && prepared.body.tools.length > 0
+    if (!hasTools) {
+        delete prepared.body.parallel_tool_calls
+        delete prepared.body.tool_choice
+    }
     return prepared
 }
 

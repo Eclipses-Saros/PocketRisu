@@ -1,6 +1,6 @@
 import { Ollama } from 'ollama/dist/browser.mjs';
 import { language } from "../../../lang";
-import { globalFetch } from "../../globalApi.svelte";
+import { globalFetch, fetchNative } from "../../globalApi.svelte";
 import { getModelInfo, LLMFlags, LLMFormat, type LLMModel } from "../../model/modellist";
 import { risuChatParser, risuEscape, risuUnescape } from "../../parser/parser.svelte";
 import { pluginProcess, pluginV2 } from "../../plugins/plugins.svelte";
@@ -29,6 +29,7 @@ import {
 } from "src/ts/preset/adapter";
 import type { AdapterKind, ModelPreset } from "src/ts/preset/types";
 import { resolveChatModelBinding, buildModelPresetCredential } from "./modelPresetBinding";
+import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 
 export type ToolCall = {
     name: string;
@@ -492,13 +493,56 @@ function streamModelPreset(
     }
 }
 
+// Route adapter requests through the proxy-aware fetch (fetchNative) instead of
+// globalThis.fetch: NodeOnly runs in the browser, so a direct cross-origin fetch
+// to a provider that doesn't send CORS headers fails ("Failed to fetch").
+// fetchNative tries a direct fetch first and falls back to the node /proxy2,
+// matching the classic request path.
+// chatId (= the message generationId) is threaded into fetchNative so the
+// request is recorded in the fetch log against the message — otherwise the
+// per-message "view log" shows "deleted log" for binding requests.
+function makeProxiedFetch(chatId?: string): typeof fetch {
+    return ((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString()
+        return fetchNative(url, {
+            method: (init?.method as 'POST' | 'GET' | 'PUT' | 'DELETE') ?? 'POST',
+            headers: (init?.headers as Record<string, string>) ?? {},
+            body: init?.body as string,
+            signal: init?.signal ?? undefined,
+            chatId,
+            // Local providers (e.g. self-hosted Ollama) must route through the node
+            // proxy rather than a browser-direct fetch to a private address.
+            networkRoute: isLocalNetworkUrl(url) ? 'local_network' : 'auto',
+            // Honor the same request-timeout the classic path uses.
+            requestTimeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
+        })
+    }) as typeof fetch
+}
+
+// Pull out adapter-error detail for logging without leaking the credential.
+function describeModelPresetError(err: unknown): Record<string, unknown> {
+    if (err && typeof err === 'object') {
+        const e = err as Record<string, unknown>
+        return {
+            name: (e.name as string) ?? undefined,
+            kind: e.kind,
+            status: e.status,
+            retryable: e.retryable,
+            fallbackEligible: e.fallbackEligible,
+            message: e.message ?? String(err),
+            cause: e.cause instanceof Error ? e.cause.message : e.cause,
+        }
+    }
+    return { message: String(err) }
+}
+
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
     const messages = arg.formated.map(toAdapterMessage)
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
     const useStreaming = arg.forceStreaming ? true : (db.useStreaming && arg.useStreaming)
-    const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined }
+    const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl: makeProxiedFetch(arg.chatId) }
 
     try {
         if(useStreaming){
@@ -513,6 +557,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                         }
                         controller.close()
                     } catch (err) {
+                        console.error('[ModelPreset] stream error', describeModelPresetError(err))
                         controller.error(err)
                     }
                 }
@@ -522,6 +567,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         const response = await sendModelPreset(kind, preset, options, credential)
         return { type: 'success', result: response.text, model: preset.name }
     } catch (err) {
+        console.error('[ModelPreset] request failed', describeModelPresetError(err))
         return {
             type: 'fail',
             result: err instanceof Error ? err.message : String(err),
