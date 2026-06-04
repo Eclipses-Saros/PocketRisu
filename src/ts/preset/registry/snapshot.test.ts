@@ -204,7 +204,7 @@ describe('resolveSnapshot', () => {
             'openrouter:openai-compatible',
             'nanogpt:openai-compatible',
             'ollama:openai-compatible-local',
-            'deepseek:v4',
+            'deepseek:v4-flash',
             'deepinfra:openai-compatible',
             'vercel:openai-compatible',
         ]
