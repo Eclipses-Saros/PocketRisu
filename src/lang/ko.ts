@@ -678,7 +678,7 @@ export const languageKorean = {
   useCustomBackground: "커스텀 배경",
   translateInput: "입력창 번역하기",
   autoTranslation: "자동 번역",
-  fullscreen: "전체 화면",
+  fullscreen: "전체화면(비권장)",
   playMessage: "메시지 소리 출력",
   iconSize: "아이콘 크기",
   single: "싱글",
@@ -709,6 +709,12 @@ export const languageKorean = {
   backupLoadConfirm2:
     "정말로, 정말로 백업을 불러오시겠습니까? 현재 데이터가 모두 사라집니다!",
   others: "기타",
+  sectionInterface: "인터페이스",
+  sectionHomeList: "홈 / 채팅 목록",
+  sectionChatView: "채팅 화면",
+  sectionBubble: "말풍선 스타일",
+  sectionQuotes: "따옴표",
+  sectionAdvanced: "고급",
   presets: "프리셋",
   themePresets: "테마 프리셋",
   imageGeneration: "이미지 생성",
@@ -1252,7 +1258,7 @@ export const languageKorean = {
   convertionStep1:
     "프롬프트와 관련된 모든 파일을 선택하세요 (컨텍스트, 인스트럭트, 샘플러 JSON을 지원합니다)",
   customCSS: "커스텀 CSS",
-  betaMobileGUI: "베타 모바일 GUI",
+  betaMobileGUI: "모바일 GUI(비권장)",
   enableScrollToActiveChar: "활성 캐릭터로 스크롤 활성화",
   menu: "메뉴",
   jsonSchema: "JSON 스키마",
@@ -1322,7 +1328,7 @@ export const languageKorean = {
   destinationLanguage: "목표 언어",
   noWebGPU:
     "브라우저 또는 OS가 WebGPU를 지원하지 않습니다. 이로 인해 성능이 크게 저하될 수 있습니다.",
-  menuSideBar: "메뉴 사이드바",
+  menuSideBar: "메뉴 사이드바(비권장)",
   home: "홈",
   showSavingIcon: "저장 아이콘 표시",
   pluginVersionWarn:

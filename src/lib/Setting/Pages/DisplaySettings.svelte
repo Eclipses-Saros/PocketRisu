@@ -6,7 +6,11 @@
     import SettingRenderer from "../SettingRenderer.svelte";
     import { DBState, openThemePresetList } from "src/ts/stores.svelte";
     import {
-        displayOtherSettingsItems,
+        displayOtherHomeItems,
+        displayOtherChatItems,
+        displayOtherBubbleItems,
+        displayOtherQuoteItems,
+        displayOtherAdvancedItems,
         displaySizeSettingsItems,
         displayThemeSettingsItems,
     } from "src/ts/setting/displaySettingsData.svelte";
@@ -34,6 +38,19 @@
 {:else if submenu === 1}
     <SettingRenderer items={displaySizeSettingsItems} layout="row" />
 {:else if submenu === 2}
-    <SettingRenderer items={displayOtherSettingsItems} />
+    <h3 class="text-base font-bold mt-2 mb-1">{language.sectionHomeList}</h3>
+    <SettingRenderer items={displayOtherHomeItems} layout="row" />
+
+    <h3 class="text-base font-bold mt-8 mb-1">{language.sectionChatView}</h3>
+    <SettingRenderer items={displayOtherChatItems} layout="row" />
+
+    <h3 class="text-base font-bold mt-8 mb-1">{language.sectionBubble}</h3>
+    <SettingRenderer items={displayOtherBubbleItems} layout="row" />
+
+    <h3 class="text-base font-bold mt-8 mb-1">{language.sectionQuotes}</h3>
+    <SettingRenderer items={displayOtherQuoteItems} layout="row" />
+
+    <h3 class="text-base font-bold mt-8 mb-1">{language.sectionAdvanced}</h3>
+    <SettingRenderer items={displayOtherAdvancedItems} layout="row" />
 {/if}
 </SettingPage>

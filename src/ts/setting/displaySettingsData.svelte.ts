@@ -301,23 +301,22 @@ export const displaySizeSettingsItems: SettingItem[] = [
     },
 ];
 
-export const displayOtherSettingsItems: SettingItem[] = [
-    {
-        id: 'display.fullScreen',
-        type: 'check',
-        labelKey: 'fullscreen',
-        helpKey: 'fullscreen',
-        bindKey: 'fullScreen',
-        onChange: () => changeFullscreen(),
-        keywords: ['fullscreen'],
-    },
-    { id: 'display.showMemoryLimit', type: 'check', labelKey: 'showMemoryLimit', helpKey: 'showMemoryLimit', bindKey: 'showMemoryLimit', keywords: ['memory', 'limit'] },
+export const displayOtherHomeItems: SettingItem[] = [
     { id: 'display.hideRealm', type: 'check', labelKey: 'hideRealm', helpKey: 'hideRealm', bindKey: 'hideRealm', keywords: ['realm', 'hide'] },
-    { id: 'display.hideAllImages', type: 'check', labelKey: 'hideAllImages', helpKey: 'hideAllImagesDesc', bindKey: 'hideAllImages', keywords: ['images', 'hide'] },
-    { id: 'display.hideMessagePageCount', type: 'check', labelKey: 'hideMessagePageCount', helpKey: 'hideMessagePageCountDesc', bindKey: 'hideMessagePageCount', keywords: ['message', 'page', 'count', 'hide'] },
     { id: 'display.showFolderName', type: 'check', labelKey: 'showFolderNameInIcon', helpKey: 'showFolderNameInIcon', bindKey: 'showFolderName', keywords: ['folder', 'name', 'icon'] },
-    { id: 'display.customBackground', type: 'custom', componentId: 'CustomBackgroundToggle', keywords: ['custom', 'background'] },
     { id: 'display.roundIcons', type: 'check', labelKey: 'roundIcons', helpKey: 'roundIcons', bindKey: 'roundIcons', keywords: ['round', 'icons'] },
+    { id: 'display.hideMessagePageCount', type: 'check', labelKey: 'hideMessagePageCount', helpKey: 'hideMessagePageCountDesc', bindKey: 'hideMessagePageCount', keywords: ['message', 'page', 'count', 'hide'] },
+];
+
+export const displayOtherChatItems: SettingItem[] = [
+    { id: 'display.customBackground', type: 'custom', componentId: 'CustomBackgroundToggle', keywords: ['custom', 'background'] },
+    { id: 'display.hideAllImages', type: 'check', labelKey: 'hideAllImages', helpKey: 'hideAllImagesDesc', bindKey: 'hideAllImages', keywords: ['images', 'hide'] },
+    { id: 'display.useAdditionalAssetsPreview', type: 'check', labelKey: 'useAdditionalAssetsPreview', helpKey: 'useAdditionalAssetsPreview', bindKey: 'useAdditionalAssetsPreview', keywords: ['additional', 'assets', 'preview'] },
+    { id: 'display.showMemoryLimit', type: 'check', labelKey: 'showMemoryLimit', helpKey: 'showMemoryLimit', bindKey: 'showMemoryLimit', keywords: ['memory', 'limit'] },
+    { id: 'display.showSavingIcon', type: 'check', labelKey: 'showSavingIcon', helpKey: 'showSavingIcon', bindKey: 'showSavingIcon', keywords: ['saving', 'icon'] },
+];
+
+export const displayOtherBubbleItems: SettingItem[] = [
     {
         id: 'display.textScreenColor',
         type: 'custom',
@@ -330,10 +329,6 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['text', 'background', 'color'],
     },
-    { id: 'display.textBorder', type: 'check', labelKey: 'textBorder', helpKey: 'textBorder', bindKey: 'textBorder', keywords: ['text', 'border'] },
-    { id: 'display.textScreenRounded', type: 'check', labelKey: 'textScreenRound', helpKey: 'textScreenRound', bindKey: 'textScreenRounded', keywords: ['text', 'round'] },
-    { id: 'display.showSavingIcon', type: 'check', labelKey: 'showSavingIcon', helpKey: 'showSavingIcon', bindKey: 'showSavingIcon', keywords: ['saving', 'icon'] },
-    { id: 'display.showPromptComparison', type: 'check', labelKey: 'showPromptComparison', helpKey: 'showPromptComparison', bindKey: 'showPromptComparison', keywords: ['prompt', 'comparison'] },
     {
         id: 'display.textScreenBorder',
         type: 'custom',
@@ -346,8 +341,11 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['text', 'screen', 'border', 'color'],
     },
-    { id: 'display.useAdditionalAssetsPreview', type: 'check', labelKey: 'useAdditionalAssetsPreview', helpKey: 'useAdditionalAssetsPreview', bindKey: 'useAdditionalAssetsPreview', keywords: ['additional', 'assets', 'preview'] },
-    { id: 'display.hideApiKey', type: 'check', labelKey: 'hideApiKeys', helpKey: 'hideApiKeys', bindKey: 'hideApiKey', keywords: ['api', 'key', 'hide'] },
+    { id: 'display.textScreenRounded', type: 'check', labelKey: 'textScreenRound', helpKey: 'textScreenRound', bindKey: 'textScreenRounded', keywords: ['text', 'round'] },
+    { id: 'display.textBorder', type: 'check', labelKey: 'textBorder', helpKey: 'textBorder', bindKey: 'textBorder', keywords: ['text', 'border'] },
+];
+
+export const displayOtherQuoteItems: SettingItem[] = [
     { id: 'display.unformatQuotes', type: 'check', labelKey: 'unformatQuotes', helpKey: 'unformatQuotes', bindKey: 'unformatQuotes', keywords: ['quotes'] },
     { id: 'display.blockquoteStyling', type: 'check', labelKey: 'blockquoteStyling', helpKey: 'blockquoteStyling', bindKey: 'blockquoteStyling', keywords: ['blockquote', 'quote'] },
     { id: 'display.customQuotes', type: 'check', labelKey: 'customQuotes', helpKey: 'customQuotes', bindKey: 'customQuotes', keywords: ['custom', 'quotes'] },
@@ -403,8 +401,22 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['quote', 'single', 'trailing'],
     },
-    { id: 'display.betaMobileGUI', type: 'check', labelKey: 'betaMobileGUI', helpKey: 'betaMobileGUI', bindKey: 'betaMobileGUI', keywords: ['beta', 'mobile', 'gui'] },
+];
+
+export const displayOtherAdvancedItems: SettingItem[] = [
+    { id: 'display.hideApiKey', type: 'check', labelKey: 'hideApiKeys', helpKey: 'hideApiKeys', bindKey: 'hideApiKey', keywords: ['api', 'key', 'hide'] },
+    { id: 'display.showPromptComparison', type: 'check', labelKey: 'showPromptComparison', helpKey: 'showPromptComparison', bindKey: 'showPromptComparison', keywords: ['prompt', 'comparison'] },
+    {
+        id: 'display.fullScreen',
+        type: 'check',
+        labelKey: 'fullscreen',
+        helpKey: 'fullscreen',
+        bindKey: 'fullScreen',
+        onChange: () => changeFullscreen(),
+        keywords: ['fullscreen'],
+    },
     { id: 'display.menuSideBar', type: 'check', labelKey: 'menuSideBar', helpKey: 'menuSideBar', bindKey: 'menuSideBar', keywords: ['menu', 'sidebar'] },
+    { id: 'display.betaMobileGUI', type: 'check', labelKey: 'betaMobileGUI', helpKey: 'betaMobileGUI', bindKey: 'betaMobileGUI', keywords: ['beta', 'mobile', 'gui'] },
     {
         id: 'display.useChatSticker',
         type: 'check',
@@ -420,5 +432,9 @@ export const displayOtherSettingsItems: SettingItem[] = [
 export const displaySettingsItems: SettingItem[] = [
     ...displayThemeSettingsItems,
     ...displaySizeSettingsItems,
-    ...displayOtherSettingsItems,
+    ...displayOtherHomeItems,
+    ...displayOtherChatItems,
+    ...displayOtherBubbleItems,
+    ...displayOtherQuoteItems,
+    ...displayOtherAdvancedItems,
 ];

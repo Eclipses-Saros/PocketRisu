@@ -409,8 +409,7 @@ export const helpEn = {
             "Start the Recently Uploaded section on the home screen collapsed. While collapsed it skips the RisuRealm fetch, speeding up initial load. You can expand it any time from the home screen.",
         showFolderNameInIcon:
             "Show folder names on folder icons in the character grid. Makes large folder collections easier to scan.",
-        customBackground:
-            "Use a custom image as the chat background. Enabling this opens a file picker; turning it off removes the custom background.",
+        customBackground: "A custom image used as the chat background.",
         playMessageOnTranslateEnd:
             "Play a separate notification sound when translation finishes. Useful when automatic translation is enabled and you want an audible completion cue.",
         roundIcons:
