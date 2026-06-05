@@ -106,10 +106,10 @@
                         <span>{language.display}</span>
                     </button>
                     <button class="flex gap-2 items-center hover:text-textcolor"
-                        class:text-textcolor={$SettingsMenuIndex === 5}
-                        class:text-textcolor2={$SettingsMenuIndex !== 5}
+                        class:text-textcolor={$SettingsMenuIndex === 7}
+                        class:text-textcolor2={$SettingsMenuIndex !== 7}
                         onclick={() => {
-                            $SettingsMenuIndex = 5
+                            $SettingsMenuIndex = 7
                     }}>
                         <Volume2Icon />
                         <span>{language.soundAndNotification}</span>
@@ -254,7 +254,7 @@
                             <OtherBotSettings />
                         {:else if $SettingsMenuIndex === 3}
                             <DisplaySettings />
-                        {:else if $SettingsMenuIndex === 5}
+                        {:else if $SettingsMenuIndex === 7}
                             <NotificationSoundSettings />
                         {:else if $SettingsMenuIndex === 4}
                             <PluginSettings />
