@@ -28,6 +28,10 @@ export interface ToolLoopDeps {
     // text segment. Injected (not hardcoded) so the loop stays free of Risu's
     // <Thoughts> convention. Returns '' to show nothing.
     formatReasoning?: (reasoning?: AdapterReasoningPart[]) => string
+    // Optional: when the user cancels mid-loop, stop launching further tools.
+    // Checked before EACH tool call so a parallel batch doesn't keep firing
+    // write-side tools after an abort. (send() already honors abort via fetch.)
+    abortSignal?: AbortSignal
 }
 
 // Drives the tool-use loop: send → if the model requested tools, execute them and
@@ -76,6 +80,14 @@ export async function runToolLoop(
         // tool continuation that drops their prior thoughts/signature.
         convo.push({ role: 'assistant', content: response.text, toolCalls: calls, reasoning: response.reasoning, providerEcho: response.providerEcho })
         for (const call of calls) {
+            // Stop launching tools once the user cancels — otherwise the rest of a
+            // parallel batch keeps firing (possibly write-side) after the abort.
+            // If any tool already ran, return partial so the outer retry loop
+            // (guarded by toolExecuted) won't replay the prompt and re-run them.
+            if (deps.abortSignal?.aborted) {
+                parts.push('[ModelPreset: aborted before completing tool calls]')
+                return joinParts(parts)
+            }
             // Mark BEFORE executing: executeTool causes side effects (the actual
             // tool runs inside it). Any failure from here on — including the
             // persistence write — must not bubble to the outer retry loop, or it

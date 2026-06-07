@@ -615,8 +615,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
 
     // Tool gating. Three guards:
     //  1) Per-preset opt-in (preset.toolUse, default OFF) — the hard regression
-    //     guard: while off, this preset's requests behave exactly as before
-    //     (text only, streaming allowed) even for MCP users.
+    //     guard: while off, this preset's requests stay text-only (streaming
+    //     allowed) even for MCP users. One deliberate difference from "do
+    //     nothing": the adapters strip any customBody-provided tools /
+    //     tool_choice / toolConfig so OFF is a true text gate — a request that
+    //     manually smuggled tool fields via customBody will lose them.
     //  2) Adapter-kind allowlist — only adapters whose tool wire is implemented.
     //  3) Capability gate: the profile must EXPLICITLY declare 'tools'. Stricter
     //     than the streaming convention (no `!caps` shortcut) so it matches the
@@ -646,8 +649,12 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         ? await expandAdapterMessages(arg.formated, decodeToolCall, supportsVision)
         : arg.formated.map((m) => toAdapterMessage(m, supportsVision))
 
-    // previewBody must NEVER hit the network or run tools — build the request and
-    // return it as a preview. Mirrors the classic adapters' previewBody handling.
+    // previewBody never calls the chat endpoint and never runs tools — it just
+    // builds and returns the prepared request. (One caveat: a google-service-
+    // account profile may still perform an OAuth token exchange during credential
+    // resolution if its token cache is empty/expired — that exchange is not the
+    // chat request. API-key profiles make no network call here.) Mirrors the
+    // classic adapters' previewBody handling.
     if (arg.previewBody) {
         try {
             const prepared = await previewModelPreset(kind, preset, { messages, tools, fetchImpl }, credential)
@@ -724,6 +731,7 @@ async function runModelPresetToolLoop(
     const result = await runToolLoop(messages, {
         maxSteps: MODEL_PRESET_MAX_TOOL_STEPS,
         formatReasoning: formatPresetReasoning,
+        abortSignal: abortSignal ?? undefined,
         send: (convo) => sendModelPreset(
             kind, preset,
             { messages: convo, tools, abortSignal: abortSignal ?? undefined, fetchImpl },

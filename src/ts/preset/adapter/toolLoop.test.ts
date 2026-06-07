@@ -156,6 +156,33 @@ describe('runToolLoop', () => {
         expect(executeTool).not.toHaveBeenCalled()
     })
 
+    test('stops launching tools mid-batch once aborted (no further side effects)', async () => {
+        // Parallel batch of two write-side tools; the user cancels while the first
+        // runs. The second must NOT fire, and the loop returns partial (no re-run).
+        const controller = new AbortController()
+        const { send } = scriptedSend([
+            res('', [call('a', 'writerA'), call('b', 'writerB')]),
+            res('should-not-reach'),
+        ])
+        let ran = 0
+        const executeTool = vi.fn(async () => { ran++; controller.abort(); return { text: 'ok' } })
+        const out = await runToolLoop(initial, { send, executeTool, maxSteps: 8, abortSignal: controller.signal })
+        expect(ran).toBe(1)                       // only the first tool ran
+        expect(executeTool).toHaveBeenCalledTimes(1)
+        expect(out).toContain('aborted before completing tool calls')
+        expect(send).toHaveBeenCalledTimes(1)     // did NOT re-request after abort
+    })
+
+    test('launches no tools when already aborted before the batch', async () => {
+        const controller = new AbortController()
+        controller.abort()
+        const { send } = scriptedSend([res('text', [call('a', 'writer')])])
+        const executeTool = vi.fn(async () => ({ text: 'ok' }))
+        const out = await runToolLoop(initial, { send, executeTool, maxSteps: 8, abortSignal: controller.signal })
+        expect(executeTool).not.toHaveBeenCalled()
+        expect(out).toContain('aborted before completing tool calls')
+    })
+
     test('does not mutate the caller-provided initial messages', async () => {
         const { send } = scriptedSend([res('hi')])
         const frozen = [...initial]
