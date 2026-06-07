@@ -1513,6 +1513,8 @@ export const languageKorean = {
   modelPresetBindedSuccess: "모델 프리셋이 성공적으로 바인드되었습니다.",
   streamingOverride: "응답 스트리밍",
   streamingOverrideHelp: "이 프리셋이 응답을 스트리밍할지 여부.",
+  modelPresetToolUse: "도구 사용",
+  modelPresetToolUseHelp: "이 프리셋이 설정된 도구(MCP)를 호출하도록 허용합니다. 기본 꺼짐. 도구 실행 시 스트리밍 없이 전송됩니다.",
   maxContextHelp: "이 프리셋의 입력(프롬프트) 토큰 예산. 비우면 기본값(65000)을 쓰고, 모델 컨텍스트 윈도우 한도로 제한됩니다. 응답 길이(Max Tokens)와는 다릅니다.",
   modelPresetTabPresets: "프리셋",
   modelPresetTabOptions: "설정",

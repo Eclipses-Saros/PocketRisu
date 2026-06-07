@@ -7,9 +7,13 @@ export type {
     AdapterCredential,
     AdapterError,
     AdapterErrorKind,
+    AdapterImagePart,
     AdapterPreparedRequest,
+    AdapterReasoningPart,
     AdapterRequestContext,
     AdapterStreamEvent,
+    AdapterToolCall,
+    AdapterToolDef,
     AdapterUsage,
 } from './types'
 
@@ -33,6 +37,8 @@ export {
     normalizeHttpStatus,
 } from './error'
 export { parseSseEventBlock, parseSseStream } from './sse'
-export { sendChatRequest, streamChatRequest } from './openaiCompatible'
-export { sendAnthropicChatRequest, streamAnthropicChatRequest } from './anthropicMessages'
-export { sendGoogleChatRequest, streamGoogleChatRequest } from './googleGemini'
+export { sendChatRequest, streamChatRequest, previewChatRequest } from './openaiCompatible'
+export { sendAnthropicChatRequest, streamAnthropicChatRequest, previewAnthropicChatRequest } from './anthropicMessages'
+export { sendGoogleChatRequest, streamGoogleChatRequest, previewGoogleChatRequest } from './googleGemini'
+export { runToolLoop } from './toolLoop'
+export type { ToolLoopDeps, ToolStepResult } from './toolLoop'

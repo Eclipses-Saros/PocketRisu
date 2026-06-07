@@ -20,6 +20,7 @@
     import { alertConfirm, notifySuccess } from "src/ts/alert";
     import { getOfficialRegistry, getPresetUpdateStatus, syncRemoteRegistry } from "src/ts/preset/registry";
     import { buildSeenMap, computeRegistryNotice, noticeCount } from "src/ts/preset/registry/notice";
+    import { TOOL_CAPABLE_ADAPTER_KINDS } from "src/ts/preset/types";
     import { onMount } from "svelte";
     import { v4 as uuidv4 } from "uuid";
 
@@ -136,6 +137,17 @@
                             <ShSwitch checked={!!editingPreset.useStreaming} onCheckedChange={(v) => { editingPreset.useStreaming = v }} />
                         </div>
                     </div>
+                    {#if (editingPreset.profileSnapshot.capabilities ?? []).includes('tools') && TOOL_CAPABLE_ADAPTER_KINDS.includes(editingPreset.profileSnapshot.adapterKind)}
+                        <div class="flex items-center justify-between gap-3">
+                            <div class="flex flex-col gap-0.5 min-w-0">
+                                <span class="text-sm text-textcolor">{language.modelPresetToolUse}</span>
+                                <span class="text-xs text-textcolor2">{language.modelPresetToolUseHelp}</span>
+                            </div>
+                            <div class="shrink-0">
+                                <ShSwitch checked={!!editingPreset.toolUse} onCheckedChange={(v) => { editingPreset.toolUse = v }} />
+                            </div>
+                        </div>
+                    {/if}
                 </div>
                 <SchemaFormRenderer
                     schema={editingPreset.profileSnapshot.schema}

@@ -6,10 +6,10 @@ import { risuChatParser, risuEscape, risuUnescape } from "../../parser/parser.sv
 import { pluginProcess, pluginV2 } from "../../plugins/plugins.svelte";
 import { getCurrentCharacter, getCurrentChat, getDatabase, type character } from "../../storage/database.svelte";
 import { tokenizeNum } from "../../tokenizer";
-import { sleep } from "../../util";
+import { simplifySchema, sleep } from "../../util";
 import type { OpenAIChat } from "../index.svelte";
-import { getTools } from "../mcp/mcp";
-import type { MCPTool } from "../mcp/mcplib";
+import { getTools, callTool, encodeToolCall, decodeToolCall } from "../mcp/mcp";
+import type { MCPTool, RPCToolCallContent } from "../mcp/mcplib";
 import { NovelAIBadWordIds, stringlizeNAIChat } from "../models/nai";
 import { OobaParams } from "../prompt";
 import { getStopStrings, stringlizeAINChat, unstringlizeAIN, unstringlizeChat } from "../stringlize";
@@ -21,14 +21,17 @@ import { requestGoogleCloudVertex } from './google';
 import { requestOpenAI, requestOpenAILegacyInstruct, requestOpenAIResponseAPI } from "./openAI/requests";
 import { applyParameters, type ModelModeExtended } from './shared';
 import {
-    sendChatRequest, streamChatRequest,
-    sendAnthropicChatRequest, streamAnthropicChatRequest,
-    sendGoogleChatRequest, streamGoogleChatRequest,
+    sendChatRequest, streamChatRequest, previewChatRequest,
+    sendAnthropicChatRequest, streamAnthropicChatRequest, previewAnthropicChatRequest,
+    sendGoogleChatRequest, streamGoogleChatRequest, previewGoogleChatRequest,
+    runToolLoop,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
     type AdapterChatStreamDelta, type AdapterCredential,
+    type AdapterToolCall, type AdapterToolDef,
 } from "src/ts/preset/adapter";
-import type { AdapterKind, ModelPreset } from "src/ts/preset/types";
+import { TOOL_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { resolveChatModelBinding, buildModelPresetCredential } from "./modelPresetBinding";
+import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 
 export type ToolCall = {
@@ -80,6 +83,10 @@ export type requestDataResponse = {
     type: 'success'|'fail'
     result: string
     noRetry?: boolean,
+    // Set when a ModelPreset request actually executed tools. The outer
+    // requestChatData loop must not re-run such a response (banned-charset /
+    // blank-response retries), or side-effecting tools would fire twice.
+    toolExecuted?: boolean,
     special?: {
         emotion?: string
     },
@@ -172,6 +179,26 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 tools: tools,
             }, model, abortSignal)
 
+            // A ModelPreset response that already executed tools must be returned
+            // as-is and NEVER re-run: the side effects (possibly writes) are done.
+            // This guard runs BEFORE the abort check and the success-path retries
+            // (banned charset / blank fallback) — otherwise a follow-up abort or a
+            // ban/blank hit would discard the result and the outer loop would
+            // replay the prompt, double-executing tools. after-replacers still run
+            // (transform only), but in a try/catch so a throwing plugin can't lose
+            // the side-effect record either.
+            if(da.type === 'success' && da.toolExecuted){
+                if(arg.escape) da.result = risuEscape(da.result)
+                for(const replacer of pluginV2.replacerafterRequest){
+                    try { da.result = await replacer(da.result, model) }
+                    catch(e){ console.error('[ModelPreset] after-replacer failed', e) }
+                }
+                return {
+                    ...da,
+                    model: fallBackModels[fallbackIndex] || da.model
+                }
+            }
+
             if(abortSignal?.aborted){
                 return {
                     type: 'fail',
@@ -182,13 +209,13 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             if(da.type === 'success' && arg.escape){
                 da.result = risuEscape(da.result)
             }
-    
+
             if(da.type === 'success' && pluginV2.replacerafterRequest.size > 0){
                 for(const replacer of pluginV2.replacerafterRequest){
                     da.result = await replacer(da.result, model)
                 }
             }
-    
+
             if(da.type === 'success' && db.banCharacterset?.length > 0){
                 let failed = false
                 for(const set of db.banCharacterset){
@@ -456,20 +483,6 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
 }
 
 
-// P4 text bridge (plan v6 §7). Converts the classic OpenAIChat[] prompt to the
-// adapter's AdapterChatMessage[], routes by adapterKind, and normalizes the
-// AdapterChatResponse back into a requestDataResponse. The send/stream/parse
-// adapter layer (preset/adapter) is reused as-is.
-//
-// Scope: TEXT ONLY. Multimodal / tools / thoughts are dropped here because
-// AdapterChatMessage does not model them yet (deferred to a later sprint).
-function toAdapterMessage(m: OpenAIChat): AdapterChatMessage {
-    const role: AdapterChatMessage['role'] = m.role === 'function' ? 'tool' : m.role
-    const msg: AdapterChatMessage = { role, content: m.content ?? '' }
-    if (m.name) msg.name = m.name
-    return msg
-}
-
 function sendModelPreset(
     kind: AdapterKind,
     preset: ModelPreset,
@@ -493,6 +506,19 @@ function streamModelPreset(
         case 'openai-compatible': return streamChatRequest(preset, options, credential)
         case 'anthropic-messages': return streamAnthropicChatRequest(preset, options, credential)
         case 'google-gemini': return streamGoogleChatRequest(preset, options, credential)
+    }
+}
+
+function previewModelPreset(
+    kind: AdapterKind,
+    preset: ModelPreset,
+    options: AdapterChatOptions,
+    credential: AdapterCredential | undefined,
+) {
+    switch (kind) {
+        case 'openai-compatible': return previewChatRequest(preset, options, credential)
+        case 'anthropic-messages': return previewAnthropicChatRequest(preset, options, credential)
+        case 'google-gemini': return previewGoogleChatRequest(preset, options, credential)
     }
 }
 
@@ -551,14 +577,78 @@ function resolvePresetStreaming(preset: ModelPreset, arg: RequestDataArgumentExt
     return !!preset.useStreaming && (arg.useStreaming ?? true)
 }
 
+// Tool-execution rounds allowed per request before we stop and surface a
+// marker. Deliberately separate from the network retry budget (db.requestRetrys,
+// applied by the outer requestChatData loop): conflating them would let a failed
+// follow-up re-run already-executed (possibly write-side) tools.
+const MODEL_PRESET_MAX_TOOL_STEPS = 8
+
+function toAdapterToolDef(tool: MCPTool): AdapterToolDef {
+    return {
+        name: tool.name,
+        description: tool.description,
+        // simplifySchema mutates; clone first. Stage 1 targets openai-compatible,
+        // whose schema shape matches the default simplification.
+        parameters: simplifySchema(safeStructuredClone(tool.inputSchema)),
+    }
+}
+
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
-    const messages = arg.formated.map(toAdapterMessage)
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
-    const useStreaming = resolvePresetStreaming(preset, arg)
-    const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl: makeProxiedFetch(arg.chatId) }
+    const fetchImpl = makeProxiedFetch(arg.chatId)
+
+    // Tool gating. Three guards:
+    //  1) Per-preset opt-in (preset.toolUse, default OFF) — the hard regression
+    //     guard: while off, this preset's requests behave exactly as before
+    //     (text only, streaming allowed) even for MCP users.
+    //  2) Adapter-kind allowlist — only adapters whose tool wire is implemented.
+    //  3) Capability gate: the profile must EXPLICITLY declare 'tools'. Stricter
+    //     than the streaming convention (no `!caps` shortcut) so it matches the
+    //     editor toggle's visibility — a capability-less custom profile (e.g.
+    //     after a profile swap that kept toolUse) can never activate tools.
+    const caps = preset.profileSnapshot.capabilities
+    const supportsTools = preset.toolUse === true
+        && TOOL_CAPABLE_ADAPTER_KINDS.includes(kind)
+        && (caps?.includes('tools') ?? false)
+    const tools = (supportsTools && arg.tools && arg.tools.length > 0)
+        ? arg.tools.map(toAdapterToolDef)
+        : undefined
+
+    // Expand `<tool_call>` history into structured tool turns ONLY on the active
+    // tool path. With tools off, fall back to the plain mapping so existing chats
+    // behave exactly as before (literal passthrough; no tool-role messages that a
+    // text-only adapter would reject). Guards regression P1#2.
+    const messages = tools
+        ? await expandAdapterMessages(arg.formated, decodeToolCall)
+        : arg.formated.map(toAdapterMessage)
+
+    // previewBody must NEVER hit the network or run tools — build the request and
+    // return it as a preview. Mirrors the classic adapters' previewBody handling.
+    if (arg.previewBody) {
+        try {
+            const prepared = await previewModelPreset(kind, preset, { messages, tools, fetchImpl }, credential)
+            return {
+                type: 'success',
+                result: JSON.stringify({ url: prepared.url, body: prepared.body, headers: prepared.headers }),
+                model: preset.name,
+            }
+        } catch (err) {
+            return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: preset.name }
+        }
+    }
 
     try {
+        // Tool runs always go non-streaming for now: the execute→re-request loop
+        // needs the full structured response (tool_calls) each turn, and
+        // streaming tool_call assembly is a later stage.
+        if (tools) {
+            const { result, toolsExecuted } = await runModelPresetToolLoop(arg, preset, kind, credential, fetchImpl, messages, tools, abortSignal)
+            return { type: 'success', result, model: preset.name, toolExecuted: toolsExecuted }
+        }
+
+        const useStreaming = resolvePresetStreaming(preset, arg)
+        const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl }
         if(useStreaming){
             const gen = streamModelPreset(kind, preset, options, credential)
             const stream = new ReadableStream<StreamResponseChunk>({
@@ -587,6 +677,78 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             result: err instanceof Error ? err.message : String(err),
             model: preset.name,
         }
+    }
+}
+
+// Binds the real send + tool execution to the generic runToolLoop (kept in the
+// adapter layer so it is unit-testable without request.ts's import graph).
+// Mirrors the classic recursive path (openAI/requests.ts): the visible result
+// interleaves model text with `<tool_call>` markers (encoded when
+// rememberToolUsage is on) so the turn round-trips on the next request.
+async function runModelPresetToolLoop(
+    arg: RequestDataArgumentExtended,
+    preset: ModelPreset,
+    kind: AdapterKind,
+    credential: AdapterCredential | undefined,
+    fetchImpl: typeof fetch,
+    messages: AdapterChatMessage[],
+    tools: AdapterToolDef[],
+    abortSignal: AbortSignal | null,
+): Promise<{ result: string; toolsExecuted: boolean }> {
+    // Tracks whether any tool actually ran, so the caller can block outer
+    // success-path retries that would otherwise re-execute side-effecting tools.
+    let toolsExecuted = false
+    const result = await runToolLoop(messages, {
+        maxSteps: MODEL_PRESET_MAX_TOOL_STEPS,
+        send: (convo) => sendModelPreset(
+            kind, preset,
+            { messages: convo, tools, abortSignal: abortSignal ?? undefined, fetchImpl },
+            credential,
+        ),
+        executeTool: async (call) => {
+            toolsExecuted = true
+            const executed = await executeModelPresetTool(arg, call)
+            // Persistence is best-effort: the tool already ran, so a failed
+            // encode must not throw (the loop would otherwise drop later results,
+            // and a propagated error could trigger an outer re-run). Skip the
+            // round-trip marker on failure instead.
+            let encoded: string | undefined
+            if (arg.rememberToolUsage && executed.response.length > 0) {
+                try {
+                    encoded = await encodeToolCall({
+                        call: { id: call.id, name: call.name, arg: call.arguments },
+                        response: executed.response,
+                    })
+                } catch (e) {
+                    console.error('[ModelPreset] tool-call persistence failed', e)
+                }
+            }
+            return { text: executed.text, encoded }
+        },
+    })
+    return { result, toolsExecuted }
+}
+
+async function executeModelPresetTool(
+    arg: RequestDataArgumentExtended,
+    call: AdapterToolCall,
+): Promise<{ text: string, response: RPCToolCallContent[] }> {
+    const tool = (arg.tools ?? []).find(t => t.name === call.name)
+    if (!tool) {
+        return { text: 'No tool found with name: ' + call.name, response: [] }
+    }
+    let parsedArgs: unknown
+    try {
+        parsedArgs = call.arguments ? JSON.parse(call.arguments) : {}
+    } catch (e) {
+        return { text: 'Tool call has invalid JSON arguments: ' + (e instanceof Error ? e.message : String(e)), response: [] }
+    }
+    try {
+        const response = await callTool(call.name, parsedArgs)
+        const text = toolResponseText(response)
+        return { text: text.length > 0 ? text : 'Tool call returned no text response', response }
+    } catch (e) {
+        return { text: 'Tool call failed: ' + (e instanceof Error ? e.message : String(e)), response: [] }
     }
 }
 

@@ -188,27 +188,155 @@ describe('sendGoogleChatRequest (non-stream)', () => {
         expect(calls[0].body.systemInstruction).toBeUndefined()
     })
 
-    test('rejects tool-role messages as unsupported rather than silently mapping them to user', async () => {
-        // Gemini expresses tool results via `functionResponse` parts on
-        // role `user`, not a `tool` role. Silently dropping the role would
-        // corrupt the conversation; the adapter throws so the caller can
-        // route to a tool-capable preset or drop the message.
-        const { fetchImpl } = captureFetch(
+    test('serializes tool turns: functionCall on model, grouped functionResponse on user', async () => {
+        const { fetchImpl, calls } = captureFetch(
             jsonResponse({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }),
         )
-        await expect(
-            sendGoogleChatRequest(
-                makePreset(),
-                {
-                    messages: [
-                        { role: 'user', content: 'q' },
-                        { role: 'tool', content: '{"r":1}', toolCallId: 'call-1' },
-                    ],
-                    fetchImpl,
-                },
-                { apiKey: 'k' },
-            ),
-        ).rejects.toMatchObject({ kind: 'unsupported', retryable: false, fallbackEligible: false })
+        await sendGoogleChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: '', toolCalls: [
+                        { id: 'c1', name: 'a', arguments: '{"x":1}', signature: 'sig-1' },
+                        { id: 'c2', name: 'b', arguments: '{}' },
+                    ] },
+                    { role: 'tool', content: 'r1', toolCallId: 'c1', name: 'a' },
+                    { role: 'tool', content: 'r2', toolCallId: 'c2', name: 'b' },
+                ],
+                tools: [{ name: 'a', description: 'A', parameters: { type: 'object' } }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        const contents = calls[0].body.contents as Array<Record<string, unknown>>
+        // model turn carries functionCall parts (id echoed); first has its signature.
+        expect(contents[1]).toEqual({
+            role: 'model',
+            parts: [
+                { functionCall: { id: 'c1', name: 'a', args: { x: 1 } }, thoughtSignature: 'sig-1' },
+                { functionCall: { id: 'c2', name: 'b', args: {} } },
+            ],
+        })
+        // both tool results collapse into one user turn of functionResponse parts (id echoed).
+        expect(contents[2]).toEqual({
+            role: 'user',
+            parts: [
+                { functionResponse: { id: 'c1', name: 'a', response: { result: 'r1' } } },
+                { functionResponse: { id: 'c2', name: 'b', response: { result: 'r2' } } },
+            ],
+        })
+        expect(calls[0].body.tools).toEqual([
+            { functionDeclarations: [{ name: 'a', description: 'A', parameters: { type: 'object' } }] },
+        ])
+    })
+
+    test('parses functionCall (with thoughtSignature) and thought parts from response', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                candidates: [{
+                    content: {
+                        parts: [
+                            { text: 'reasoning', thought: true, thoughtSignature: 'TS' },
+                            { text: 'visible' },
+                            { functionCall: { name: 'search', args: { q: 'x' } }, thoughtSignature: 'FS' },
+                        ],
+                    },
+                }],
+            }),
+        )
+        const result = await sendGoogleChatRequest(
+            makePreset(),
+            { messages: [{ role: 'user', content: 'q' }], tools: [{ name: 'search', parameters: {} }], fetchImpl },
+            { apiKey: 'k' },
+        )
+        expect(result.text).toBe('visible')
+        // Gemini omits call ids; the adapter synthesizes a unique one (id asserted
+        // separately below).
+        expect(result.toolCalls).toMatchObject([{ name: 'search', arguments: '{"q":"x"}', signature: 'FS' }])
+        expect(result.reasoning).toEqual([{ text: 'reasoning', signature: 'TS' }])
+    })
+
+    test('leaves call id empty when Gemini omits one (KV uniqueness handled downstream)', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ functionCall: { name: 'a', args: {} } }] } }] }),
+        )
+        const r = await sendGoogleChatRequest(
+            makePreset(),
+            { messages: [{ role: 'user', content: 'q' }], tools: [{ name: 'a', parameters: {} }], fetchImpl },
+            { apiKey: 'k' },
+        )
+        expect(r.toolCalls![0].id).toBe('')
+    })
+
+    test('round-trips Gemini provider call id on both functionCall and functionResponse', async () => {
+        // Parse keeps the real id.
+        const { fetchImpl } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ functionCall: { id: 'fc-7', name: 'a', args: {} } }] } }] }),
+        )
+        const r = await sendGoogleChatRequest(
+            makePreset(),
+            { messages: [{ role: 'user', content: 'q' }], tools: [{ name: 'a', parameters: {} }], fetchImpl },
+            { apiKey: 'k' },
+        )
+        expect(r.toolCalls![0].id).toBe('fc-7')
+
+        // Serialize echoes it on both sides (id matching for same-name parallel calls).
+        const { fetchImpl: f2, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'done' }] } }] }),
+        )
+        await sendGoogleChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: '', toolCalls: [{ id: 'fc-7', name: 'a', arguments: '{}' }] },
+                    { role: 'tool', content: 'r', toolCallId: 'fc-7', name: 'a' },
+                ],
+                tools: [{ name: 'a', parameters: {} }],
+                fetchImpl: f2,
+            },
+            { apiKey: 'k' },
+        )
+        const contents = calls[0].body.contents as Array<Record<string, unknown>>
+        expect(contents[1]).toEqual({ role: 'model', parts: [{ functionCall: { id: 'fc-7', name: 'a', args: {} } }] })
+        expect(contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { id: 'fc-7', name: 'a', response: { result: 'r' } } }] })
+    })
+
+    test('strips customBody.tools/toolConfig when the request carries no tools (off = hard gate)', async () => {
+        const preset = makePreset({ customBody: { tools: [{ functionDeclarations: [{ name: 'sneaky' }] }], toolConfig: { functionCallingConfig: { mode: 'ANY' } } } })
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }),
+        )
+        await sendGoogleChatRequest(preset, { messages: [{ role: 'user', content: 'q' }], fetchImpl }, { apiKey: 'k' })
+        expect(calls[0].body.tools).toBeUndefined()
+        expect(calls[0].body.toolConfig).toBeUndefined()
+    })
+
+    test('resends model parts verbatim via providerEcho (preserves text-part thoughtSignature)', async () => {
+        // Gemini can attach a signature to a plain text part; it must come back exactly.
+        const rawParts = [
+            { text: 'visible answer', thoughtSignature: 'TS-on-text' },
+            { functionCall: { name: 'a', args: {} }, thoughtSignature: 'FS' },
+        ]
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'done' }] } }] }),
+        )
+        await sendGoogleChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: 'visible answer', toolCalls: [{ id: '', name: 'a', arguments: '{}', signature: 'FS' }], providerEcho: rawParts },
+                    { role: 'tool', content: 'r', toolCallId: '', name: 'a' },
+                ],
+                tools: [{ name: 'a', parameters: {} }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        const contents = calls[0].body.contents as Array<Record<string, unknown>>
+        expect(contents[1]).toEqual({ role: 'model', parts: rawParts })
     })
 
     test('URL-encodes modelId', async () => {

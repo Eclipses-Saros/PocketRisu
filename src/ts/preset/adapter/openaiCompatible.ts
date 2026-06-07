@@ -14,15 +14,28 @@ import type {
     AdapterChatStreamDelta,
     AdapterCredential,
     AdapterPreparedRequest,
+    AdapterToolCall,
+    AdapterToolDef,
     AdapterUsage,
 } from './types'
 import { resolveWireModelId } from './wireInvariants'
+
+interface WireToolCall {
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+    // OpenRouter passes Gemini's thought signature through this OpenAI-compatible
+    // extension. It must round-trip or thinking-enabled Gemini (via OpenRouter)
+    // rejects the follow-up tool turn.
+    extra_content?: { google?: { thought_signature?: string } }
+}
 
 interface WireMessage {
     role: AdapterChatMessage['role']
     content: string
     name?: string
     tool_call_id?: string
+    tool_calls?: WireToolCall[]
 }
 
 export async function sendChatRequest(
@@ -112,6 +125,16 @@ export async function* streamChatRequest(
     }
 }
 
+// Build the request without sending it (previewBody). Must never hit the network
+// or the tool loop.
+export function previewChatRequest(
+    preset: ModelPreset,
+    options: AdapterChatOptions,
+    credential?: AdapterCredential,
+): Promise<AdapterPreparedRequest> {
+    return prepareOpenAiBody(preset, options, credential, false)
+}
+
 async function prepareOpenAiBody(
     preset: ModelPreset,
     options: AdapterChatOptions,
@@ -131,6 +154,18 @@ async function prepareOpenAiBody(
     prepared.body.messages = options.messages.map(toWireMessage)
     prepared.body.model = modelId
     prepared.body.stream = stream
+    // `tools` is a wire invariant when the caller supplies them: the request
+    // builder must own tool declaration so customBody cannot smuggle a
+    // conflicting list. When absent, leave any profile-declared tools untouched.
+    if (options.tools && options.tools.length > 0) {
+        prepared.body.tools = options.tools.map(toWireToolDef)
+    } else {
+        // Tools are gated by the request, not customBody. With no tools on the
+        // request (toggle off), strip any customBody-provided tools so the OFF
+        // state is a hard gate — otherwise the model could emit tool calls the
+        // inactive text path would silently drop.
+        delete prepared.body.tools
+    }
     // Tool-coupled fields are rejected by OpenAI-compatible APIs when no tools
     // are present ("parallel_tool_calls is only allowed when tools are
     // specified"). Profiles may default these (e.g. gpt-5.5 ships
@@ -143,13 +178,43 @@ async function prepareOpenAiBody(
     return prepared
 }
 
+function toWireToolDef(tool: AdapterToolDef): Record<string, unknown> {
+    return {
+        type: 'function',
+        function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        },
+    }
+}
+
 function toWireMessage(message: AdapterChatMessage): WireMessage {
+    // Verbatim re-send of the model's own assistant turn (reasoning_details,
+    // tool_calls, etc.) when we captured it this request. Reconstruction below is
+    // the fallback for history-restored turns (no providerEcho).
+    if (message.role === 'assistant' && isPlainObject(message.providerEcho)) {
+        return message.providerEcho as unknown as WireMessage
+    }
     const wire: WireMessage = {
         role: message.role,
         content: message.content,
     }
     if (message.name !== undefined) wire.name = message.name
     if (message.toolCallId !== undefined) wire.tool_call_id = message.toolCallId
+    if (message.toolCalls && message.toolCalls.length > 0) {
+        wire.tool_calls = message.toolCalls.map((call) => {
+            const wireCall: WireToolCall = {
+                id: call.id,
+                type: 'function',
+                function: { name: call.name, arguments: call.arguments },
+            }
+            if (call.signature) {
+                wireCall.extra_content = { google: { thought_signature: call.signature } }
+            }
+            return wireCall
+        })
+    }
     return wire
 }
 
@@ -184,15 +249,45 @@ function parseChatCompletion(raw: unknown): AdapterChatResponse {
     const text = isPlainObject(message) && typeof message['content'] === 'string'
         ? (message['content'] as string)
         : ''
+    const toolCalls = isPlainObject(message) ? parseToolCalls(message['tool_calls']) : undefined
     const finishReason = typeof first['finish_reason'] === 'string'
         ? (first['finish_reason'] as string)
         : undefined
     return {
         text,
+        toolCalls,
+        // Keep the raw assistant message so a tool follow-up resends it verbatim
+        // (preserves reasoning_details / any provider extension OpenRouter requires).
+        providerEcho: isPlainObject(message) ? message : undefined,
         finishReason,
         usage: parseUsage(raw['usage']),
         raw,
     }
+}
+
+function parseToolCalls(raw: unknown): AdapterToolCall[] | undefined {
+    if (!Array.isArray(raw) || raw.length === 0) return undefined
+    const calls: AdapterToolCall[] = []
+    for (const entry of raw) {
+        if (!isPlainObject(entry)) continue
+        const fn = entry['function']
+        if (!isPlainObject(fn) || typeof fn['name'] !== 'string') continue
+        const args = typeof fn['arguments'] === 'string' ? (fn['arguments'] as string) : ''
+        const id = typeof entry['id'] === 'string' ? (entry['id'] as string) : ''
+        const signature = extractThoughtSignature(entry['extra_content'])
+        calls.push({ id, name: fn['name'] as string, arguments: args, signature })
+    }
+    return calls.length > 0 ? calls : undefined
+}
+
+// OpenRouter relays Gemini's thoughtSignature here. Returns undefined for the
+// common (non-Gemini-via-OpenRouter) case.
+function extractThoughtSignature(extraContent: unknown): string | undefined {
+    if (!isPlainObject(extraContent)) return undefined
+    const google = extraContent['google']
+    if (!isPlainObject(google)) return undefined
+    const sig = google['thought_signature']
+    return typeof sig === 'string' ? sig : undefined
 }
 
 function parseChatStreamDelta(raw: unknown): AdapterChatStreamDelta | null {

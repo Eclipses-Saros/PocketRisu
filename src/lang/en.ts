@@ -1392,6 +1392,8 @@ export const languageEnglish = {
     modelPresetBindedSuccess: "Model preset is successfully binded",
     streamingOverride: "Response streaming",
     streamingOverrideHelp: "Whether this preset streams responses.",
+    modelPresetToolUse: "Tool use",
+    modelPresetToolUseHelp: "Let this preset call your configured tools (MCP). Off by default. Tool runs are sent without streaming.",
     maxContextHelp: "Input (prompt) token budget for this preset. Leave empty for the default (65000), capped at the model's context window. Not the response length (that is Max Tokens).",
     modelPresetTabPresets: "Presets",
     modelPresetTabOptions: "Settings",

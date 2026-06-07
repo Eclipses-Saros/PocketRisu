@@ -14,6 +14,9 @@ import type {
     AdapterChatStreamDelta,
     AdapterCredential,
     AdapterPreparedRequest,
+    AdapterReasoningPart,
+    AdapterToolCall,
+    AdapterToolDef,
     AdapterUsage,
 } from './types'
 import { resolveWireModelId } from './wireInvariants'
@@ -28,14 +31,22 @@ import { resolveWireModelId } from './wireInvariants'
 // negative override.
 const ANTHROPIC_FALLBACK_MAX_TOKENS = 4096
 
-interface AnthropicContentBlock {
-    type: 'text'
-    text: string
-}
+type AnthropicContentBlock =
+    | { type: 'text'; text: string }
+    | { type: 'thinking'; thinking: string; signature?: string }
+    | { type: 'redacted_thinking'; data: string }
+    | { type: 'tool_use'; id: string; name: string; input: unknown }
+    | { type: 'tool_result'; tool_use_id: string; content: string }
 
 interface AnthropicWireMessage {
     role: 'user' | 'assistant'
     content: AnthropicContentBlock[]
+}
+
+interface AnthropicWireTool {
+    name: string
+    description?: string
+    input_schema: unknown
 }
 
 export async function sendAnthropicChatRequest(
@@ -127,6 +138,15 @@ export async function* streamAnthropicChatRequest(
     }
 }
 
+// Build the request without sending it (previewBody).
+export function previewAnthropicChatRequest(
+    preset: ModelPreset,
+    options: AdapterChatOptions,
+    credential?: AdapterCredential,
+): Promise<AdapterPreparedRequest> {
+    return prepareAnthropicBody(preset, options, credential, false)
+}
+
 async function prepareAnthropicBody(
     preset: ModelPreset,
     options: AdapterChatOptions,
@@ -144,11 +164,20 @@ async function prepareAnthropicBody(
     //   - stream             → adapter controls the transport mode
     const modelId = resolveWireModelId(preset, { vendorName: 'Anthropic' })
     const { system, chat } = collectSystemAndChat(options.messages)
-    prepared.body.messages = chat.map(toAnthropicMessage)
+    prepared.body.messages = toAnthropicWireMessages(chat)
     if (system.length > 0) {
         prepared.body.system = system
     } else {
         delete prepared.body.system
+    }
+    if (options.tools && options.tools.length > 0) {
+        prepared.body.tools = options.tools.map(toAnthropicTool)
+    } else {
+        // Tools are gated by the request, not customBody / additionalParams:
+        // strip the whole tool-control surface when off so the OFF toggle is a
+        // hard text-only gate (a lingering tool_choice would 400).
+        delete prepared.body.tools
+        delete prepared.body.tool_choice
     }
     prepared.body.model = modelId
     if (prepared.body.max_tokens === undefined) {
@@ -156,6 +185,10 @@ async function prepareAnthropicBody(
     }
     prepared.body.stream = stream
     return prepared
+}
+
+function toAnthropicTool(tool: AdapterToolDef): AnthropicWireTool {
+    return { name: tool.name, description: tool.description, input_schema: tool.parameters }
 }
 
 function collectSystemAndChat(messages: AdapterChatMessage[]): {
@@ -167,27 +200,82 @@ function collectSystemAndChat(messages: AdapterChatMessage[]): {
     for (const message of messages) {
         if (message.role === 'system') {
             systems.push(message.content)
-        } else if (message.role === 'tool') {
-            // Tool messages need a different wire shape on Anthropic
-            // (`tool_result` content blocks). Until the adapter actually
-            // supports tool use, silently mapping tool → user would corrupt
-            // the conversation. Surface it instead.
-            throw new ModelPresetAdapterError(
-                'unsupported',
-                'Anthropic adapter does not support tool-role messages yet',
-            )
         } else {
+            // tool / user / assistant are all carried into the wire builder,
+            // which groups tool results onto a user turn (Anthropic shape).
             chat.push(message)
         }
     }
     return { system: systems.join('\n\n'), chat }
 }
 
-function toAnthropicMessage(message: AdapterChatMessage): AnthropicWireMessage {
-    const role = message.role === 'assistant' ? 'assistant' : 'user'
-    return {
-        role,
-        content: [{ type: 'text', text: message.content }],
+// Build the Anthropic message array. Consecutive tool-role messages are merged
+// into ONE user message carrying multiple `tool_result` blocks (Anthropic
+// requires every tool_use to be answered in the immediately following user
+// turn). Assistant turns emit thinking blocks first, then text, then tool_use —
+// the order Anthropic requires when thinking is enabled.
+function toAnthropicWireMessages(chat: AdapterChatMessage[]): AnthropicWireMessage[] {
+    const out: AnthropicWireMessage[] = []
+    let pendingToolResults: AnthropicContentBlock[] = []
+
+    const flushToolResults = () => {
+        if (pendingToolResults.length > 0) {
+            out.push({ role: 'user', content: pendingToolResults })
+            pendingToolResults = []
+        }
+    }
+
+    for (const message of chat) {
+        if (message.role === 'tool') {
+            pendingToolResults.push({
+                type: 'tool_result',
+                tool_use_id: message.toolCallId ?? '',
+                content: message.content,
+            })
+            continue
+        }
+        flushToolResults()
+        if (message.role === 'assistant') {
+            // Verbatim re-send of the model's own turn (thinking signatures intact)
+            // when captured this request; reconstruct for history-restored turns.
+            const content = Array.isArray(message.providerEcho)
+                ? (message.providerEcho as AnthropicContentBlock[])
+                : toAssistantBlocks(message)
+            out.push({ role: 'assistant', content })
+        } else {
+            out.push({ role: 'user', content: [{ type: 'text', text: message.content }] })
+        }
+    }
+    flushToolResults()
+    return out
+}
+
+function toAssistantBlocks(message: AdapterChatMessage): AnthropicContentBlock[] {
+    const blocks: AnthropicContentBlock[] = []
+    for (const part of message.reasoning ?? []) {
+        if (part.redactedData !== undefined) {
+            blocks.push({ type: 'redacted_thinking', data: part.redactedData })
+        } else if (part.text !== undefined) {
+            blocks.push({ type: 'thinking', thinking: part.text, signature: part.signature })
+        }
+    }
+    if (message.content.length > 0) {
+        blocks.push({ type: 'text', text: message.content })
+    }
+    for (const call of message.toolCalls ?? []) {
+        blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: parseToolArgs(call.arguments) })
+    }
+    // Anthropic rejects an assistant message with an empty content array.
+    if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
+    return blocks
+}
+
+function parseToolArgs(args: string): unknown {
+    if (!args) return {}
+    try {
+        return JSON.parse(args)
+    } catch {
+        return {}
     }
 }
 
@@ -220,10 +308,27 @@ function parseAnthropicMessage(raw: unknown): AdapterChatResponse {
     }
     const content = raw['content']
     let text = ''
+    const toolCalls: AdapterToolCall[] = []
+    const reasoning: AdapterReasoningPart[] = []
     if (Array.isArray(content)) {
         for (const block of content) {
-            if (isPlainObject(block) && block['type'] === 'text' && typeof block['text'] === 'string') {
+            if (!isPlainObject(block)) continue
+            const type = block['type']
+            if (type === 'text' && typeof block['text'] === 'string') {
                 text += block['text'] as string
+            } else if (type === 'tool_use' && typeof block['name'] === 'string') {
+                toolCalls.push({
+                    id: typeof block['id'] === 'string' ? (block['id'] as string) : '',
+                    name: block['name'] as string,
+                    arguments: JSON.stringify(block['input'] ?? {}),
+                })
+            } else if (type === 'thinking' && typeof block['thinking'] === 'string') {
+                reasoning.push({
+                    text: block['thinking'] as string,
+                    signature: typeof block['signature'] === 'string' ? (block['signature'] as string) : undefined,
+                })
+            } else if (type === 'redacted_thinking' && typeof block['data'] === 'string') {
+                reasoning.push({ redactedData: block['data'] as string })
             }
         }
     }
@@ -232,6 +337,11 @@ function parseAnthropicMessage(raw: unknown): AdapterChatResponse {
         : undefined
     return {
         text,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        reasoning: reasoning.length > 0 ? reasoning : undefined,
+        // Keep the raw content blocks so a tool follow-up resends the assistant
+        // turn verbatim (thinking signatures must come back byte-for-byte).
+        providerEcho: Array.isArray(content) ? content : undefined,
         finishReason,
         usage: parseAnthropicUsage(raw['usage']),
         raw,

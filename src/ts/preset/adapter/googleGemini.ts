@@ -14,12 +14,19 @@ import type {
     AdapterChatStreamDelta,
     AdapterCredential,
     AdapterPreparedRequest,
+    AdapterReasoningPart,
+    AdapterToolCall,
+    AdapterToolDef,
     AdapterUsage,
 } from './types'
 import { resolveWireModelId } from './wireInvariants'
 
 interface GeminiPart {
-    text: string
+    text?: string
+    thought?: boolean
+    thoughtSignature?: string
+    functionCall?: { id?: string; name: string; args: unknown }
+    functionResponse?: { id?: string; name: string; response: unknown }
 }
 
 interface GeminiContent {
@@ -111,6 +118,16 @@ export async function* streamGoogleChatRequest(
     }
 }
 
+// Build the request without sending it (previewBody). The model id lives in the
+// URL path for Gemini, so the preview carries it there.
+export function previewGoogleChatRequest(
+    preset: ModelPreset,
+    options: AdapterChatOptions,
+    credential?: AdapterCredential,
+): Promise<AdapterPreparedRequest> {
+    return prepareGeminiBody(preset, options, credential, false)
+}
+
 async function prepareGeminiBody(
     preset: ModelPreset,
     options: AdapterChatOptions,
@@ -132,16 +149,29 @@ async function prepareGeminiBody(
     delete prepared.body.model
 
     const { system, chat } = collectSystemAndChat(options.messages)
-    prepared.body.contents = chat.map(toGeminiContent)
+    prepared.body.contents = toGeminiContents(chat)
     if (system.length > 0) {
         prepared.body.systemInstruction = { parts: [{ text: system }] }
     } else {
         delete prepared.body.systemInstruction
     }
+    if (options.tools && options.tools.length > 0) {
+        prepared.body.tools = [{ functionDeclarations: options.tools.map(toGeminiFunctionDeclaration) }]
+    } else {
+        // Tools are gated by the request, not customBody / additionalParams:
+        // strip the whole tool-control surface when off so the OFF toggle is a
+        // hard text-only gate (a lingering toolConfig would force/restrict calls).
+        delete prepared.body.tools
+        delete prepared.body.toolConfig
+    }
 
     const suffix = stream ? ':streamGenerateContent?alt=sse' : ':generateContent'
     prepared.url = `${prepared.url}/${encodeURIComponent(modelId)}${suffix}`
     return prepared
+}
+
+function toGeminiFunctionDeclaration(tool: AdapterToolDef): Record<string, unknown> {
+    return { name: tool.name, description: tool.description, parameters: tool.parameters }
 }
 
 function collectSystemAndChat(messages: AdapterChatMessage[]): {
@@ -153,27 +183,86 @@ function collectSystemAndChat(messages: AdapterChatMessage[]): {
     for (const message of messages) {
         if (message.role === 'system') {
             systems.push(message.content)
-        } else if (message.role === 'tool') {
-            // Gemini expresses tool results via `functionResponse` parts on
-            // role `user`, not a `tool` role. Until the adapter actually
-            // supports tool use, silently mapping tool → user would corrupt
-            // the conversation. Surface it instead.
-            throw new ModelPresetAdapterError(
-                'unsupported',
-                'Google Gemini adapter does not support tool-role messages yet',
-            )
         } else {
+            // tool / user / assistant flow into the wire builder, which maps tool
+            // results to functionResponse parts on a user turn (Gemini shape).
             chat.push(message)
         }
     }
     return { system: systems.join('\n\n'), chat }
 }
 
-function toGeminiContent(message: AdapterChatMessage): GeminiContent {
-    const role: GeminiContent['role'] = message.role === 'assistant' ? 'model' : 'user'
-    return {
-        role,
-        parts: [{ text: message.content }],
+// Build Gemini `contents`. Consecutive tool messages collapse into one `user`
+// turn of `functionResponse` parts (Gemini answers tool calls on the user role).
+// Assistant ("model") turns emit thought parts first (carrying thoughtSignature),
+// then text, then functionCall parts — each functionCall echoing the signature
+// Gemini issued, which thinking models require on the follow-up request.
+function toGeminiContents(chat: AdapterChatMessage[]): GeminiContent[] {
+    const out: GeminiContent[] = []
+    let pendingFnResponses: GeminiPart[] = []
+
+    const flush = () => {
+        if (pendingFnResponses.length > 0) {
+            out.push({ role: 'user', parts: pendingFnResponses })
+            pendingFnResponses = []
+        }
+    }
+
+    for (const message of chat) {
+        if (message.role === 'tool') {
+            const functionResponse: NonNullable<GeminiPart['functionResponse']> = {
+                name: message.name ?? '',
+                response: { result: message.content },
+            }
+            // Echo Gemini's call id (when present) so parallel same-name results
+            // match unambiguously. Empty toolCallId → name-based matching.
+            if (message.toolCallId) functionResponse.id = message.toolCallId
+            pendingFnResponses.push({ functionResponse })
+            continue
+        }
+        flush()
+        if (message.role === 'assistant') {
+            // Verbatim re-send of the model's own parts (thoughtSignatures intact)
+            // when captured this request; reconstruct for history-restored turns.
+            const parts = Array.isArray(message.providerEcho)
+                ? (message.providerEcho as GeminiPart[])
+                : toModelParts(message)
+            out.push({ role: 'model', parts })
+        } else {
+            out.push({ role: 'user', parts: [{ text: message.content }] })
+        }
+    }
+    flush()
+    return out
+}
+
+function toModelParts(message: AdapterChatMessage): GeminiPart[] {
+    const parts: GeminiPart[] = []
+    for (const part of message.reasoning ?? []) {
+        if (part.text !== undefined) {
+            parts.push({ text: part.text, thought: true, thoughtSignature: part.signature })
+        }
+    }
+    if (message.content.length > 0) {
+        parts.push({ text: message.content })
+    }
+    for (const call of message.toolCalls ?? []) {
+        const functionCall: NonNullable<GeminiPart['functionCall']> = { name: call.name, args: parseToolArgs(call.arguments) }
+        if (call.id) functionCall.id = call.id
+        const fc: GeminiPart = { functionCall }
+        if (call.signature) fc.thoughtSignature = call.signature
+        parts.push(fc)
+    }
+    if (parts.length === 0) parts.push({ text: '' })
+    return parts
+}
+
+function parseToolArgs(args: string): unknown {
+    if (!args) return {}
+    try {
+        return JSON.parse(args)
+    } catch {
+        return {}
     }
 }
 
@@ -206,16 +295,65 @@ function parseGeminiResponse(raw: unknown): AdapterChatResponse {
     if (!isPlainObject(first)) {
         throw new ModelPresetAdapterError('parse', 'First Gemini candidate is not an object')
     }
-    const text = extractTextFromContent(first['content'])
+    const parsed = parseGeminiParts(first['content'])
     const finishReason = typeof first['finishReason'] === 'string'
         ? (first['finishReason'] as string)
         : undefined
+    const echoParts = isPlainObject(first['content']) && Array.isArray((first['content'] as Record<string, unknown>)['parts'])
+        ? (first['content'] as Record<string, unknown>)['parts']
+        : undefined
     return {
-        text,
+        text: parsed.text,
+        toolCalls: parsed.toolCalls.length > 0 ? parsed.toolCalls : undefined,
+        reasoning: parsed.reasoning.length > 0 ? parsed.reasoning : undefined,
+        // Keep the raw parts so a tool follow-up resends the model turn verbatim —
+        // Gemini requires every thoughtSignature back on the exact part it issued,
+        // including signatures on plain text parts.
+        providerEcho: echoParts,
         finishReason,
         usage: parseGeminiUsage(raw['usageMetadata']),
         raw,
     }
+}
+
+// Split a Gemini candidate's content into visible text, tool calls, and reasoning
+// (thought) parts. functionCall parts carry a thoughtSignature that thinking
+// models require echoed back on the follow-up request.
+function parseGeminiParts(content: unknown): {
+    text: string
+    toolCalls: AdapterToolCall[]
+    reasoning: AdapterReasoningPart[]
+} {
+    const text: string[] = []
+    const toolCalls: AdapterToolCall[] = []
+    const reasoning: AdapterReasoningPart[] = []
+    if (isPlainObject(content) && Array.isArray(content['parts'])) {
+        for (const part of content['parts']) {
+            if (!isPlainObject(part)) continue
+            const signature = typeof part['thoughtSignature'] === 'string'
+                ? (part['thoughtSignature'] as string)
+                : undefined
+            const fn = part['functionCall']
+            if (isPlainObject(fn) && typeof fn['name'] === 'string') {
+                toolCalls.push({
+                    // Keep Gemini's real call id when present so it round-trips on
+                    // the wire (functionCall/functionResponse id matching for
+                    // same-name parallel calls). When omitted, leave it empty:
+                    // encodeToolCall mints a unique KV key (`|| v4()`), and the
+                    // wire falls back to name-based matching.
+                    id: typeof fn['id'] === 'string' ? (fn['id'] as string) : '',
+                    name: fn['name'] as string,
+                    arguments: JSON.stringify(fn['args'] ?? {}),
+                    signature,
+                })
+            } else if (part['thought'] === true && typeof part['text'] === 'string') {
+                reasoning.push({ text: part['text'] as string, signature })
+            } else if (typeof part['text'] === 'string') {
+                text.push(part['text'] as string)
+            }
+        }
+    }
+    return { text: text.join(''), toolCalls, reasoning }
 }
 
 function parseGeminiStreamDelta(raw: unknown): AdapterChatStreamDelta | null {

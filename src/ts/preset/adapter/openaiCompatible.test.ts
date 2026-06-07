@@ -3,7 +3,7 @@ import { loadBundledRegistry } from '../registry/loader'
 import { resolveSnapshot } from '../registry/snapshot'
 import type { ModelPreset, ResolvedModelProfileSnapshot } from '../types'
 import { ModelPresetAdapterError } from './error'
-import { sendChatRequest, streamChatRequest } from './openaiCompatible'
+import { sendChatRequest, streamChatRequest, previewChatRequest } from './openaiCompatible'
 import type { AdapterChatMessage } from './types'
 
 function makeSnapshot(overrides: Partial<ResolvedModelProfileSnapshot> = {}): ResolvedModelProfileSnapshot {
@@ -545,5 +545,197 @@ describe('error class identity', () => {
         } catch (err) {
             expect(err).toBeInstanceOf(ModelPresetAdapterError)
         }
+    })
+})
+
+describe('tool use (Stage 1)', () => {
+    const toolDef = {
+        name: 'search',
+        description: 'web search',
+        parameters: { type: 'object', properties: { q: { type: 'string' } } },
+    }
+
+    test('declares tools as function envelopes in the request body', async () => {
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+        )
+        await sendChatRequest(
+            makePreset(),
+            { messages: userMessages, tools: [toolDef], fetchImpl },
+            { apiKey: 'sk' },
+        )
+        expect(calls[0].body.tools).toEqual([
+            {
+                type: 'function',
+                function: {
+                    name: 'search',
+                    description: 'web search',
+                    parameters: { type: 'object', properties: { q: { type: 'string' } } },
+                },
+            },
+        ])
+    })
+
+    test('serializes assistant toolCalls and tool results onto the wire', async () => {
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'final' } }] }),
+        )
+        const convo: AdapterChatMessage[] = [
+            { role: 'user', content: 'find x' },
+            { role: 'assistant', content: 'checking', toolCalls: [{ id: 'c1', name: 'search', arguments: '{"q":"x"}' }] },
+            { role: 'tool', content: 'result text', toolCallId: 'c1', name: 'search' },
+        ]
+        await sendChatRequest(
+            makePreset(),
+            { messages: convo, tools: [toolDef], fetchImpl },
+            { apiKey: 'sk' },
+        )
+        const wire = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(wire[1]).toEqual({
+            role: 'assistant',
+            content: 'checking',
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'search', arguments: '{"q":"x"}' } }],
+        })
+        expect(wire[2]).toEqual({ role: 'tool', content: 'result text', name: 'search', tool_call_id: 'c1' })
+    })
+
+    test('parses tool_calls (including parallel) from the response', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                choices: [{
+                    message: {
+                        role: 'assistant',
+                        content: '',
+                        tool_calls: [
+                            { id: 'a', type: 'function', function: { name: 'alpha', arguments: '{"n":1}' } },
+                            { id: 'b', type: 'function', function: { name: 'beta', arguments: '{}' } },
+                        ],
+                    },
+                    finish_reason: 'tool_calls',
+                }],
+            }),
+        )
+        const result = await sendChatRequest(
+            makePreset(),
+            { messages: userMessages, tools: [toolDef], fetchImpl },
+            { apiKey: 'sk' },
+        )
+        expect(result.toolCalls).toEqual([
+            { id: 'a', name: 'alpha', arguments: '{"n":1}' },
+            { id: 'b', name: 'beta', arguments: '{}' },
+        ])
+    })
+
+    test('omits tools and tool-coupled fields on tool-less requests', async () => {
+        const preset = makePreset({ customBody: { parallel_tool_calls: true, tool_choice: 'auto' } })
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hi' } }] }),
+        )
+        await sendChatRequest(preset, { messages: userMessages, fetchImpl }, { apiKey: 'sk' })
+        expect(calls[0].body.tools).toBeUndefined()
+        expect(calls[0].body.parallel_tool_calls).toBeUndefined()
+        expect(calls[0].body.tool_choice).toBeUndefined()
+    })
+
+    test('strips customBody.tools when the request carries no tools (off = hard gate)', async () => {
+        const preset = makePreset({ customBody: { tools: [{ type: 'function', function: { name: 'sneaky' } }] } })
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hi' } }] }),
+        )
+        await sendChatRequest(preset, { messages: userMessages, fetchImpl }, { apiKey: 'sk' })
+        expect(calls[0].body.tools).toBeUndefined()
+    })
+
+    test('resends an assistant turn verbatim via providerEcho (preserves reasoning_details)', async () => {
+        const rawAssistant = {
+            role: 'assistant',
+            content: 'thinking out loud',
+            tool_calls: [{ id: 't1', type: 'function', function: { name: 'a', arguments: '{}' } }],
+            reasoning_details: [{ type: 'reasoning.text', text: 'chain', id: 'r1' }],
+        }
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'done' } }] }),
+        )
+        await sendChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: 'thinking out loud', toolCalls: [{ id: 't1', name: 'a', arguments: '{}' }], providerEcho: rawAssistant },
+                    { role: 'tool', content: 'r', toolCallId: 't1', name: 'a' },
+                ],
+                tools: [toolDef],
+                fetchImpl,
+            },
+            { apiKey: 'sk' },
+        )
+        const wire = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(wire[1]).toEqual(rawAssistant) // byte-for-byte, incl. reasoning_details
+    })
+
+    test('round-trips Gemini thought signature via extra_content (OpenRouter)', async () => {
+        // Parse: signature lifted from extra_content.google.thought_signature.
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                choices: [{
+                    message: {
+                        role: 'assistant',
+                        content: '',
+                        tool_calls: [{
+                            id: 'g1',
+                            type: 'function',
+                            function: { name: 'search', arguments: '{}' },
+                            extra_content: { google: { thought_signature: 'SIG-XYZ' } },
+                        }],
+                    },
+                }],
+            }),
+        )
+        const result = await sendChatRequest(
+            makePreset(),
+            { messages: userMessages, tools: [toolDef], fetchImpl },
+            { apiKey: 'sk' },
+        )
+        expect(result.toolCalls).toEqual([{ id: 'g1', name: 'search', arguments: '{}', signature: 'SIG-XYZ' }])
+
+        // Serialize: signature written back to the same extension on the wire.
+        const { fetchImpl: fetchImpl2, calls } = captureFetch(
+            jsonResponse({ choices: [{ message: { role: 'assistant', content: 'done' } }] }),
+        )
+        await sendChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: '', toolCalls: [{ id: 'g1', name: 'search', arguments: '{}', signature: 'SIG-XYZ' }] },
+                    { role: 'tool', content: 'r', toolCallId: 'g1', name: 'search' },
+                ],
+                tools: [toolDef],
+                fetchImpl: fetchImpl2,
+            },
+            { apiKey: 'sk' },
+        )
+        const wire = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(wire[1].tool_calls).toEqual([{
+            id: 'g1',
+            type: 'function',
+            function: { name: 'search', arguments: '{}' },
+            extra_content: { google: { thought_signature: 'SIG-XYZ' } },
+        }])
+    })
+})
+
+describe('previewChatRequest (no network)', () => {
+    test('returns the prepared body without fetching', async () => {
+        let fetched = false
+        const fetchImpl: typeof fetch = async () => { fetched = true; return jsonResponse({}) }
+        const prepared = await previewChatRequest(
+            makePreset(),
+            { messages: userMessages, tools: [{ name: 'a', parameters: { type: 'object' } }], fetchImpl },
+            { apiKey: 'sk' },
+        )
+        expect(fetched).toBe(false)
+        expect(prepared.url).toBe('https://demo.test/v1/chat/completions')
+        expect((prepared.body.tools as unknown[]).length).toBe(1)
     })
 })

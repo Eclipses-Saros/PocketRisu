@@ -259,27 +259,134 @@ describe('sendAnthropicChatRequest (non-stream)', () => {
         ])
     })
 
-    test('rejects tool-role messages as unsupported rather than silently mapping them to user', async () => {
-        // Silent map would corrupt the conversation because Anthropic's tool
-        // semantics require `tool_result` content blocks, not a plain user
-        // text turn. The adapter throws so the caller can decide (route to a
-        // tool-capable preset / drop the message / etc).
-        const { fetchImpl } = captureFetch(
+    test('serializes tool turns: assistant tool_use + grouped tool_result on a user turn', async () => {
+        const { fetchImpl, calls } = captureFetch(
             jsonResponse({ content: [{ type: 'text', text: 'ok' }] }),
         )
-        await expect(
-            sendAnthropicChatRequest(
-                makePreset(),
-                {
-                    messages: [
-                        { role: 'user', content: 'q1' },
-                        { role: 'tool', content: '{"r":1}', toolCallId: 'call-1' },
-                    ],
-                    fetchImpl,
-                },
-                { apiKey: 'k' },
-            ),
-        ).rejects.toMatchObject({ kind: 'unsupported', retryable: false, fallbackEligible: false })
+        await sendAnthropicChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q1' },
+                    { role: 'assistant', content: 'using tools', toolCalls: [
+                        { id: 'call-1', name: 'a', arguments: '{"x":1}' },
+                        { id: 'call-2', name: 'b', arguments: '{}' },
+                    ] },
+                    { role: 'tool', content: 'r1', toolCallId: 'call-1', name: 'a' },
+                    { role: 'tool', content: 'r2', toolCallId: 'call-2', name: 'b' },
+                ],
+                tools: [{ name: 'a', description: 'A', parameters: { type: 'object' } }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        const msgs = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(msgs[1]).toEqual({
+            role: 'assistant',
+            content: [
+                { type: 'text', text: 'using tools' },
+                { type: 'tool_use', id: 'call-1', name: 'a', input: { x: 1 } },
+                { type: 'tool_use', id: 'call-2', name: 'b', input: {} },
+            ],
+        })
+        // Both tool results collapse into ONE user turn.
+        expect(msgs[2]).toEqual({
+            role: 'user',
+            content: [
+                { type: 'tool_result', tool_use_id: 'call-1', content: 'r1' },
+                { type: 'tool_result', tool_use_id: 'call-2', content: 'r2' },
+            ],
+        })
+        expect(calls[0].body.tools).toEqual([{ name: 'a', description: 'A', input_schema: { type: 'object' } }])
+    })
+
+    test('round-trips thinking blocks (with signature) ahead of tool_use', async () => {
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ content: [{ type: 'text', text: 'ok' }] }),
+        )
+        await sendAnthropicChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        reasoning: [
+                            { text: 'let me think', signature: 'sig-abc' },
+                            { redactedData: 'REDACTED' },
+                        ],
+                        toolCalls: [{ id: 'c1', name: 'a', arguments: '{}' }],
+                    },
+                ],
+                tools: [{ name: 'a', parameters: {} }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        const msgs = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(msgs[1].content).toEqual([
+            { type: 'thinking', thinking: 'let me think', signature: 'sig-abc' },
+            { type: 'redacted_thinking', data: 'REDACTED' },
+            { type: 'tool_use', id: 'c1', name: 'a', input: {} },
+        ])
+    })
+
+    test('parses tool_use and thinking blocks from the response', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                content: [
+                    { type: 'thinking', thinking: 'hmm', signature: 'S' },
+                    { type: 'text', text: 'calling' },
+                    { type: 'tool_use', id: 'tu1', name: 'search', input: { q: 'x' } },
+                ],
+                stop_reason: 'tool_use',
+            }),
+        )
+        const result = await sendAnthropicChatRequest(
+            makePreset(),
+            { messages: [{ role: 'user', content: 'q' }], tools: [{ name: 'search', parameters: {} }], fetchImpl },
+            { apiKey: 'k' },
+        )
+        expect(result.text).toBe('calling')
+        expect(result.toolCalls).toEqual([{ id: 'tu1', name: 'search', arguments: '{"q":"x"}' }])
+        expect(result.reasoning).toEqual([{ text: 'hmm', signature: 'S' }])
+    })
+
+    test('strips customBody.tools/tool_choice when the request carries no tools (off = hard gate)', async () => {
+        const preset = makePreset({ customBody: { tools: [{ name: 'sneaky', input_schema: {} }], tool_choice: { type: 'any' } } })
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ content: [{ type: 'text', text: 'ok' }] }),
+        )
+        await sendAnthropicChatRequest(preset, { messages: [{ role: 'user', content: 'q' }], fetchImpl }, { apiKey: 'k' })
+        expect(calls[0].body.tools).toBeUndefined()
+        expect(calls[0].body.tool_choice).toBeUndefined()
+    })
+
+    test('resends content blocks verbatim via providerEcho (preserves thinking signature)', async () => {
+        const rawContent = [
+            { type: 'thinking', thinking: 'deep', signature: 'SIG' },
+            { type: 'text', text: 'answer' },
+            { type: 'tool_use', id: 'tu1', name: 'a', input: {} },
+        ]
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ content: [{ type: 'text', text: 'done' }] }),
+        )
+        await sendAnthropicChatRequest(
+            makePreset(),
+            {
+                messages: [
+                    { role: 'user', content: 'q' },
+                    { role: 'assistant', content: 'answer', toolCalls: [{ id: 'tu1', name: 'a', arguments: '{}' }], providerEcho: rawContent },
+                    { role: 'tool', content: 'r', toolCallId: 'tu1', name: 'a' },
+                ],
+                tools: [{ name: 'a', parameters: {} }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        const msgs = calls[0].body.messages as Array<Record<string, unknown>>
+        expect(msgs[1]).toEqual({ role: 'assistant', content: rawContent })
     })
 
     test('customBody cannot inject system field when user provided no system message', async () => {
