@@ -123,9 +123,20 @@
     }
 </script>
 
-<svelte:window onpointerup={() => (sliderActive = false)} />
+<!-- Reset sliderActive on release anywhere. A keyup/pointerup can land outside the
+     Root (e.g. Tab moves focus away before its keyup fires), so a Root-level reset
+     would get stuck on; listen on window instead. -->
+<svelte:window
+    onpointerup={() => (sliderActive = false)}
+    onkeyup={() => (sliderActive = false)}
+/>
 
 <div class={cn('flex items-center gap-2 w-full', className)}>
+    <!-- sliderActive is set in CAPTURE phase: bits-ui's keydown handler lives on the
+         Thumb (child) and fires onValueChange synchronously, so a bubble-phase Root
+         handler would run too late and the keyboard change would be dropped (then
+         our $effect would snap the thumb back). Capturing on the Root guarantees the
+         flag is already true when bits-ui's onValueChange runs. Reset: window above. -->
     <SliderPrimitive.Root
         type="single"
         bind:value={internal}
@@ -134,9 +145,8 @@
         step={sliderStep}
         {disabled}
         {onValueChange}
-        onpointerdown={() => (sliderActive = true)}
-        onkeydown={() => (sliderActive = true)}
-        onkeyup={() => (sliderActive = false)}
+        onpointerdowncapture={() => (sliderActive = true)}
+        onkeydowncapture={() => (sliderActive = true)}
         data-slot="slider"
         data-unset={value === undefined ? '' : undefined}
         class={
