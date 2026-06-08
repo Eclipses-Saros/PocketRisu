@@ -519,6 +519,27 @@ import { isMobile } from 'src/ts/platform'
     let inputTranslateHeight = $state("44px")
     let inputTranslateEle:HTMLTextAreaElement = $state()
 
+    // NodeOnly floating composer: when fixed mode is off (default) and on the
+    // standard theme, the composer floats over the message list as an overlay so
+    // chat scrolls underneath it. floatPad mirrors the overlay height and is fed
+    // back as the scroll container's bottom padding so the newest message clears it.
+    // Standard-theme chat composer floats over the message list so chat scrolls
+    // underneath it (other themes keep the in-flow composer).
+    let floatingMode = $derived(DBState.db.theme === '')
+    // Chat-area background (bgcolor 25% + darkbg), mirroring nodeonly-standard.css —
+    // used for the thin fade above the pill so chat dissolves into the background as
+    // it scrolls past the input edge. Only used on the standard theme (floatingMode).
+    const chatAreaBg = 'color-mix(in srgb, var(--risu-theme-bgcolor) 25%, var(--risu-theme-darkbg))'
+    let floatEle:HTMLElement = $state()
+    let floatPad = $state("0px")
+    $effect(() => {
+        if(!floatingMode || !floatEle) return
+        const el = floatEle
+        const ro = new ResizeObserver(() => { floatPad = el.offsetHeight + "px" })
+        ro.observe(el)
+        return () => ro.disconnect()
+    })
+
     function updateInputSizeAll() {
         updateInputSize()
         updateInputTranslateSize()
@@ -801,37 +822,18 @@ import { isMobile } from 'src/ts/platform'
             <span>{language.selectChatToView}</span>
         </div>
     {:else}
-        <div class="h-full w-full flex flex-col-reverse overflow-y-auto relative default-chat-screen"
-            class:nodeonly-standard={DBState.db.theme === ''}
-            class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
-            class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}
-            onscroll={(e) => {
-            if (DBState.db.nodeOnlyScrollButtonType !== 'off') {
-                bumpScrollNav()
-            }
-            //@ts-expect-error scrollHeight/clientHeight/scrollTop don't exist on EventTarget, but target is HTMLElement here
-            const scrolled = (e.target.scrollHeight - e.target.clientHeight + e.target.scrollTop)
-            if(scrolled < 100 && currentChat.length > loadPages){
-                loadPages += 15
-            }
-            const chatTarget = e.target as HTMLElement;
-            const chatsContainer = (DBState.db.fixedChatTextarea && chatTarget.children[1]) ? chatTarget.children[1] : chatTarget.children[0];
-            const lastEl = chatsContainer?.firstElementChild;
-            const isAtBottom = lastEl ? lastEl.getBoundingClientRect().top <= chatTarget.getBoundingClientRect().bottom + 100 : true;
-            if(isAtBottom){
-                showNewMessageButton = false;
-            }
-        }}>
+        {#snippet composerCluster()}
             <div
-                    class="{DBState.db.fixedChatTextarea ? 'sticky pt-2 pb-2 right-0 bottom-0 bg-bgcolor' : 'mt-2 mb-2'} w-full"
-                    style="{DBState.db.fixedChatTextarea ? 'z-index:29;' : ''}"
+                    class="{floatingMode ? 'pt-2 pb-2' : (DBState.db.fixedChatTextarea ? 'sticky pt-2 pb-2 right-0 bottom-0 bg-bgcolor' : 'mt-2 mb-2')} w-full"
+                    style="{!floatingMode && DBState.db.fixedChatTextarea ? 'z-index:29;' : ''}"
             >
               <div class="mx-auto w-full max-w-3xl px-2">
                 <!-- "plugin-compat-items-stretch" is a compat hook (not a Tailwind class):
                      plugins that locate the composer via div[class*="items-stretch"] (e.g. gemini-cache-keeper)
                      relied on the pre-redesign container class. Keep it so they can still find/anchor their UI,
                      and it scopes the timer re-flow rules in <style> below. -->
-                <div class="flex flex-wrap items-center gap-1 rounded-3xl border border-darkborderc bg-bgcolor px-2 py-1.5 transition-colors focus-within:border-textcolor plugin-compat-items-stretch">
+                <div class="flex flex-wrap items-center gap-1 rounded-3xl border border-darkborderc bg-bgcolor px-2 py-1.5 transition-colors focus-within:border-textcolor plugin-compat-items-stretch"
+                     style:box-shadow={floatingMode ? '0 13px 24px 7px ' + chatAreaBg : ''}>
                 {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
                     <ShDropdownMenu bind:open={openMenu}>
                         <ShDropdownMenuTrigger>
@@ -1113,6 +1115,33 @@ import { isMobile } from 'src/ts/platform'
                     : msg
                 )} {send}/>
             {/if}
+        {/snippet}
+
+        <div class="h-full w-full flex flex-col-reverse overflow-y-auto relative default-chat-screen"
+            class:nodeonly-standard={DBState.db.theme === ''}
+            class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
+            class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}
+            style:padding-bottom={floatingMode ? floatPad : ''}
+            onscroll={(e) => {
+            if (DBState.db.nodeOnlyScrollButtonType !== 'off') {
+                bumpScrollNav()
+            }
+            //@ts-expect-error scrollHeight/clientHeight/scrollTop don't exist on EventTarget, but target is HTMLElement here
+            const scrolled = (e.target.scrollHeight - e.target.clientHeight + e.target.scrollTop)
+            if(scrolled < 100 && currentChat.length > loadPages){
+                loadPages += 15
+            }
+            const chatTarget = e.target as HTMLElement;
+            const chatsContainer = (!floatingMode && DBState.db.fixedChatTextarea && chatTarget.children[1]) ? chatTarget.children[1] : chatTarget.children[0];
+            const lastEl = chatsContainer?.firstElementChild;
+            const isAtBottom = lastEl ? lastEl.getBoundingClientRect().top <= chatTarget.getBoundingClientRect().bottom + 100 : true;
+            if(isAtBottom){
+                showNewMessageButton = false;
+            }
+        }}>
+            {#if !floatingMode}
+                {@render composerCluster()}
+            {/if}
 
             {#if !currentChatReady}
                 <div class="w-full flex justify-center text-textcolor2 italic mb-12">
@@ -1197,6 +1226,14 @@ import { isMobile } from 'src/ts/platform'
             {/if}
 
         </div>
+
+        {#if floatingMode}
+            <div class="absolute left-0 right-0 bottom-0 z-29 pointer-events-none">
+                <div bind:this={floatEle} class="pointer-events-auto flex flex-col-reverse">
+                    {@render composerCluster()}
+                </div>
+            </div>
+        {/if}
 
     {/if}
 </div>
