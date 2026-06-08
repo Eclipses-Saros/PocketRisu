@@ -1957,8 +1957,19 @@ export const languageEnglish = {
     backupSnapshotDeleteFailed: "Failed to delete snapshot",
     backupSnapshotLimits: (count: number, bytes: number) =>
         `Up to ${count} · ${(bytes / 1024 / 1024).toFixed(0)} MB`,
-    backupSnapshotLimitsCurrent: (count: number, bytes: number) =>
-        `Currently ${count} · ${(bytes / 1024 / 1024).toFixed(1)} MB used`,
+    backupSnapshotLimitsCurrent: (count: number, bytes: number, logicalBytes?: number) => {
+        const disk = (bytes / 1024 / 1024).toFixed(1)
+        const saved = (logicalBytes ?? 0) - bytes
+        // Only surface the dedup win when it's meaningful (chunked snapshots share
+        // chunks); for tiny/un-chunked sets logical ≈ disk, so the plain line reads
+        // cleaner without a "(0 MB saved)" tail.
+        if (saved > 1024 * 1024) {
+            const data = ((logicalBytes ?? 0) / 1024 / 1024).toFixed(0)
+            const savedMB = (saved / 1024 / 1024).toFixed(0)
+            return `Currently ${count} · ${disk} MB on disk (${data} MB of data, ${savedMB} MB saved by deduplication)`
+        }
+        return `Currently ${count} · ${disk} MB used`
+    },
     backupSnapshotLimitsChange: "Configure limits",
     backupSnapshotLimitsDialog: "Snapshot retention limits",
     backupSnapshotLimitsDialogDesc: "Whichever limit is reached first applies. Snapshots are rotated as new ones are created; reducing a limit trims immediately (the most recent snapshot is always kept regardless).",

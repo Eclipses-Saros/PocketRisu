@@ -184,14 +184,21 @@ function trimSnapshotsToLimits() {
     return { kept: entries.length - toDelete.length, removed: toDelete.length };
 }
 
-// Current snapshot count + total marginal disk cost. Uses the same measure as
-// the limit (snapshotFootprint), so the limits UI matches what trimming sees —
-// kvListWithSizes would report a chunked snapshot's 13-byte marker.
+// Current snapshot count + two totals:
+//   bytes        — marginal disk cost (snapshotFootprint), the SAME measure the
+//                  byte limit/trim uses, so the limit gauge matches what trimming
+//                  sees. kvListWithSizes would report a chunked snapshot's marker.
+//   logicalBytes — sum of each snapshot's full logical size (kvSize), i.e. what
+//                  the snapshots would cost WITHOUT dedup. Drives the "saved by
+//                  deduplication" figure; never used for trimming.
 function snapshotUsage() {
     const keys = kvList(DB_BACKUP_PREFIX);
-    let bytes = 0;
-    for (const k of keys) bytes += snapshotFootprint(k);
-    return { count: keys.length, bytes };
+    let bytes = 0, logicalBytes = 0;
+    for (const k of keys) {
+        bytes += snapshotFootprint(k);
+        logicalBytes += (kvSize(k) || 0);
+    }
+    return { count: keys.length, bytes, logicalBytes };
 }
 
 function createBackupAndRotate() {
@@ -5344,6 +5351,7 @@ app.get('/api/db/snapshots/limits', async (req, res, next) => {
             maxBytes,
             currentCount: usage.count,
             currentBytes: usage.bytes,
+            logicalBytes: usage.logicalBytes,
             bounds: {
                 minCount: SNAPSHOT_LIMIT_MIN_COUNT,
                 maxCount: SNAPSHOT_LIMIT_MAX_COUNT,
@@ -5380,6 +5388,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
             maxCount, maxBytes,
             currentCount: usage.count,
             currentBytes: usage.bytes,
+            logicalBytes: usage.logicalBytes,
             removed: trim.removed,
         });
     } catch (err) { next(err); }
@@ -5391,9 +5400,13 @@ app.get('/api/db/snapshots', async (req, res, next) => {
         const out = kvList(DB_BACKUP_PREFIX).map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
             const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
-            // Marginal disk cost (chunks not shared with live), matching the limit
-            // — kvListWithSizes would report a chunked snapshot's 13-byte marker.
-            return { key, size: snapshotFootprint(key), timestamp: ts };
+            // Logical size — the full data this snapshot represents (the whole DB),
+            // not its marginal on-disk cost. Users expect "this backup = my 53 MB
+            // DB"; the dedup win is shown once, as the section's savings figure.
+            // (kvSize reassembles via the manifest; the marker's 13 bytes are not
+            // what a user wants to see for a full backup.) Trimming still sizes by
+            // snapshotFootprint in db.cjs, so this display change can't over-trim.
+            return { key, size: kvSize(key) || 0, timestamp: ts };
         }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
         res.json({ snapshots: out });
     } catch (err) { next(err); }

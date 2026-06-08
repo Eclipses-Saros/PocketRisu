@@ -2147,8 +2147,19 @@ export const languageKorean = {
   backupSnapshotDeleteFailed: "스냅샷 삭제 실패",
   backupSnapshotLimits: (count: number, bytes: number) =>
     `최대 ${count}개 · ${(bytes / 1024 / 1024).toFixed(0)} MB`,
-  backupSnapshotLimitsCurrent: (count: number, bytes: number) =>
-    `현재 ${count}개 · ${(bytes / 1024 / 1024).toFixed(1)} MB 사용`,
+  backupSnapshotLimitsCurrent: (count: number, bytes: number, logicalBytes?: number) => {
+    const disk = (bytes / 1024 / 1024).toFixed(1)
+    const saved = (logicalBytes ?? 0) - bytes
+    // Only surface the dedup win when it's meaningful (chunked snapshots share
+    // chunks); for tiny/un-chunked sets logical ≈ disk, so the plain line reads
+    // cleaner without a "(0 MB saved)" tail.
+    if (saved > 1024 * 1024) {
+      const data = ((logicalBytes ?? 0) / 1024 / 1024).toFixed(0)
+      const savedMB = (saved / 1024 / 1024).toFixed(0)
+      return `현재 ${count}개 · 디스크 ${disk} MB (데이터 ${data} MB, 중복 제거로 ${savedMB} MB 절약)`
+    }
+    return `현재 ${count}개 · ${disk} MB 사용`
+  },
   backupSnapshotLimitsChange: "한도 설정",
   backupSnapshotLimitsDialog: "스냅샷 보관 한도",
   backupSnapshotLimitsDialogDesc:
