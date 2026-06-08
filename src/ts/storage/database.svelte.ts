@@ -714,6 +714,7 @@ export function setDatabase(data:Database){
     data.dynamicModelRegistry ??= true
     data.saveSignatures ??= false
     data.nodeOnlyScrollButtonType ??= 'four'
+    data.nodeOnlyHideRecentChats ??= false
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
@@ -1451,6 +1452,7 @@ export interface Database{
     blockquoteStyling?:boolean
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
+    nodeOnlyHideRecentChats?:boolean
     seperateParametersByModel?:boolean
     disableSeperateParameterChangeOnPresetChange?:boolean
     saveSignatures?:boolean

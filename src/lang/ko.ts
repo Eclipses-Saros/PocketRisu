@@ -2249,4 +2249,7 @@ export const languageKorean = {
   relatedArcaLiveDesc: "AI 채팅 채널에서 다른 사용자와 이야기를 나눠보세요.",
 
   selectBotHint: "채팅을 시작할 봇을 선택하세요",
+  recentChatsTitle: "최근 대화",
+  noRecentChatsDesc: "아직 대화한 봇이 없어요",
+  hideRecentChats: "대화 목록 숨기기",
 } satisfies DeepPartial<typeof import("./en").languageEnglish>;
