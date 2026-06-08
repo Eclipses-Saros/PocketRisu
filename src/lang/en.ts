@@ -2052,6 +2052,9 @@ export const languageEnglish = {
     relatedArcaLiveDesc: "Discuss with other users in the AI chat channel.",
 
     selectBotHint: "Select a bot to start chatting",
+    recentChatsTitle: "Recent Chats",
+    noRecentChatsDesc: "No conversations yet",
+    hideRecentChats: "Hide conversation list",
 
 } satisfies I18nTranslation;
 
