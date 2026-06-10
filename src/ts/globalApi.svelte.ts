@@ -2,6 +2,7 @@ import { changeFullscreen, checkNullish, sleep } from "./util"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { tick } from "svelte";
 import { get } from "svelte/store";
+import streamSaver from 'streamsaver';
 import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat } from "./storage/database.svelte";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, loadingOverlayStore, chatDeselected } from "./stores.svelte";
@@ -1723,7 +1724,6 @@ export class LocalWriter {
      * @returns {Promise<boolean>} - A promise that resolves to a boolean indicating success.
      */
     async init(name = 'Binary', ext = ['bin']): Promise<boolean> {
-        const streamSaver = await import('streamsaver')
         const writableStream = streamSaver.createWriteStream(name + '.' + ext[0])
         this.writer = writableStream.getWriter()
         return true
