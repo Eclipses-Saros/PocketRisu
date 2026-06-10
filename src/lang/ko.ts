@@ -596,6 +596,7 @@ export const languageKorean = {
   characterPackage: "캐릭터 패키지",
   characterPackageExport: "패키지 내보내기",
   convertToModule: "모듈로 변환",
+  convertToCharacter: "캐릭터로 변환",
   successfullyConverted: "변환되었습니다.",
   characterPackageImport: "캐릭터 패키지 임포트 (zip)",
   characterPackageCharacter: "캐릭터",

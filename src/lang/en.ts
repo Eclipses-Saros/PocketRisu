@@ -531,6 +531,7 @@ export const languageEnglish = {
     characterPackage: "Character Package",
     characterPackageExport: "Export Package",
     convertToModule: "Convert to Module",
+    convertToCharacter: "Convert to Character",
     successfullyConverted: "Successfully converted.",
     characterPackageImport: "Import Character Package (zip)",
     characterPackageCharacter: "Character",
