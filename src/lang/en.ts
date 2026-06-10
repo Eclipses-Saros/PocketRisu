@@ -2066,6 +2066,7 @@ export const languageEnglish = {
     recentChatsTitle: "Recent Chats",
     noRecentChatsDesc: "No conversations yet",
     hideRecentChats: "Hide conversation list",
+    moveInsteadOfCopyOnCMPConvert: "Move Instead of Copy on CMP Convert",
 
 } satisfies I18nTranslation;
 

@@ -237,6 +237,13 @@ export const accessibilitySettingsItems: SettingItem[] = [
         keywords: ['hamburger', 'button', 'bottom', 'menu', 'sidebar', 'accessibility'],
     },
     {
+        id: 'acc.moveInsteadOfCopyOnCMPConvert',
+        type: 'check',
+        labelKey: 'moveInsteadOfCopyOnCMPConvert',
+        bindKey: 'moveInsteadOfCopyOnCMPConvert',
+        keywords: ['move', 'instead', 'of', 'copy', 'on', 'CMP', 'convert'],
+    },
+    {
         id: 'acc.hideLeftBarCollapseButton',
         type: 'check',
         labelKey: 'hideLeftBarCollapseButton',
@@ -389,4 +396,5 @@ export const accessibilityOtherItems = pick([
     'acc.showTranslationLoading',
     'acc.disableMobileDragDrop',
     'acc.disableToggleBinding',
+    'acc.moveInsteadOfCopyOnCMPConvert',
 ]);
