@@ -23,7 +23,10 @@ export function buildPreparedRequest(ctx: AdapterRequestContext): AdapterPrepare
     for (const field of snapshot.schema) {
         if (!field.mapsTo) continue
         const effective = pickEffective(userValues, field.key, field.default)
-        if (effective === undefined) continue
+        // Treat an empty string as "unset": a combobox/text field cleared back
+        // to blank leaves '' in userValues, and sending e.g. reasoning_effort:''
+        // is rejected by providers (no enum match). Skip it like undefined.
+        if (effective === undefined || effective === '') continue
         switch (field.mapsTo.target) {
             case 'body':
                 setNested(body, field.mapsTo.path, effective)

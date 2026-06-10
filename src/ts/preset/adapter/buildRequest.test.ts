@@ -101,6 +101,31 @@ describe('buildPreparedRequest', () => {
         expect(result.body).toEqual({ reasoning_effort: 'low' })
     })
 
+    test('treats an empty-string userValue as unset (combobox cleared to blank)', () => {
+        const preset = makePreset({
+            profileSnapshot: makeSnapshot({
+                schema: [
+                    {
+                        key: 'apiKey',
+                        type: 'string',
+                        label: 'API Key',
+                        secret: true,
+                        mapsTo: { target: 'auth', path: 'apiKey' },
+                    },
+                    {
+                        key: 'reasoning',
+                        type: 'string',
+                        label: 'Reasoning Effort',
+                        mapsTo: { target: 'body', path: 'reasoning_effort' },
+                    },
+                ],
+            }),
+            userValues: { reasoning: '' },
+        })
+        const result = buildPreparedRequest({ preset, credential: { apiKey: 'sk' } })
+        expect(result.body).not.toHaveProperty('reasoning_effort')
+    })
+
     test('skips fields without mapsTo and ignores auth/custom targets at body merge', () => {
         const preset = makePreset({
             profileSnapshot: makeSnapshot({
