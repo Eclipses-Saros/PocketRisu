@@ -746,6 +746,7 @@ export const languageEnglish = {
     chatInputExpandTitle: "Message input",
     resendLastMessage: "Resend the last message",
     enterMessagePlaceholder: "Enter a message...",
+    enterMessageToPersona: (name: string) => `Message ${name}...`,
     sendKeyEnter: "Enter (Shift+Enter for newline)",
     sendKeyCtrlEnter: "Ctrl+Enter (Enter for newline)",
     sendKeyShiftEnter: "Shift+Enter (Enter for newline)",

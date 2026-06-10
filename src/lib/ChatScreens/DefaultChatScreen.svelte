@@ -526,6 +526,20 @@ import { isMobile } from 'src/ts/platform'
     // Standard-theme chat composer floats over the message list so chat scrolls
     // underneath it (other themes keep the in-flow composer).
     let floatingMode = $derived(DBState.db.theme === '')
+    // Standard theme: composer width follows the configured chat width (matches message cards).
+    // Other themes: no width limit (original full-width behavior).
+    let composerWidthClass = $derived(
+        !floatingMode ? '' :
+        DBState.db.nodeOnlyStandardChatWidth === 'full' ? 'max-w-full' :
+        DBState.db.nodeOnlyStandardChatWidth === 'wide' ? 'max-w-6xl' :
+        'max-w-3xl'
+    )
+    // Effective persona name for the input placeholder (chat-bound persona overrides the selected one).
+    let activePersonaName = $derived.by(() => {
+        const chat = DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]
+        const bound = chat?.bindedPersona ? DBState.db.personas.find(p => p.id === chat.bindedPersona) : null
+        return (bound ?? DBState.db.personas[DBState.db.selectedPersona])?.name || 'User'
+    })
     // Chat-area background (bgcolor 25% + darkbg), mirroring nodeonly-standard.css —
     // used for the thin fade above the pill so chat dissolves into the background as
     // it scrolls past the input edge. Only used on the standard theme (floatingMode).
@@ -716,11 +730,7 @@ import { isMobile } from 'src/ts/platform'
 
 
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="w-full h-full relative" style={customStyle} onclick={() => {
-    openMenu = false
-}}>
+<div class="w-full h-full relative" style={customStyle}>
     
     {#if DBState.db.nodeOnlyScrollButtonType !== 'off' && currentChat.length > 0}
         <div
@@ -827,7 +837,7 @@ import { isMobile } from 'src/ts/platform'
                     class="{floatingMode ? 'pt-2 pb-2' : (DBState.db.fixedChatTextarea ? 'sticky pt-2 pb-2 right-0 bottom-0 bg-bgcolor' : 'mt-2 mb-2')} w-full"
                     style="{!floatingMode && DBState.db.fixedChatTextarea ? 'z-index:29;' : ''}"
             >
-              <div class="mx-auto w-full max-w-3xl px-2">
+              <div class="mx-auto w-full {composerWidthClass} px-2">
                 <!-- "plugin-compat-items-stretch" is a compat hook (not a Tailwind class):
                      plugins that locate the composer via div[class*="items-stretch"] (e.g. gemini-cache-keeper)
                      relied on the pre-redesign container class. Keep it so they can still find/anchor their UI,
@@ -940,7 +950,7 @@ import { isMobile } from 'src/ts/platform'
                           class:order-first={multiline}
                           class:overflow-y-auto={inputOverflow}
                           class:overflow-y-hidden={!inputOverflow}
-                          placeholder={willResend ? language.resendLastMessage : language.enterMessagePlaceholder}
+                          placeholder={willResend ? language.resendLastMessage : language.enterMessageToPersona(activePersonaName)}
                           bind:value={messageInput}
                           bind:this={inputEle}
                           onkeydown={(e) => {
@@ -1263,7 +1273,7 @@ import { isMobile } from 'src/ts/platform'
             <textarea
                     bind:value={messageInput}
                     bind:this={fullscreenEle}
-                    placeholder={language.enterMessagePlaceholder}
+                    placeholder={language.enterMessageToPersona(activePersonaName)}
                     class="flex-1 min-h-0 w-full resize-none rounded-md border border-darkborderc bg-transparent p-3 text-textcolor text-base outline-hidden overflow-y-auto focus:border-textcolor transition-colors"
             ></textarea>
             <div class="flex justify-end mt-3">
