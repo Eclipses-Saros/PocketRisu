@@ -134,6 +134,7 @@ export type RegistryCapability =
     | 'tools'
     | 'json'
     | 'reasoning'
+    | 'cache'
 
 export interface ModelLimits {
     known?: boolean
