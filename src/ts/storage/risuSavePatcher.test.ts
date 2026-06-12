@@ -748,55 +748,70 @@ describe('fast-path — a skipped block still catches a later change', () => {
     })
 })
 
-describe('fast-path — shared references stay on the safe full path', () => {
-    // normalizeJSON replaces the 2nd occurrence of a shared (non-cyclic)
-    // reference with null, so the protocol baseline holds null there while the
-    // raw JSON holds the full object. If the cheap baseline were the raw string,
-    // un-sharing the reference into an independent (deep-equal) object would
-    // leave the raw JSON unchanged → fast path skips → server keeps the null.
-    // Seeding the baseline from the normalized form keeps such characters on the
-    // full path so the change is always emitted.
-    test('un-sharing a reference emits the recovery op — init-seeded baseline', async () => {
+describe('fast-path — shared (non-cyclic) references round-trip correctly', () => {
+    // normalizeJSON uses path-based cycle detection: a shared (non-cyclic)
+    // reference appearing twice is kept in BOTH places (only true cycles are
+    // nulled). So raw JSON and the normalized baseline agree on shared-ref data
+    // and the fast path is safe — no null to "recover". These pin that the
+    // patcher neither corrupts shared-ref data nor emits spurious ops.
+    test('character with a shared ref: round-trips without null corruption, then no-op', async () => {
+        const { applyPatch: apply } = await import('fast-json-patch')
         const shared = { tag: 'v', n: 1 }
-        const db = dbWith([chr('a', { extA: shared, extB: shared })]) // extB normalizes to null
+        const base = dbWith([chr('a')])
         const p = new RisuSavePatcher()
-        await p.init(db) // baseline for 'a' has extB: null
+        await p.init(base)
 
-        // Un-share: extB is now an independent object, deep-equal to extA.
-        // Built fresh (clone() via JSON would itself un-share, so construct it).
+        // Introduce a character that holds the same object under two keys.
+        const withShared = dbWith([chr('a', { extA: shared, extB: shared })])
+        const { patch } = await p.set(withShared, { ...emptyToSave(), character: ['a'] })
+
+        // Server reconstruction must hold the full object in BOTH places (no null).
+        const server = JSON.parse(JSON.stringify(normalizeJSON(base)))
+        apply(server, patch)
+        expect(server.characters[0].extA).toEqual({ tag: 'v', n: 1 })
+        expect(server.characters[0].extB).toEqual({ tag: 'v', n: 1 })
+
+        // Identical re-save is a clean no-op (baseline converged).
+        expect((await p.set(withShared, emptyToSave())).patch).toEqual([])
+    })
+
+    test('un-sharing into deep-equal objects is a no-op (no spurious ops)', async () => {
+        const shared = { tag: 'v', n: 1 }
+        const p = new RisuSavePatcher()
+        await p.init(dbWith([chr('a', { extA: shared, extB: shared })]))
+
+        // Un-share: two independent but deep-equal objects — content unchanged.
         const unshared = dbWith([chr('a', { extA: { tag: 'v', n: 1 }, extB: { tag: 'v', n: 1 } })])
         const { patch } = await p.set(unshared, emptyToSave())
-
-        // The server's null at /characters/0/extB must be recovered.
-        expect(patch.some((o: any) => o.path.startsWith('/characters/0/extB'))).toBe(true)
+        expect(patch).toEqual([])
     })
 
-    test('un-sharing a reference emits the recovery op — set-updated baseline', async () => {
-        // Exercises the per-character baseline UPDATE path (not just init seeding):
-        // start normal, introduce a shared ref via a save, then un-share.
-        const p = new RisuSavePatcher()
-        await p.init(dbWith([chr('a', { desc: 'd0' })]))
-
-        // Save 1: introduce the shared ref (full path runs, updates baseline).
+    test('a real content change under a shared ref is still caught', async () => {
         const shared = { tag: 'v', n: 1 }
-        await p.set(dbWith([chr('a', { desc: 'd0', extA: shared, extB: shared })]), emptyToSave())
-        // Server now holds extB: null.
+        const p = new RisuSavePatcher()
+        await p.init(dbWith([chr('a', { extA: shared, extB: shared })]))
 
-        // Save 2: un-share (same content, only the sharing changes).
-        const unshared = dbWith([chr('a', { desc: 'd0', extA: { tag: 'v', n: 1 }, extB: { tag: 'v', n: 1 } })])
-        const { patch } = await p.set(unshared, emptyToSave())
+        // Now genuinely change extB's content.
+        const changed = dbWith([chr('a', { extA: { tag: 'v', n: 1 }, extB: { tag: 'v', n: 2 } })])
+        const { patch } = await p.set(changed, emptyToSave())
         expect(patch.some((o: any) => o.path.startsWith('/characters/0/extB'))).toBe(true)
     })
 
-    test('root-level un-sharing is also caught', async () => {
+    test('root-level shared ref round-trips and converges to a no-op', async () => {
+        const { applyPatch: apply } = await import('fast-json-patch')
         const shared = { theme: 'x' }
-        const db = dbWith([chr('a')], { sdProvider: shared, customCss: shared } as any)
+        const base = dbWith([chr('a')])
         const p = new RisuSavePatcher()
-        await p.init(db)
+        await p.init(base)
 
-        const unshared = dbWith([chr('a')], { sdProvider: { theme: 'x' }, customCss: { theme: 'x' } } as any)
-        const { patch } = await p.set(unshared, { ...emptyToSave(), root: true })
-        expect(patch.some((o: any) => o.path === '/customCss' || o.path.startsWith('/customCss/'))).toBe(true)
+        const withShared = dbWith([chr('a')], { sdProvider: shared, customCss: shared } as any)
+        const { patch } = await p.set(withShared, { ...emptyToSave(), root: true })
+        const server = JSON.parse(JSON.stringify(normalizeJSON(base)))
+        apply(server, patch)
+        expect(server.sdProvider).toEqual({ theme: 'x' })
+        expect(server.customCss).toEqual({ theme: 'x' })
+
+        expect((await p.set(withShared, emptyToSave())).patch).toEqual([])
     })
 })
 
