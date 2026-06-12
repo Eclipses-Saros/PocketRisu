@@ -760,6 +760,7 @@ export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
                 result.push(normalized === undefined ? null : normalized);
             }
         }
+        seen.delete(value);
         return result;
     }
     const result: Record<string, any> = {};
@@ -773,6 +774,7 @@ export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
             }
         }
     }
+    seen.delete(value);
     return result;
 }
 
