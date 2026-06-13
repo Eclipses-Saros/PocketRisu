@@ -2873,6 +2873,8 @@ app.post('/proxy', reverseProxyFunc);
 app.post('/proxy2', reverseProxyFunc);
 app.put('/proxy', reverseProxyFunc);
 app.put('/proxy2', reverseProxyFunc);
+app.patch('/proxy', reverseProxyFunc);
+app.patch('/proxy2', reverseProxyFunc);
 app.delete('/proxy', reverseProxyFunc);
 app.delete('/proxy2', reverseProxyFunc);
 app.post('/hub-proxy/*', hubProxyFunc);
