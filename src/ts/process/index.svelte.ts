@@ -479,10 +479,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    if(DBState.db.personaPrompt){
+    const personaPromptText = getPersonaPrompt()
+    if(personaPromptText){
         unformated.personaPrompt.push({
             role: 'system',
-            content: risuChatParser(getPersonaPrompt(), {chara: currentChar})
+            content: risuChatParser(personaPromptText, {chara: currentChar})
         })
     }
     
