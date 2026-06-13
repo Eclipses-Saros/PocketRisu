@@ -98,7 +98,11 @@ function loadEntries(): Map<string, GeminiCacheStateEntry> {
                 for (const [key, value] of Object.entries(parsed)) {
                     if (!isValidEntry(value) || value.expiresAt <= now) continue
                     entries.set(key, value)
-                    invalidationCounts.set(key, value.consecutiveInvalidations)
+                    // The consecutive-invalidation guard is in-memory only (it
+                    // resets on reload by design — see the session-guards block):
+                    // do NOT restore the persisted count, or a stale count could
+                    // disable caching prematurely after a restart. The persisted
+                    // consecutiveInvalidations field stays (harmless, always 0).
                 }
             }
         }

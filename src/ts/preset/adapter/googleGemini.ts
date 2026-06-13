@@ -218,8 +218,16 @@ async function prepareGeminiBody(
     const modelId = resolveWireModelId(preset, { vendorName: 'Google Gemini' })
     delete prepared.body.model
 
-    const { system, chat } = collectSystemAndChat(options.messages)
+    const { system, chat, systemCachePoint } = collectSystemAndChat(options.messages)
     const { contents, cacheBoundary } = toGeminiContents(chat)
+    // A cachePoint carried only by system messages (cache prompt card /
+    // automaticCachePoint landing on the system role) used to be dropped when
+    // collectSystemAndChat hoisted those messages into systemInstruction,
+    // silently disabling caching. When the chat side has no cachePoint of its
+    // own, fall back to boundary 0 = "cache the systemInstruction only": an
+    // empty cached-prefix of contents plus the full systemInstruction. A chat
+    // cachePoint always wins (it is the deeper, larger cacheable prefix).
+    const resolvedBoundary = cacheBoundary ?? (systemCachePoint ? 0 : null)
     prepared.body.contents = contents
     if (system.length > 0) {
         prepared.body.systemInstruction = { parts: [{ text: system }] }
@@ -238,7 +246,7 @@ async function prepareGeminiBody(
 
     const suffix = stream ? ':streamGenerateContent?alt=sse' : ':generateContent'
     prepared.url = `${prepared.url}/${encodeURIComponent(modelId)}${suffix}`
-    return { ...prepared, modelId, cacheBoundary }
+    return { ...prepared, modelId, cacheBoundary: resolvedBoundary }
 }
 
 function toGeminiFunctionDeclaration(tool: AdapterToolDef): Record<string, unknown> {
@@ -248,19 +256,26 @@ function toGeminiFunctionDeclaration(tool: AdapterToolDef): Record<string, unkno
 function collectSystemAndChat(messages: AdapterChatMessage[]): {
     system: string
     chat: AdapterChatMessage[]
+    // True when any system message carried a cachePoint. These messages are
+    // hoisted into systemInstruction (which the cache always covers anyway), so
+    // their cachePoint would otherwise vanish; the caller folds it into a
+    // boundary-0 (systemInstruction-only) cache when the chat side has none.
+    systemCachePoint: boolean
 } {
     const systems: string[] = []
     const chat: AdapterChatMessage[] = []
+    let systemCachePoint = false
     for (const message of messages) {
         if (message.role === 'system') {
             systems.push(message.content)
+            if (message.cachePoint) systemCachePoint = true
         } else {
             // tool / user / assistant flow into the wire builder, which maps tool
             // results to functionResponse parts on a user turn (Gemini shape).
             chat.push(message)
         }
     }
-    return { system: systems.join('\n\n'), chat }
+    return { system: systems.join('\n\n'), chat, systemCachePoint }
 }
 
 // Build Gemini `contents`. Consecutive tool messages collapse into one `user`
@@ -276,8 +291,9 @@ function collectSystemAndChat(messages: AdapterChatMessage[]): {
 // cacheable prefix). Tracking happens here, in the same pass that collapses
 // tool turns, so the index can never drift from the wire shape. System
 // messages never reach this function (collectSystemAndChat hoists them into
-// systemInstruction, which the cache covers anyway), so a cachePoint carried
-// only by system messages yields null = no boundary.
+// systemInstruction), so a chat-side cachePoint here always wins; a cachePoint
+// carried ONLY by system messages yields null here and is folded into a
+// boundary-0 (systemInstruction-only) cache by prepareGeminiBody.
 function toGeminiContents(chat: AdapterChatMessage[]): {
     contents: GeminiContent[]
     cacheBoundary: number | null

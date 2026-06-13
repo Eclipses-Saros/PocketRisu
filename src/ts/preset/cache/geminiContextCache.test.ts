@@ -655,11 +655,13 @@ describe('session guards', () => {
         expect(getGeminiCacheInvalidationCount(key)).toBe(0)
     })
 
-    test('invalidation count restores from the mirrored entry', () => {
+    test('invalidation count is in-memory only: a reload starts the guard at zero', () => {
+        // The guard never reads the persisted consecutiveInvalidations field, so
+        // a restart cannot resurrect a stale count and disable caching early.
         const key = 'chat-1::model::p1'
         setGeminiCacheEntry(key, makeEntry({ expiresAt: Date.now() + 600_000, consecutiveInvalidations: 2 }))
         resetGeminiContextCacheRuntime()
-        expect(getGeminiCacheInvalidationCount(key)).toBe(2)
+        expect(getGeminiCacheInvalidationCount(key)).toBe(0)
     })
 
     test('disableGeminiCacheSession warns once per key', () => {

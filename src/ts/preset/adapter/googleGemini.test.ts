@@ -978,6 +978,93 @@ describe('context caching wiring', () => {
         expect(calls[0].body.cachedContent).toBeUndefined()
     })
 
+    // A cachePoint carried only by a system message (cache card landing on the
+    // system role) used to be dropped when system → systemInstruction, silently
+    // disabling caching. It now folds into a boundary-0 (systemInstruction-only)
+    // cache: the create POST holds an empty contents prefix + systemInstruction.
+    const systemOnlyCachePoint: AdapterChatMessage[] = [
+        { role: 'system', content: 'You are factual.', cachePoint: true },
+        { role: 'user', content: 'turn 1' },
+    ]
+
+    test('a system-only cachePoint caches the systemInstruction (boundary 0)', async () => {
+        const { fetchImpl, calls } = routedFetch(chatJson(10_000))
+        await sendGoogleChatRequest(
+            makePreset(),
+            { messages: systemOnlyCachePoint, fetchImpl, cache: makeCacheContext() },
+            { apiKey: 'k' },
+        )
+        // Turn 1 sends uncached (full contents + systemInstruction).
+        expect(calls[0].body.cachedContent).toBeUndefined()
+        expect(calls[0].body.systemInstruction).toBeDefined()
+        // Fire-and-forget creation: cache the systemInstruction only (no contents).
+        await vi.waitFor(() => expect(calls).toHaveLength(2))
+        expect(calls[1].method).toBe('POST')
+        expect(calls[1].url).toBe('https://demo.test/v1beta/cachedContents')
+        expect(calls[1].body).toEqual({
+            model: 'models/gemini-demo',
+            ttl: '600s',
+            systemInstruction: { parts: [{ text: 'You are factual.' }] },
+            contents: [],
+        })
+    })
+
+    test('second turn applies the systemInstruction-only cache: cachedContent + full contents, systemInstruction stripped', async () => {
+        const { fetchImpl, calls } = routedFetch(chatJson(10_000))
+        await sendGoogleChatRequest(
+            makePreset(),
+            { messages: systemOnlyCachePoint, fetchImpl, cache: makeCacheContext() },
+            { apiKey: 'k' },
+        )
+        await vi.waitFor(() => expect(calls).toHaveLength(2))
+        const turnTwo: AdapterChatMessage[] = [
+            { role: 'system', content: 'You are factual.', cachePoint: true },
+            { role: 'user', content: 'turn 1' },
+            { role: 'assistant', content: 'reply 1' },
+            { role: 'user', content: 'turn 2' },
+        ]
+        await sendGoogleChatRequest(
+            makePreset(),
+            { messages: turnTwo, fetchImpl, cache: makeCacheContext() },
+            { apiKey: 'k' },
+        )
+        // boundary 0 → the cache holds only the systemInstruction; the chat call
+        // strips systemInstruction and sends the FULL contents as the suffix.
+        expect(calls[2].body.cachedContent).toBe('cachedContents/created-1')
+        expect(calls[2].body.systemInstruction).toBeUndefined()
+        expect(calls[2].body.contents).toEqual([
+            { role: 'user', parts: [{ text: 'turn 1' }] },
+            { role: 'model', parts: [{ text: 'reply 1' }] },
+            { role: 'user', parts: [{ text: 'turn 2' }] },
+        ])
+    })
+
+    test('a chat cachePoint wins over a system cachePoint (deeper boundary)', async () => {
+        const messages: AdapterChatMessage[] = [
+            { role: 'system', content: 'You are factual.', cachePoint: true },
+            { role: 'user', content: 'turn 1', cachePoint: true },
+            { role: 'assistant', content: 'reply 1' },
+            { role: 'user', content: 'turn 2' },
+        ]
+        const { fetchImpl, calls } = routedFetch(chatJson(10_000))
+        await sendGoogleChatRequest(
+            makePreset(),
+            { messages, fetchImpl, cache: makeCacheContext() },
+            { apiKey: 'k' },
+        )
+        await vi.waitFor(() => expect(calls).toHaveLength(2))
+        // The chat cachePoint (boundary 1) is the larger cacheable prefix: the
+        // create body holds systemInstruction + the first user turn, not just
+        // the systemInstruction.
+        expect(calls[1].method).toBe('POST')
+        expect(calls[1].body).toEqual({
+            model: 'models/gemini-demo',
+            ttl: '600s',
+            systemInstruction: { parts: [{ text: 'You are factual.' }] },
+            contents: [{ role: 'user', parts: [{ text: 'turn 1' }] }],
+        })
+    })
+
     test('stream completion drives cache creation from the last chunk usage', async () => {
         const { fetchImpl, calls } = routedFetch(() => sseResponse([
             'data: {"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"}}]}\n\n',

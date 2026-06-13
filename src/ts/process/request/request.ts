@@ -723,6 +723,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // previews are excluded. Both auth kinds share the cachedContents wire; the
     // adapter derives the Studio-vs-Vertex URL/model shape from the prepared
     // chat URL, so the only difference here is admitting google-service-account.
+    // The profile must EXPLICITLY declare the 'cache' capability (same gate the
+    // editor toggle uses, ModelPresetSettings.svelte): a profile swap that kept
+    // promptCaching.enabled but landed on a cache-less profile can never engage
+    // caching — otherwise the cachedContents API would be hit every turn on a
+    // model that does not support it.
     // Vertex-OpenAI stays out: it routes through openai-compatible, not this
     // adapter kind. The context carries everything the cache layer needs so the
     // adapter never reads the database (SSR rule). The state key is chat.id
@@ -732,6 +737,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     const cacheAuthKind = preset.profileSnapshot.auth.kind
     let cache: AdapterCacheContext | undefined
     if (kind === 'google-gemini' && preset.promptCaching?.enabled && mode === 'model'
+        && (caps?.includes('cache') ?? false)
         && !tools && !arg.previewBody
         && (cacheAuthKind === 'x-goog-api-key' || cacheAuthKind === 'google-service-account')) {
         const cacheChatKey = getCurrentChat()?.id
