@@ -671,29 +671,29 @@ const isPermissionResolved = async (
 const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermissionDesc, reconfirm: boolean|'periodically' = false) => {
     await ensurePluginPermissionStateLoaded()
 
-    let requiresReconfirm = false;
-
-    if(reconfirm === 'periodically'){
-        const lastGrantTime = permissionCache.get(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime') as number | undefined;
-        const now = Date.now();
-        if(!lastGrantTime || now - lastGrantTime > 3 * 24 * 60 * 60 * 1000){ //3 days
-            requiresReconfirm = true;
+    // Recomputed (not captured) so a periodic reconfirm reflects the latest
+    // lastGrantTime: when several identical requests queue together, an earlier
+    // one may refresh it, making the reconfirm no longer due for the rest.
+    const computeRequiresReconfirm = () => {
+        if(reconfirm === 'periodically'){
+            const lastGrantTime = permissionCache.get(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime') as number | undefined;
+            return !lastGrantTime || Date.now() - lastGrantTime > 3 * 24 * 60 * 60 * 1000; //3 days
         }
-    }
-    else if(reconfirm === true){
-        requiresReconfirm = true;
+        return reconfirm === true;
     }
 
     // Fast path: if the answer is already known, skip the serialization queue
     // entirely so cached/granted permissions never block on a pending dialog.
-    const early = await isPermissionResolved(pluginName, permissionDesc, requiresReconfirm)
+    const early = await isPermissionResolved(pluginName, permissionDesc, computeRequiresReconfirm())
     if (early.resolved) {
         return early.value
     }
 
     const showDialog = async (): Promise<boolean> => {
         // Re-check under the lock: an earlier queued dialog for the same plugin
-        // may have already granted/denied while we were waiting our turn.
+        // may have already granted/denied (or refreshed a periodic grant) while
+        // we were waiting our turn — recompute reconfirm so we don't re-prompt.
+        const requiresReconfirm = computeRequiresReconfirm()
         const recheck = await isPermissionResolved(pluginName, permissionDesc, requiresReconfirm)
         if (recheck.resolved) {
             return recheck.value

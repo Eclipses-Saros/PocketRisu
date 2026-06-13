@@ -202,6 +202,60 @@ function makePerPermissionGetPermission(
     }
 }
 
+// ─── Periodic-reconfirm variant: mirrors getPluginPermission's 'periodically' ─
+//
+// A 'periodically' request only re-prompts if the last grant is older than the
+// window. The bug: requiresReconfirm was captured BEFORE entering the queue, so
+// when several identical periodic requests queued together they all decided
+// "reconfirm due" up front; the first grant refreshed lastGrantTime but the rest
+// re-prompted anyway. The fix recomputes it under the lock. `recompute` toggles
+// between the fixed (true) and buggy (false) behavior so a test can pin both.
+function makePeriodicGetPermission(
+    state: ReturnType<typeof makePermissionState>,
+    alertConfirm: (m: string) => Promise<boolean>,
+    now: () => number,
+    recompute: boolean,
+    windowMs = 3 * 24 * 60 * 60 * 1000,
+) {
+    let chain: Promise<unknown> = Promise.resolve()
+
+    const dueForReconfirm = (key: string) => {
+        const last = state.cache.get(key + '_lastGrantTime') as number | undefined
+        return !last || now() - last > windowMs
+    }
+    const resolved = (key: string, requiresReconfirm: boolean) => {
+        if (!requiresReconfirm && state.given.has(key)) return { resolved: true, value: true }
+        if (!requiresReconfirm && state.denied.has(key)) return { resolved: true, value: false }
+        return { resolved: false, value: false }
+    }
+
+    return async function getPluginPermission(pluginName: string, permissionDesc: string): Promise<boolean> {
+        const key = keyOf(pluginName, permissionDesc)
+        const captured = dueForReconfirm(key)
+        const early = resolved(key, captured)
+        if (early.resolved) return early.value
+
+        const showDialog = async (): Promise<boolean> => {
+            // Fixed: recompute under the lock. Buggy: reuse the captured value.
+            const requiresReconfirm = recompute ? dueForReconfirm(key) : captured
+            const recheck = resolved(key, requiresReconfirm)
+            if (recheck.resolved) return recheck.value
+            const conf = await alertConfirm(`Allow ${pluginName} → ${permissionDesc}?`)
+            if (conf) {
+                state.given.add(key)
+                state.cache.set(key + '_lastGrantTime', now())
+                return true
+            }
+            state.denied.add(key)
+            return false
+        }
+
+        const run = chain.catch(() => {}).then(() => showDialog())
+        chain = run.catch(() => {})
+        return run
+    }
+}
+
 describe('plugin permission dialog serialization', () => {
     it('BUGGY: concurrent requests clobber the shared dialog (reproduces the report)', async () => {
         const harness = makeAlertHarness()
@@ -399,6 +453,81 @@ describe('plugin permission dialog serialization', () => {
         expect(prompted).toBe(true)
         // ...and our denial held, so no silent authorization leaked through.
         expect(dbPerm).toBe(false)
+    })
+
+    it('PERIODIC: concurrent identical periodic requests prompt only ONCE', async () => {
+        const harness = makeAlertHarness()
+        const state = makePermissionState()
+        const now = () => 1_000_000 // fixed clock; first grant stamps lastGrantTime=now
+        const getPerm = makePeriodicGetPermission(state, harness.alertConfirm, now, /*recompute*/ true)
+
+        // Count dialogs, granting each. maxConcurrentLive can't tell the fix from
+        // the bug — serialization keeps dialogs from overlapping in time even when
+        // re-prompting — so we must count prompts, not concurrency.
+        let dialogs = 0
+        const responder = (() => {
+            let stopped = false
+            const loop = async () => {
+                while (!stopped) {
+                    if (get(harness.alertStore).type === 'ask') {
+                        harness.alertStore.set({ type: 'none', msg: 'yes' })
+                        dialogs++
+                    }
+                    await sleep(2)
+                }
+            }
+            const done = loop()
+            return { stop: async () => { stopped = true; await done } }
+        })()
+
+        // Four replacer registrations fire at once (e.g. a plugin calling
+        // addRisuReplacer repeatedly), all 'periodically' and all due up front.
+        const results = await Promise.all([
+            getPerm('Plug', 'replacer'),
+            getPerm('Plug', 'replacer'),
+            getPerm('Plug', 'replacer'),
+            getPerm('Plug', 'replacer'),
+        ])
+        await responder.stop()
+
+        expect(results).toEqual([true, true, true, true])
+        // Only the first prompted; the rest saw the refreshed lastGrantTime
+        // (recomputed under the lock) and the recorded grant, so no re-prompt.
+        expect(dialogs).toBe(1)
+    })
+
+    it('PERIODIC: without recompute, the same burst re-prompts (guards the fix)', async () => {
+        const harness = makeAlertHarness()
+        const state = makePermissionState()
+        const now = () => 1_000_000
+        // recompute=false reproduces the captured-before-queue bug.
+        const getPerm = makePeriodicGetPermission(state, harness.alertConfirm, now, /*recompute*/ false)
+
+        let dialogs = 0
+        const counter = (() => {
+            let stopped = false
+            const loop = async () => {
+                while (!stopped) {
+                    if (get(harness.alertStore).type === 'ask') {
+                        harness.alertStore.set({ type: 'none', msg: 'yes' })
+                        dialogs++
+                    }
+                    await sleep(2)
+                }
+            }
+            const done = loop()
+            return { stop: async () => { stopped = true; await done } }
+        })()
+
+        await Promise.all([
+            getPerm('Plug', 'replacer'),
+            getPerm('Plug', 'replacer'),
+            getPerm('Plug', 'replacer'),
+        ])
+        await counter.stop()
+
+        // The buggy path prompts more than once for the same burst.
+        expect(dialogs).toBeGreaterThan(1)
     })
 
     it('FIXED: a throwing dialog does not deadlock later requests', async () => {
