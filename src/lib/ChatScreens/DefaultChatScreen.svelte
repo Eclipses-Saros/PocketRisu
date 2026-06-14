@@ -7,7 +7,7 @@
     import ShDropdownMenuContent from 'src/lib/UI/GUI/ShDropdownMenuContent.svelte';
     import ShDropdownMenuItem from 'src/lib/UI/GUI/ShDropdownMenuItem.svelte';
     import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected, chatPanelStore } from "../../ts/stores.svelte";
-    import { tick } from 'svelte';
+    import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
     import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
@@ -34,6 +34,7 @@ import { isMobile } from 'src/ts/platform'
     import { postChatFile } from 'src/ts/process/files/multisend';
     import { getInlayAsset } from 'src/ts/process/files/inlays';
     import { quickMenu } from 'src/ts/hotkey';
+    import { loadChatDraft, scheduleSaveChatDraft, flushChatDraft, removeChatDraft } from 'src/ts/storage/chatDraft';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -79,6 +80,75 @@ import { isMobile } from 'src/ts/platform'
     let currentChatReady = $derived(!!currentChatSlot && !currentChatSlot._placeholder)
     let currentChat = $derived(currentChatReady ? currentChatSlot.message : [])
     let currentChatFmIndex = $derived(currentChatReady ? (currentChatSlot.fmIndex ?? -1) : -1)
+
+    // ─── Per-chat composer draft ────────────────────────────────────────────
+    // The message input is kept per chat, stored outside the chat body, so it
+    // survives unmounting the chat view (e.g. accidentally opening Settings while
+    // composing a long message). Keyed by character + chat id.
+    let draftChaId = $derived(currentCharacter?.chaId ?? '')
+    let draftChatId = $derived(currentChatSlot?.id ?? '')
+    let draftLoading = $state(false)
+
+    function persistDraftNow() {
+        flushChatDraft(draftChaId, draftChatId, { m: messageInput, t: messageInputTranslate })
+    }
+
+    // Load on chat enter (keyed by id, so no wait for hydration); flush the
+    // latest text for the chat being left on switch / unmount.
+    $effect(() => {
+        const chaId = draftChaId
+        const chatId = draftChatId
+        if (!chaId || !chatId) return
+        untrack(() => { messageInput = ''; messageInputTranslate = ''; draftLoading = true })
+        let active = true
+        ;(async () => {
+            const draft = await loadChatDraft(chaId, chatId)
+            if (!active) return
+            untrack(() => {
+                // Don't clobber text the user began typing during the load.
+                if (draft && messageInput === '' && messageInputTranslate === '') {
+                    messageInput = draft.m
+                    messageInputTranslate = draft.t
+                }
+                draftLoading = false
+            })
+            // Resize the textarea to fit the cleared/loaded text (height is
+            // updated imperatively, not reactively to messageInput).
+            await tick()
+            if (active) updateInputSizeAll()
+        })()
+        return () => {
+            active = false
+            flushChatDraft(chaId, chatId, {
+                m: untrack(() => messageInput),
+                t: untrack(() => messageInputTranslate),
+            })
+        }
+    })
+
+    // Debounced save while typing (each write is a network round-trip, so it is
+    // coalesced). Suppressed during the initial load to avoid racing it.
+    $effect(() => {
+        const chaId = draftChaId
+        const chatId = draftChatId
+        const m = messageInput
+        const t = messageInputTranslate
+        if (!chaId || !chatId || draftLoading) return
+        scheduleSaveChatDraft(chaId, chatId, { m, t })
+    })
+
+    // Best-effort persist on tab hide / unload (refresh, app switch): the
+    // unmount cleanup above does not fire on a hard page teardown.
+    $effect(() => {
+        const onHide = () => { if (document.visibilityState === 'hidden') persistDraftNow() }
+        const onPageHide = () => persistDraftNow()
+        document.addEventListener('visibilitychange', onHide)
+        window.addEventListener('pagehide', onPageHide)
+        return () => {
+            document.removeEventListener('visibilitychange', onHide)
+            window.removeEventListener('pagehide', onPageHide)
+        }
+    })
 
     /** Await hydration of active chat. Returns full Chat or null on failure. */
     async function ensureActiveChatReady(selectedChar = $selectedCharID): Promise<ChatData | null> {
@@ -271,6 +341,8 @@ import { isMobile } from 'src/ts/platform'
             const commandProcessed = await processMultiCommand(messageInput)
             if(commandProcessed !== false){
                 messageInput = ''
+                messageInputTranslate = ''
+                removeChatDraft(draftChaId, draftChatId)
                 return
             }
         }
@@ -319,6 +391,7 @@ import { isMobile } from 'src/ts/platform'
         }
         messageInput = ''
         messageInputTranslate = ''
+        removeChatDraft(draftChaId, draftChatId)
         DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message = cha
 
         await sleep(10)
@@ -342,6 +415,7 @@ import { isMobile } from 'src/ts/platform'
     })
     async function exitFullscreen(){
         composerFullscreen = false
+        persistDraftNow()   // checkpoint the draft on return from the expanded composer
         await tick()   // let the inline composer re-measure with the latest text
         updateInputSizeAll()
         updateInputTransateMessage(false)
@@ -1010,6 +1084,7 @@ import { isMobile } from 'src/ts/platform'
                         }
                     }}
                           oninput={()=>{updateInputSizeAll();updateInputTransateMessage(false)}}
+                          onblur={persistDraftNow}
                           style:height={inputHeight}
                 ></textarea>
 
@@ -1288,6 +1363,7 @@ import { isMobile } from 'src/ts/platform'
             <textarea
                     bind:value={messageInput}
                     bind:this={fullscreenEle}
+                    onblur={persistDraftNow}
                     placeholder={language.enterMessageToPersona(activePersonaName)}
                     class="flex-1 min-h-0 w-full resize-none rounded-md border border-darkborderc bg-transparent p-3 text-textcolor text-base outline-hidden overflow-y-auto focus:border-textcolor transition-colors"
             ></textarea>

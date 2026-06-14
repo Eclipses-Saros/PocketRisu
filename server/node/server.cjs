@@ -2213,6 +2213,9 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
     kvDelPrefix('coldstorage/');
+    // Composer drafts are session/device-local and not carried in the backup;
+    // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
+    kvDelPrefix('drafts/');
     // Same reasoning as clearExistingData (save-folder import path): wipe stale
     // remote payloads from the prior user before this backup's contents land.
     // .bin backups never carry REMOTE blocks today, so the migration won't
@@ -4648,6 +4651,8 @@ function clearExistingData() {
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
+    // Composer drafts aren't part of a save folder; clear stale ones on import.
+    kvDelPrefix('drafts/');
     // Drop the previous user's remote payloads. The new save folder usually
     // brings its own remotes/<id>.local.bin files (INSERT OR REPLACE), but if
     // the imported character ids reuse names from the prior user without
