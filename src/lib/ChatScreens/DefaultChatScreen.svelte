@@ -275,8 +275,7 @@ import { isMobile } from 'src/ts/platform'
             const preIndex = Math.max(0, index - 3)
             const preElement = document.querySelector(`[data-chat-index="${preIndex}"]`)
             // Scroll within the chat container only — raw scrollIntoView climbs to
-            // documentElement and, if the root is inflated, shoves the whole page
-            // up. (rootScrollGuard is the backstop; this avoids the visible jolt.)
+            // documentElement and, if the root is inflated, shoves the whole page up.
             if(chatContainer && preElement){
                 scrollWithinContainer(preElement as HTMLElement, chatContainer, { block: 'start', behavior: 'instant' })
             } else if(chatContainer && element){
