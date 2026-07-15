@@ -651,6 +651,28 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
     }
 
+    // ── pluginCustomStorage sidecar (B inc 3d) ──────────────────────────────────
+    // Same wire format as /api/chat-content: encodeRisuSaveLegacy({pluginCustomStorage}).
+    // The server endpoint + store already exist and are proven against this format.
+
+    async savePluginStorageSidecar(pluginCustomStorage: any): Promise<void> {
+        const encoded = encodeRisuSaveLegacy({ pluginCustomStorage: pluginCustomStorage ?? {} })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream' },
+            body: encoded,
+        })
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageSidecar error: ${da.status}`)
+    }
+
+    async fetchPluginStorageSidecar(): Promise<any | null> {
+        const da = await this.authFetch('/api/plugin-storage')
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchPluginStorageSidecar error: ${da.status}`)
+        const decoded = await decodeRisuSave(new Uint8Array(await da.arrayBuffer()))
+        return decoded && typeof decoded === 'object' ? (decoded.pluginCustomStorage ?? null) : null
+    }
+
     // ── Save-folder migration ─────────────────────────────────────────────────
 
     async scanSaveFolder(folderPath?: string): Promise<{count: number, totalSize: number, hasDatabase: boolean}> {

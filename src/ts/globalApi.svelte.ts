@@ -15,6 +15,7 @@ import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEnc
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
+import { isPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -848,6 +849,19 @@ export async function saveDb() {
         }
         if (failedChats.length > 0) {
             throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
+        }
+
+        // ── pluginCustomStorage sidecar (new layout only; flag OFF by default) ──
+        // Send the sidecar BEFORE encoding/writing database.bin, so the payload is
+        // durable before the marker-bearing DB can be relied upon. If the send
+        // fails, throw — never persist a marker DB whose sidecar is missing (that
+        // would read back as fail-closed / lost memory). Inert while the flag is off.
+        if (isPluginStorageSidecarWriteEnabled() && toSave.pluginCustomStorage) {
+            try {
+                await forageStorage.realStorage.savePluginStorageSidecar(db.pluginCustomStorage)
+            } catch (e) {
+                throw new Error(`Failed to save pluginCustomStorage sidecar (aborting save to avoid losing plugin memory): ${e}`)
+            }
         }
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
