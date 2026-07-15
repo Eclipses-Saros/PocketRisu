@@ -11,6 +11,7 @@ const {
     normalizeJSON,
     resolvePluginCustomStorage,
     hydratePluginCustomStorageServer,
+    assertPluginStorageResolved,
     PLUGIN_STORAGE_SIDECAR_MARKER,
 } = pkg as any
 
@@ -66,5 +67,24 @@ describe('server hydratePluginCustomStorageServer — inert today, armed for the
         const out = await hydratePluginCustomStorageServer(db, async () => clone(pcs))
         expect(JSON.stringify(out.pluginCustomStorage)).toBe(JSON.stringify(pcs))
         expect(PLUGIN_STORAGE_SIDECAR_MARKER in out).toBe(false)
+    })
+})
+
+describe('assertPluginStorageResolved — re-persist backstop', () => {
+    it('passes through a resolved DB (no marker) — inert today', () => {
+        const db: any = { characters: [], pluginCustomStorage: makePluginStorage() }
+        expect(assertPluginStorageResolved(db)).toBe(db)
+        expect(assertPluginStorageResolved({ characters: [] })).toBeTruthy()
+        expect(assertPluginStorageResolved(null)).toBeNull()
+    })
+    it('throws if a DB about to be re-encoded still carries the unresolved marker', () => {
+        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { keys: ['k'] } }
+        expect(() => assertPluginStorageResolved(db)).toThrow(/fail closed|unresolved/i)
+    })
+    it('a hydrated DB passes the backstop (hydrate strips the marker → re-persist safe)', async () => {
+        const pcs = makePluginStorage()
+        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { keys: Object.keys(pcs) } }
+        await hydratePluginCustomStorageServer(db, async () => clone(pcs))
+        expect(() => assertPluginStorageResolved(db)).not.toThrow()
     })
 })

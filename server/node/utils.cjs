@@ -496,6 +496,19 @@ async function loadPluginStorageSidecarServer(_directory) {
     return null;
 }
 
+// Backstop for the re-persist paths: throw if a dbObj about to be re-encoded
+// STILL carries the sidecar directory marker (i.e. it was decoded but never
+// hydrated). Encoding it now would write a database.bin with neither inline
+// pluginCustomStorage nor a resolvable sidecar reference — silent memory loss.
+// Failing the save is strictly safer. Inert today (no marker exists); it guards
+// against a future/missed re-persist site once writing is enabled.
+function assertPluginStorageResolved(db) {
+    if (db && typeof db === 'object' && db[PLUGIN_STORAGE_SIDECAR_MARKER]) {
+        throw new Error('refusing to re-encode a database with an unresolved pluginCustomStorage sidecar marker — hydrate it first (fail closed, no silent memory loss)');
+    }
+    return db;
+}
+
 // Applied to a freshly decoded dbObj BEFORE it is used or re-persisted. Inert
 // today (no dbObj carries the marker → pass-through, dbObj unchanged).
 async function hydratePluginCustomStorageServer(dbObj, loader = loadPluginStorageSidecarServer) {
@@ -624,6 +637,7 @@ module.exports = {
     resolvePluginCustomStorage,
     loadPluginStorageSidecarServer,
     hydratePluginCustomStorageServer,
+    assertPluginStorageResolved,
     PLUGIN_STORAGE_SIDECAR_MARKER,
 
     // Constants

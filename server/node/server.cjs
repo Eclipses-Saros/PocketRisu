@@ -31,7 +31,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved } = require('./utils.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -224,6 +224,7 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
+                await hydratePluginCustomStorageServer(dbObj);
                 const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
@@ -438,6 +439,11 @@ function mergeChatStubWithFullChat(stub, fullChat) {
 }
 
 function reassembleFullDb(strippedDb) {
+    // Backstop: never re-encode a DB that still carries an unresolved sidecar
+    // marker (would drop pluginCustomStorage). All re-persist paths feed through
+    // here; the known ones hydrate first (marker already stripped), so this only
+    // fires if a future/missed path forgets — fail closed instead of losing data.
+    assertPluginStorageResolved(strippedDb);
     if (!strippedDb?.characters || !fullChatStore) return strippedDb;
     const full = { ...strippedDb };
     full.characters = strippedDb.characters.map(char => {
@@ -3562,6 +3568,7 @@ app.post('/api/write', async (req, res, next) => {
                 // Client sends stubs-only DB — merge full chats from server before persisting
                 try {
                     const incomingDb = await decodeRisuSave(fileContent);
+                    await hydratePluginCustomStorageServer(incomingDb);
                     await ensureChatStore();
                     const fullDb = reassembleFullDb(incomingDb);
 
@@ -4645,6 +4652,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
+                            await hydratePluginCustomStorageServer(dbObj);
                             const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
