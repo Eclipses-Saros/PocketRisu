@@ -1347,6 +1347,15 @@ import { isMobile } from 'src/ts/platform'
 {/if}
 <style>
 
+    /* Mobile URL-bar collapse/expand resizes the viewport; browser scroll anchoring
+       then pins the TOP of the visible content, sliding bottom messages under the
+       sticky composer. This scroller is column-reverse (scrollTop 0 = newest), so
+       keeping scrollTop unchanged on resize preserves the BOTTOM edge instead —
+       content rises with the composer and nothing gets covered. */
+    .default-chat-screen {
+        overflow-anchor: none;
+    }
+
     .chat-process-stage-1{
         border-top: 0.4rem solid #60a5fa;
         border-left: 0.4rem solid #60a5fa;
