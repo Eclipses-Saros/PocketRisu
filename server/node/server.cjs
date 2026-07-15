@@ -32,6 +32,11 @@ const {
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved } = require('./utils.cjs');
+const { createPluginStorageSidecarStore } = require('./pluginStorageStore.cjs');
+// Server home for the pluginCustomStorage sidecar (a dedicated KV key, outside
+// database.bin). Durable: kvSet is synchronous SQLite, so a write is durable
+// before the endpoint ACKs. Dormant until the client write-enable POSTs a payload.
+const pluginStorageSidecarStore = createPluginStorageSidecarStore({ get: kvGet, set: kvSet, del: kvDel });
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -224,7 +229,7 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                await hydratePluginCustomStorageServer(dbObj);
+                await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
                 const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
@@ -297,7 +302,7 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     // BEFORE any downstream re-persist below could re-encode it away. Inert today
     // (no DB carries the marker → pass-through). Must exist before the client ever
     // writes the new layout, since this server is a separate deploy.
-    await hydratePluginCustomStorageServer(dbObj);
+    await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
     let needsPersist = false;
 
     const hadMissingIds = assignMissingChatIds(dbObj);
@@ -3568,7 +3573,7 @@ app.post('/api/write', async (req, res, next) => {
                 // Client sends stubs-only DB — merge full chats from server before persisting
                 try {
                     const incomingDb = await decodeRisuSave(fileContent);
-                    await hydratePluginCustomStorageServer(incomingDb);
+                    await hydratePluginCustomStorageServer(incomingDb, pluginStorageSidecarStore.loader);
                     await ensureChatStore();
                     const fullDb = reassembleFullDb(incomingDb);
 
@@ -4652,7 +4657,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            await hydratePluginCustomStorageServer(dbObj);
+                            await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
                             const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
@@ -4683,6 +4688,52 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             res.json({ success: true });
         });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// ── pluginCustomStorage sidecar endpoints (B inc 3c) ─────────────────────────
+// The client write-enable increment will POST the whole pluginCustomStorage map
+// here instead of embedding it in database.bin. Dormant until then. Durable:
+// store.write → synchronous SQLite, so the write is durable before we ACK.
+
+// POST /api/plugin-storage — receive the full pluginCustomStorage sidecar payload.
+app.post('/api/plugin-storage', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        await queueStorageOperation(async () => {
+            let pcs;
+            if (Buffer.isBuffer(req.body)) {
+                let decoded;
+                try { decoded = await decodeRisuSave(req.body); }
+                catch { return res.status(400).json({ error: 'Invalid binary plugin-storage payload' }); }
+                pcs = decoded && typeof decoded === 'object' ? (decoded.pluginCustomStorage ?? decoded) : {};
+            } else if (req.body && typeof req.body === 'object') {
+                pcs = req.body.pluginCustomStorage ?? req.body;
+            } else {
+                return res.status(400).json({ error: 'plugin-storage payload required' });
+            }
+            pluginStorageSidecarStore.write(pcs);
+            res.json({ success: true });
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// GET /api/plugin-storage — return the sidecar payload for the client loader.
+app.get('/api/plugin-storage', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const pcs = await pluginStorageSidecarStore.read();
+        if (pcs === null) {
+            res.status(404).json({ error: 'No plugin-storage sidecar' });
+            return;
+        }
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.send(Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: pcs })));
     } catch (error) {
         next(error);
     }

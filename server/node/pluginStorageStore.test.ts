@@ -3,7 +3,7 @@ import store from './pluginStorageStore.cjs'
 import utils from './utils.cjs'
 
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = store as any
-const { hydratePluginCustomStorageServer, PLUGIN_STORAGE_SIDECAR_MARKER } = utils as any
+const { hydratePluginCustomStorageServer, PLUGIN_STORAGE_SIDECAR_MARKER, encodeRisuSaveLegacy, decodeRisuSave } = utils as any
 
 // Minimal in-memory kv matching the store's interface (Buffer values).
 function fakeKv() {
@@ -84,5 +84,29 @@ describe('pluginStorageStore — server sidecar store (inc 3c-i)', () => {
     it('rejects a bad kv interface', () => {
         expect(() => createPluginStorageSidecarStore(null as any)).toThrow(/kv/i)
         expect(() => createPluginStorageSidecarStore({} as any)).toThrow(/kv/i)
+    })
+
+    // Endpoint wire-format contract (proven without booting express): the bytes a
+    // client would POST decode the way /api/plugin-storage decodes them, store.write
+    // persists, and a later marker-DB decode resolves from the store via its loader.
+    it('POST wire payload → store → GET wire payload round-trips, and hydrate resolves it', async () => {
+        const kv = fakeKv()
+        const s = createPluginStorageSidecarStore(kv)
+        const pcs = makePcs()
+
+        // Client POST body (binary), exactly what GET would also return.
+        const postBody = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: clone(pcs) }))
+        // Endpoint POST handler core: decode → extract → write.
+        const decodedPost = await decodeRisuSave(postBody)
+        s.write(decodedPost.pluginCustomStorage ?? decodedPost)
+
+        // Endpoint GET handler core: read → encode.
+        const getBody = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: await s.read() }))
+        expect(JSON.stringify((await decodeRisuSave(getBody)).pluginCustomStorage)).toBe(JSON.stringify(pcs))
+
+        // Server decode of a marker-DB resolves pluginCustomStorage from the store.
+        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { keys: Object.keys(pcs) } }
+        await hydratePluginCustomStorageServer(db, s.loader)
+        expect(JSON.stringify(db.pluginCustomStorage)).toBe(JSON.stringify(pcs))
     })
 })
