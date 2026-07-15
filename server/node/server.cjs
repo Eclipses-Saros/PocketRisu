@@ -194,7 +194,7 @@ function trimSnapshotsToLimits() {
     }
     for (const key of toDelete) {
         kvDel(key);
-        kvDel(sidecarSnapshotKeyFor(key)); // evict the paired sidecar snapshot too (no-op if absent)
+        dropPluginStorageSnapshotForDb(key); // evict the paired per-key snapshot too (no-op if absent)
     }
     return { kept: entries.length - toDelete.length, removed: toDelete.length };
 }
@@ -225,11 +225,10 @@ function createBackupAndRotate() {
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
     kvCopyValue('database/database.bin', backupKey);
-    // Pair the sidecar into the snapshot so a sidecar-layout DB restores intact.
-    // Guarded: only when a live sidecar exists (inert while the flag is off).
-    if (kvGet(PLUGIN_STORAGE_SIDECAR_KEY)) {
-        kvCopyValue(PLUGIN_STORAGE_SIDECAR_KEY, sidecarSnapshotKeyFor(backupKey));
-    }
+    // Pair the per-key plugin storage into the snapshot so a marker-layout DB
+    // restores with the matching plugin memory. Inert while the flag is off
+    // (no pluginStorage/* entries → no-op).
+    snapshotPluginStorageForDb(backupKey);
     trimSnapshotsToLimits();
 }
 
@@ -2116,11 +2115,14 @@ function listColdStorageBackupEntries() {
 // no live sidecar exists → inert while the write-enable flag is off (backups then
 // look exactly as before). When present, it rides the backup like the DB blob and
 // maps back via resolveBackupStorageKey on import/restore.
-function pluginStorageBackupEntry() {
-    const size = kvSize(PLUGIN_STORAGE_SIDECAR_KEY) || 0;
-    return size > 0
-        ? { kind: 'kv', key: PLUGIN_STORAGE_SIDECAR_KEY, backupName: 'pluginStorage.risudat', sortKey: 'pluginStorage.risudat', size }
-        : null;
+// b3: reassemble the per-key store into one blob for the backup file (same
+// pluginStorage.risudat format the importer expects, which fans it back out to
+// per-key). Returns null when there is no plugin memory (inert while flag off).
+async function pluginStorageBackupEntry() {
+    const map = await pluginStoragePerKeyStore.readAll();
+    if (!map || Object.keys(map).length === 0) return null;
+    const buffer = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: map }));
+    return { kind: 'buffer', buffer, backupName: 'pluginStorage.risudat', sortKey: 'pluginStorage.risudat', size: buffer.length };
 }
 
 function resolveBackupStorageKey(name) {
@@ -2446,6 +2448,22 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         }
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         throw swapError;
+    }
+
+    // b3: an imported pluginStorage.risudat lands at the single-blob transient key
+    // (resolveBackupStorageKey). Fan it out to the per-key store (the live layout),
+    // then drop the transient. Import replaces plugin memory wholesale → replaceAll.
+    try {
+        const pcsBlob = kvGet(PLUGIN_STORAGE_SIDECAR_KEY);
+        if (pcsBlob && pcsBlob.length > 0) {
+            const decodedPcs = await decodeRisuSave(pcsBlob);
+            const map = decodedPcs && typeof decodedPcs === 'object' ? (decodedPcs.pluginCustomStorage ?? {}) : {};
+            pluginStoragePerKeyStore.replaceAll(map);
+            kvDel(PLUGIN_STORAGE_SIDECAR_KEY);
+        }
+    } catch (e) {
+        logger.error('[Import] failed to fan out pluginCustomStorage to the per-key store:', e?.message || e);
+        throw e; // fail closed: never leave plugin memory half-imported
     }
 
     invalidateDbCache();
@@ -4015,7 +4033,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         // content-length and the stream below). Upstream target re-inlines it
         // separately (a later exit), since upstream can't read our sidecar.
         if (target !== 'upstream') {
-            const pse = pluginStorageBackupEntry();
+            const pse = await pluginStorageBackupEntry();
             if (pse) namespacedEntries.push(pse);
         }
         // Upstream target can't read our sidecar, so re-inline pluginCustomStorage
@@ -4278,7 +4296,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         ];
         // Carry the pluginCustomStorage sidecar in server backups too (inert when absent).
         {
-            const pse = pluginStorageBackupEntry();
+            const pse = await pluginStorageBackupEntry();
             if (pse) namespacedEntries.push(pse);
         }
 
@@ -5110,6 +5128,31 @@ const DB_BACKUP_PREFIX = 'database/dbbackup-';
 const DB_SIDECAR_BACKUP_PREFIX = 'database/pluginStorage-dbbackup-';
 const sidecarSnapshotKeyFor = (dbSnapshotKey) =>
     DB_SIDECAR_BACKUP_PREFIX + String(dbSnapshotKey).slice(DB_BACKUP_PREFIX.length);
+
+// b3 per-key snapshot: pair every live pluginStorage/<k> entry with a DB snapshot
+// under a per-snapshot prefix (raw KV copies — sync, exact, no decode). A DB
+// snapshot restore then brings the plugin memory back to its state AT that
+// snapshot, exactly like the paired-sidecar model did for the single blob.
+const PLUGIN_STORAGE_PERKEY_PREFIX = 'pluginStorage/';
+const sidecarSnapshotPrefixFor = (dbSnapshotKey) => `${sidecarSnapshotKeyFor(dbSnapshotKey)}/`;
+function snapshotPluginStorageForDb(dbSnapshotKey) {
+    const dst = sidecarSnapshotPrefixFor(dbSnapshotKey);
+    for (const k of kvList(PLUGIN_STORAGE_PERKEY_PREFIX)) {
+        kvCopyValue(k, dst + k.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length));
+    }
+}
+function dropPluginStorageSnapshotForDb(dbSnapshotKey) {
+    kvDelPrefix(sidecarSnapshotPrefixFor(dbSnapshotKey));
+    kvDel(sidecarSnapshotKeyFor(dbSnapshotKey)); // also clear any legacy single-blob pairing
+}
+function restorePluginStorageSnapshotForDb(dbSnapshotKey) {
+    const src = sidecarSnapshotPrefixFor(dbSnapshotKey);
+    const snap = kvList(src);
+    if (snap.length === 0) return false; // no paired snapshot (legacy/flag-off DB) — leave live as-is
+    kvDelPrefix(PLUGIN_STORAGE_PERKEY_PREFIX); // clear current per-key state, then restore the snapshot's
+    for (const k of snap) kvCopyValue(k, PLUGIN_STORAGE_PERKEY_PREFIX + k.slice(src.length));
+    return true;
+}
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
 
 function statsBasename(s) {
@@ -5649,7 +5692,7 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         kvDel(key);
-        kvDel(sidecarSnapshotKeyFor(key)); // drop the paired sidecar snapshot too
+        dropPluginStorageSnapshotForDb(key); // drop the paired per-key snapshot too
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5676,13 +5719,11 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
             kvCopyValue(key, DB_BLOB_KEY);
-            // Restore the paired sidecar so a sidecar-layout snapshot comes back
-            // as a consistent (database.bin + sidecar) pair. If the snapshot has
-            // no paired sidecar (taken in the legacy inline layout), leave the
-            // live sidecar untouched — that DB carries no marker, so inline wins.
-            if (kvGet(sidecarSnapshotKeyFor(key))) {
-                kvCopyValue(sidecarSnapshotKeyFor(key), PLUGIN_STORAGE_SIDECAR_KEY);
-            }
+            // Restore the paired per-key plugin storage so a marker-layout snapshot
+            // comes back as a consistent (database.bin + per-key values) pair. If the
+            // snapshot has no paired per-key entries (legacy/flag-off DB), leave the
+            // live per-key store untouched — that DB carries no marker, so inline wins.
+            restorePluginStorageSnapshotForDb(key);
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored

@@ -130,6 +130,23 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         expect(() => createPluginStoragePerKeyStore({})).toThrow(/kv/i)
     })
 
+    // C6b export/import: the backup carries one reassembled blob
+    // (encodeRisuSaveLegacy({pluginCustomStorage: readAll})); import decodes it and
+    // fans it back out via replaceAll. Prove the whole round-trip is lossless.
+    it('export blob → import replaceAll round-trips the whole per-key map (backup path)', async () => {
+        const src = createPluginStoragePerKeyStore(fakeKv())
+        for (const [k, v] of Object.entries(KEYS)) src.writeKey(k, v)
+        // export: reassemble → encode
+        const blob = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: await src.readAll() }))
+        // import into a FRESH store (with a stale key that must be cleared)
+        const dst = createPluginStoragePerKeyStore(fakeKv())
+        dst.writeKey('stale-should-be-removed', 'old')
+        const decoded = await decodeRisuSave(new Uint8Array(blob))
+        dst.replaceAll(decoded.pluginCustomStorage)
+        expect(await dst.readAll()).toEqual(KEYS)
+        expect(await dst.readKey('stale-should-be-removed')).toBeUndefined() // wholesale replace
+    })
+
     it('readAll reassembles the whole stored map by prefix scan', async () => {
         const s = createPluginStoragePerKeyStore(fakeKv())
         for (const [k, v] of Object.entries(KEYS)) s.writeKey(k, v)

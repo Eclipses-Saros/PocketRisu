@@ -66,7 +66,7 @@ beforeAll(async () => {
     TOKEN = forgeToken()
     srv = spawn('node', [SERVER_CJS], {
         cwd: dir,
-        env: { ...process.env, PORT: String(PORT), RISU_TUNNEL_DISABLED: 'true', RISU_UPDATE_CHECK: 'false' },
+        env: { ...process.env, PORT: String(PORT), RISU_TUNNEL_DISABLED: 'true', RISU_UPDATE_CHECK: 'false', POCKETRISU_BACKUP_INTERVAL_MS: '0' },
         stdio: ['ignore', 'pipe', 'pipe'],
     })
     booted = await waitFor(async () => {
@@ -174,6 +174,36 @@ describe('pluginCustomStorage patch-sync — REAL server (codex BLOCKER 1)', () 
         // BOTH edits present — the single-blob layout would have lost one.
         expect(back.A).toBe('a1')
         expect(back.B).toBe('b1')
+    })
+
+    it('BACKUP/RESTORE: a DB snapshot captures + restores the per-key plugin memory', async () => {
+        if (!booted) { console.warn('server not booted — skipping'); return }
+        // seed + create a snapshot (interval=0 → the seed write backs up with the
+        // per-key state {A:a0,B:b0} paired in)
+        await seedMarkerDbAndValues({ A: 'a0', B: 'b0' })
+        await fetch(`${BASE}/api/read`, { headers: authHeaders({ 'file-path': hex('database/database.bin') }) }) // flush → backup
+        const list = await (await fetch(`${BASE}/api/db/snapshots`, { headers: authHeaders() })).json()
+        const snaps: any[] = Array.isArray(list) ? list : (list.snapshots ?? list.items ?? [])
+        const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).find(Boolean)
+        expect(snapKey, 'a snapshot should exist').toBeTruthy()
+
+        // mutate per-key AFTER the snapshot
+        await fetch(`${BASE}/api/plugin-storage`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy({ type: 'delta', changed: { A: 'a1-CHANGED' }, removed: [] })),
+        })
+        const mid = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
+        expect(mid.A).toBe('a1-CHANGED')
+
+        // restore the snapshot → per-key reverts to {A:a0,B:b0}
+        const r = await fetch(`${BASE}/api/db/snapshots/restore`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ key: snapKey }),
+        })
+        expect(r.status).toBe(200)
+        const after = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
+        expect(after.A).toBe('a0')   // reverted (per-key snapshot restored)
+        expect(after.B).toBe('b0')
     })
 
     it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {
