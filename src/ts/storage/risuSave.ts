@@ -3,6 +3,7 @@ import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
+import { isPluginStorageSidecarWriteEnabled, buildPluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER } from "./pluginStorageSidecar";
 
 const packr = new Packr({
     useRecords:false
@@ -118,6 +119,29 @@ export class RisuSaveEncoder {
     // differ from the patcher's protocol-level calculateHash.
     private characterJsons: { [key: string]: string } = {};
 
+    // Build the database.bin block for pluginCustomStorage. Default (flag OFF):
+    // the inline PLUGIN_STORAGE block, byte-identical to before. Flag ON (new
+    // layout): a ROOT_COMPONENT directory marker instead of the payload — decode
+    // maps it to db.pluginStorageSidecar, which the dual-read hydrate resolves;
+    // the payload itself travels to the sidecar store (sent separately). No
+    // inline pluginCustomStorage is written in the new layout.
+    private async buildPluginStorageBlock(compression: boolean, data: Database) {
+        if (isPluginStorageSidecarWriteEnabled()) {
+            return await this.encodeBlock({
+                compression,
+                data: JSON.stringify({ key: PLUGIN_STORAGE_SIDECAR_MARKER, data: buildPluginStorageDirectory(data.pluginCustomStorage) }),
+                type: RisuSaveType.ROOT_COMPONENT,
+                name: 'pluginStorage'
+            });
+        }
+        return await this.encodeBlock({
+            compression,
+            data: JSON.stringify(data.pluginCustomStorage),
+            type: RisuSaveType.PLUGIN_STORAGE,
+            name: 'pluginStorage'
+        });
+    }
+
     async init(data:Database,arg:{
         compression?: boolean,
         skipRemoteSavingOnCharacters?: boolean
@@ -161,12 +185,7 @@ export class RisuSaveEncoder {
             type: RisuSaveType.PLUGINS,
             name: 'plugins'
         });
-        this.blocks['pluginStorage'] = await this.encodeBlock({
-            compression,
-            data: JSON.stringify(data.pluginCustomStorage),
-            type: RisuSaveType.PLUGIN_STORAGE,
-            name: 'pluginStorage'
-        });
+        this.blocks['pluginStorage'] = await this.buildPluginStorageBlock(compression, data);
         this.characterJsons = {}
         for( const character of data.characters) {
             // Replace chats with stubs for database.bin — full chat data lives server-side
@@ -281,12 +300,7 @@ export class RisuSaveEncoder {
         }
 
         if(toSave.pluginCustomStorage){
-            this.blocks['pluginStorage'] = await this.encodeBlock({
-                compression: this.compression,
-                data: JSON.stringify(data.pluginCustomStorage),
-                type: RisuSaveType.PLUGIN_STORAGE,
-                name: 'pluginStorage'
-            });
+            this.blocks['pluginStorage'] = await this.buildPluginStorageBlock(this.compression, data);
         }
 
         if(toSave.plugins){

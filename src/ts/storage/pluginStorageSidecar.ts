@@ -18,6 +18,27 @@
 // pluginCustomStorage, and that is legitimately empty — not a lost sidecar.
 export const PLUGIN_STORAGE_SIDECAR_MARKER = 'pluginStorageSidecar'
 
+// Write-enable gate for the new (sidecar) layout. DEFAULT OFF: while off, the
+// encoder still embeds pluginCustomStorage inline (byte-identical to today) and
+// nothing produces the marker, so the whole sidecar path stays dormant. It only
+// flips on once EVERY write-enable piece is in (encoder strip + sidecar send +
+// client loader + persistence exits + downgrade guard) AND the end-to-end run
+// passes. Kept as module state (not a build const) so tests can exercise both
+// branches; production leaves it off until the coordinated flip.
+let sidecarWriteEnabled = false
+export function isPluginStorageSidecarWriteEnabled(): boolean { return sidecarWriteEnabled }
+export function setPluginStorageSidecarWriteEnabled(value: boolean): void { sidecarWriteEnabled = !!value }
+
+// The directory stub embedded in database.bin (in place of the inline payload)
+// when the new layout is written. Its presence is the marker the dual-read
+// resolver keys on; the key list lets a reader/validator know what the sidecar
+// must contain. The payload itself never goes in here — it travels to the
+// sidecar store.
+export function buildPluginStorageDirectory(pluginCustomStorage: Record<string, any> | null | undefined): { version: number, keys: string[] } {
+    const keys = pluginCustomStorage && typeof pluginCustomStorage === 'object' ? Object.keys(pluginCustomStorage) : []
+    return { version: 1, keys }
+}
+
 // Pure dual-read resolver.
 // - Legacy layout (no directory): inline is authoritative, even when undefined
 //   (a DB that never had plugin data). Never throws.
@@ -48,11 +69,14 @@ export async function loadPluginStorageSidecar(_directory: unknown): Promise<unk
 // carries the marker, so this returns `db` unchanged (pluginCustomStorage stays
 // exactly as decoded). When a real sidecar layout arrives (increment 3+), it
 // resolves pluginCustomStorage from the sidecar and strips the marker.
-export async function hydratePluginCustomStorage<T extends Record<string, any>>(db: T): Promise<T> {
+export async function hydratePluginCustomStorage<T extends Record<string, any>>(
+    db: T,
+    loader: (directory: unknown) => Promise<unknown | null> = loadPluginStorageSidecar,
+): Promise<T> {
     if (!db || typeof db !== 'object') return db
     const hasSidecarDirectory = !!(db as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
     if (!hasSidecarDirectory) return db
-    const sidecar = await loadPluginStorageSidecar((db as any)[PLUGIN_STORAGE_SIDECAR_MARKER])
+    const sidecar = await loader((db as any)[PLUGIN_STORAGE_SIDECAR_MARKER])
     ;(db as any).pluginCustomStorage = resolvePluginCustomStorage({
         inline: (db as any).pluginCustomStorage,
         sidecar,

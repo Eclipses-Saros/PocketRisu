@@ -1,4 +1,4 @@
-import { describe, test, expect, vi } from 'vitest'
+import { describe, test, it, expect, vi, afterEach } from 'vitest'
 
 // B step 1+2 — pluginCustomStorage sidecar SAFETY + inert dual-read wiring.
 // Proves, before any writer produces the new layout: (1) moving pluginCustomStorage
@@ -10,11 +10,13 @@ vi.mock('./database.svelte', () => ({}))
 vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
-const { encodeRisuSaveLegacy, decodeRisuSave } = await import('./risuSave')
+const { encodeRisuSaveLegacy, decodeRisuSave, RisuSaveEncoder } = await import('./risuSave')
 const {
     resolvePluginCustomStorage,
     hydratePluginCustomStorage,
     PLUGIN_STORAGE_SIDECAR_MARKER,
+    isPluginStorageSidecarWriteEnabled,
+    setPluginStorageSidecarWriteEnabled,
 } = await import('./pluginStorageSidecar')
 
 function makePluginStorage(): Record<string, string> {
@@ -78,6 +80,63 @@ describe('resolvePluginCustomStorage — directory-marker-aware contract', () =>
     test('new layout with MISSING sidecar fails closed — never reports empty', () => {
         expect(() => resolvePluginCustomStorage({ inline: undefined, sidecar: null, hasSidecarDirectory: true })).toThrow(/fail closed/i)
         expect(() => resolvePluginCustomStorage({ inline: {}, sidecar: undefined, hasSidecarDirectory: true })).toThrow(/fail closed/i)
+    })
+})
+
+describe('RisuSaveEncoder write-enable flag (B inc 3d-i) — default OFF is byte-identical', () => {
+    const makeDb = (): any => ({
+        formatversion: 4, characters: [], botPresets: [{ id: 'p', name: 'preset' }],
+        modules: [], plugins: [], pluginCustomStorage: makePluginStorage(),
+    })
+
+    afterEach(() => setPluginStorageSidecarWriteEnabled(false))
+
+    it('flag defaults OFF', () => {
+        expect(isPluginStorageSidecarWriteEnabled()).toBe(false)
+    })
+
+    it('flag OFF: encode→decode embeds pluginCustomStorage inline, NO marker (today’s layout)', async () => {
+        const db = makeDb()
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        expect(JSON.stringify(back.pluginCustomStorage)).toBe(JSON.stringify(db.pluginCustomStorage))
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
+    })
+
+    it('flag ON: encode strips inline pluginCustomStorage and emits the directory marker', async () => {
+        const db = makeDb()
+        setPluginStorageSidecarWriteEnabled(true)
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        // No inline payload in database.bin ...
+        expect(back.pluginCustomStorage).toBeUndefined()
+        // ... but the directory marker is present, with the key list.
+        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER]).toBeTruthy()
+        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].version).toBe(1)
+        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].keys).toEqual(Object.keys(db.pluginCustomStorage))
+    })
+
+    it('flag ON round-trip: decode + hydrate(sidecar loader) restores pluginCustomStorage identically', async () => {
+        const db = makeDb()
+        const pcs = clone(db.pluginCustomStorage)
+        setPluginStorageSidecarWriteEnabled(true)
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        await hydratePluginCustomStorage(back, async () => pcs)
+        expect(JSON.stringify(back.pluginCustomStorage)).toBe(JSON.stringify(pcs))
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
+    })
+
+    it('flag ON + missing sidecar: hydrate fails closed (never silently empty)', async () => {
+        const db = makeDb()
+        setPluginStorageSidecarWriteEnabled(true)
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        await expect(hydratePluginCustomStorage(back, async () => null)).rejects.toThrow(/fail closed/i)
     })
 })
 
