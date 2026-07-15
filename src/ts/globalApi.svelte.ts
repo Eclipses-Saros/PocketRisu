@@ -1964,21 +1964,48 @@ export class AppendableBuffer {
 }
 
 /**
- * Pipes the fetch log to a readable stream.
- * @param {number} fetchLogIndex - The index of the fetch log.
- * @param {ReadableStream<Uint8Array>} readableStream - The readable stream to pipe.
- * @returns {ReadableStream<Uint8Array>} - The new readable stream.
+ * Taps a fetch response and mirrors the (possibly streamed) body text into the
+ * given fetch log entry, so streamed requests stay inspectable in the request
+ * log viewers. The tap is a pass-through TransformStream: backpressure and
+ * cancellation still propagate to the underlying fetch, and the entry is
+ * updated per chunk so an interrupted stream still leaves a partial log.
  */
-const pipeFetchLog = (fetchLogIndex: number, readableStream: ReadableStream<Uint8Array>) => {
-    
-    const splited = readableStream.tee();
-    
-    (async () => {
-        const text = await (new Response(splited[0])).text()
-        fetchLog[fetchLogIndex].response = text
-    })()
-    
-    return splited[1]
+const FETCH_LOG_RESPONSE_LIMIT = 2_000_000
+const pipeFetchLog = (logEntry: fetchLog, res: Response): Response => {
+    logEntry.status = res.status
+    logEntry.success = res.ok
+    if (!res.body) {
+        logEntry.response = `(no response body, status ${res.status})`
+        return res
+    }
+    const decoder = new TextDecoder()
+    let text = ''
+    let truncated = false
+    const append = (piece: string) => {
+        if (truncated) {
+            return
+        }
+        text += piece
+        if (text.length > FETCH_LOG_RESPONSE_LIMIT) {
+            text = text.slice(0, FETCH_LOG_RESPONSE_LIMIT)
+            truncated = true
+        }
+        logEntry.response = truncated ? text + '\n…[truncated]' : text
+    }
+    const tapped = res.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            append(decoder.decode(chunk, { stream: true }))
+            controller.enqueue(chunk)
+        },
+        flush() {
+            append(decoder.decode())
+        }
+    }))
+    return new Response(tapped, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers
+    })
 }
 
 /**
@@ -2054,6 +2081,10 @@ export async function fetchNative(url: string, arg: {
         resType: 'stream',
         chatId: arg.chatId,
     })
+    // addFetchLog unshifts: the entry just created sits at index 0. Keep the
+    // object reference (indices shift as newer logs come in) so the streamed
+    // response can be piped into it below.
+    const logEntry = fetchLog[0]
     const useLocalNetworkRoute = arg.networkRoute === 'local_network' && isLocalNetworkUrl(url)
     const timeoutSignal = buildTimeoutSignal(arg.signal, arg.requestTimeoutMs)
     const requestSignal = timeoutSignal.signal
@@ -2063,7 +2094,7 @@ export async function fetchNative(url: string, arg: {
         throughProxy = true
     }
 
-    try {
+    const route = async (): Promise<Response> => {
         if (window.userScriptFetch && !throughProxy) {
             return await window.userScriptFetch(url, {
                 body: realBody as any,
@@ -2138,6 +2169,17 @@ export async function fetchNative(url: string, arg: {
             ...arg,
             signal: requestSignal
         })
+    }
+
+    try {
+        // Mirror the (streamed) response text into the request log so it stays
+        // inspectable per message; previously streamed responses were logged as
+        // a bare 'Streamed Fetch' placeholder forever.
+        return pipeFetchLog(logEntry, await route())
+    } catch (e) {
+        logEntry.success = false
+        logEntry.response = `Fetch failed: ${e}`
+        throw e
     } finally {
         timeoutSignal.cleanup()
     }
