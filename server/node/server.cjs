@@ -31,7 +31,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer } = require('./utils.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -292,6 +292,11 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         if (fresh) raw = fresh;
     }
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
+    // Resolve pluginCustomStorage from a sidecar if this DB is in the new layout,
+    // BEFORE any downstream re-persist below could re-encode it away. Inert today
+    // (no DB carries the marker → pass-through). Must exist before the client ever
+    // writes the new layout, since this server is a separate deploy.
+    await hydratePluginCustomStorageServer(dbObj);
     let needsPersist = false;
 
     const hadMissingIds = assignMissingChatIds(dbObj);

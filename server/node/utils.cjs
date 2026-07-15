@@ -469,6 +469,48 @@ function encodeRisuSaveLegacy(data, compression = 'noCompression') {
     }
 }
 
+// --- pluginCustomStorage sidecar dual-read (server mirror of the client's
+// src/ts/storage/pluginStorageSidecar.ts) ---
+//
+// The server is a SEPARATE deploy from the client, so it must learn to read the
+// new (sidecar) layout BEFORE any client writes it — otherwise an old server
+// decodes a stripped database.bin, sees no pluginCustomStorage, and re-encodes
+// it away (silent memory loss). This lands that read side, inert: nothing writes
+// the marker yet, so hydrate is a pass-through. Kept byte-identical to the client
+// contract on purpose.
+const PLUGIN_STORAGE_SIDECAR_MARKER = 'pluginStorageSidecar';
+
+// Legacy (no directory): inline is authoritative, even when undefined — never
+// throws. New layout (directory present): the sidecar is authoritative and MUST
+// be present; a missing sidecar FAILS CLOSED rather than reporting empty.
+function resolvePluginCustomStorage({ inline, sidecar, hasSidecarDirectory }) {
+    if (!hasSidecarDirectory) return inline;
+    if (sidecar !== undefined && sidecar !== null) return sidecar;
+    throw new Error('pluginCustomStorage sidecar expected by directory marker but missing — refusing to report empty (fail closed)');
+}
+
+// Server sidecar loader stub. No server-side sidecar store exists yet (built in
+// the write-enable increment); returns "absent" so a stray marker trips the
+// fail-closed guard instead of losing data.
+async function loadPluginStorageSidecarServer(_directory) {
+    return null;
+}
+
+// Applied to a freshly decoded dbObj BEFORE it is used or re-persisted. Inert
+// today (no dbObj carries the marker → pass-through, dbObj unchanged).
+async function hydratePluginCustomStorageServer(dbObj, loader = loadPluginStorageSidecarServer) {
+    if (!dbObj || typeof dbObj !== 'object') return dbObj;
+    if (!dbObj[PLUGIN_STORAGE_SIDECAR_MARKER]) return dbObj;
+    const sidecar = await loader(dbObj[PLUGIN_STORAGE_SIDECAR_MARKER]);
+    dbObj.pluginCustomStorage = resolvePluginCustomStorage({
+        inline: dbObj.pluginCustomStorage,
+        sidecar,
+        hasSidecarDirectory: true,
+    });
+    delete dbObj[PLUGIN_STORAGE_SIDECAR_MARKER];
+    return dbObj;
+}
+
 // --- Hash & normalization utilities for patch-based sync ---
 
 const PRIME_MULTIPLIER = 31;
@@ -579,6 +621,10 @@ module.exports = {
     checkHeader,
     checkCompressionStreams,
     hasRemoteBlocks,
+    resolvePluginCustomStorage,
+    loadPluginStorageSidecarServer,
+    hydratePluginCustomStorageServer,
+    PLUGIN_STORAGE_SIDECAR_MARKER,
 
     // Constants
     RisuSaveType,
