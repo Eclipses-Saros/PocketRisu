@@ -120,19 +120,15 @@ export class RisuSaveEncoder {
     private characterJsons: { [key: string]: string } = {};
 
     // Build the database.bin block for pluginCustomStorage. Default (flag OFF):
-    // the inline PLUGIN_STORAGE block, byte-identical to before. Flag ON (new
-    // layout): a ROOT_COMPONENT directory marker instead of the payload — decode
-    // maps it to db.pluginStorageSidecar, which the dual-read hydrate resolves;
-    // the payload itself travels to the sidecar store (sent separately). No
-    // inline pluginCustomStorage is written in the new layout.
+    // the inline PLUGIN_STORAGE block, byte-identical to before. Flag ON (b3):
+    // pluginCustomStorage is EXCLUDED from database.bin entirely — it lives purely
+    // out-of-band, one KV entry per key (the chat-body model), synced via the
+    // /api/plugin-storage endpoint. Nothing about it rides database.bin (no inline,
+    // no marker), so it never enters the patch/etag/hash/rebase machinery — that
+    // coupling was the root of the concurrency defects. Returns null → no block.
     private async buildPluginStorageBlock(compression: boolean, data: Database) {
         if (isPluginStorageSidecarWriteEnabled()) {
-            return await this.encodeBlock({
-                compression,
-                data: JSON.stringify({ key: PLUGIN_STORAGE_SIDECAR_MARKER, data: buildPluginStorageDirectory(data.pluginCustomStorage) }),
-                type: RisuSaveType.ROOT_COMPONENT,
-                name: 'pluginStorage'
-            });
+            return null;
         }
         return await this.encodeBlock({
             compression,
@@ -185,7 +181,10 @@ export class RisuSaveEncoder {
             type: RisuSaveType.PLUGINS,
             name: 'plugins'
         });
-        this.blocks['pluginStorage'] = await this.buildPluginStorageBlock(compression, data);
+        {
+            const psBlock = await this.buildPluginStorageBlock(compression, data);
+            if (psBlock) this.blocks['pluginStorage'] = psBlock; else delete this.blocks['pluginStorage']; // flag ON → excluded from database.bin
+        }
         this.characterJsons = {}
         for( const character of data.characters) {
             // Replace chats with stubs for database.bin — full chat data lives server-side
@@ -300,7 +299,8 @@ export class RisuSaveEncoder {
         }
 
         if(toSave.pluginCustomStorage){
-            this.blocks['pluginStorage'] = await this.buildPluginStorageBlock(this.compression, data);
+            const psBlock = await this.buildPluginStorageBlock(this.compression, data);
+            if (psBlock) this.blocks['pluginStorage'] = psBlock; else delete this.blocks['pluginStorage']; // flag ON → excluded from database.bin
         }
 
         if(toSave.plugins){
@@ -896,18 +896,16 @@ export class RisuSavePatcher {
         return this.lastSyncedDb?.[key]
     }
 
-    // Replace inline pluginCustomStorage with the directory marker, in place, when
-    // the sidecar write layout is on. Mirrors chatToStub: the heavy payload (the
-    // per-key values) travels out-of-band (per-key delta POST, like chat bodies),
-    // so the patch diff only ever sees the tiny {version, keys} directory — the
-    // whole-store re-serialization that made saves spike is gone. Applied to BOTH
-    // the baseline (init) and the current root (set) so the diff is marker-vs-
-    // marker. No-op while the flag is off (inline stays, byte-identical to today).
-    private stubPluginStorageInPlace(root: any) {
+    // EXCLUDE pluginCustomStorage from the patch entirely when the b3 layout is on:
+    // its values live out-of-band (one KV entry per key, synced via the delta POST,
+    // exactly like chat bodies), so it must never enter the root diff/hash — that is
+    // what kept the whole store off the save spike AND removed the marker/hash/rebase
+    // coupling that caused the concurrency defects. Applied to BOTH the baseline
+    // (init) and the current root (set) so neither side hashes it. No-op while the
+    // flag is off (inline pluginCustomStorage stays, byte-identical to today).
+    private excludePluginStorageInPlace(root: any) {
         if (!isPluginStorageSidecarWriteEnabled()) return
-        if (!root || typeof root !== 'object' || !Object.hasOwn(root, 'pluginCustomStorage')) return
-        root[PLUGIN_STORAGE_SIDECAR_MARKER] = buildPluginStorageDirectory(root.pluginCustomStorage)
-        delete root.pluginCustomStorage
+        if (root && typeof root === 'object') delete root.pluginCustomStorage
     }
 
     async init(data: any) {
@@ -915,10 +913,9 @@ export class RisuSavePatcher {
         if (!Array.isArray(this.lastSyncedDb.characters)) {
             this.lastSyncedDb.characters = [];
         }
-        // Baseline holds the marker (not the inline map) when the sidecar layout is
-        // on, so per-key baselines below seed from the directory and the diff stays
-        // marker-vs-marker. Before hashBlocks so pluginCustomStorage never hashes.
-        this.stubPluginStorageInPlace(this.lastSyncedDb);
+        // Drop pluginCustomStorage before hashBlocks so it never hashes/diffs; its
+        // values are synced out-of-band per-key. (b3 flag ON only.)
+        this.excludePluginStorageInPlace(this.lastSyncedDb);
         this.hashBlocks = {};
 
         const keys = Object.keys(this.lastSyncedDb)
@@ -984,11 +981,13 @@ export class RisuSavePatcher {
             ...curRoot
         } = data
 
-        // Current root mirrors the baseline: when the sidecar layout is on, diff the
-        // directory marker, not the inline map. curRoot is a fresh rest-copy, so the
-        // live `data.pluginCustomStorage` is untouched (values still ride the
-        // out-of-band per-key delta POST). No-op while the flag is off.
-        this.stubPluginStorageInPlace(curRoot)
+        // Exclude pluginCustomStorage from the current root too (b3 flag ON): with
+        // init() also excluding it, neither side of the diff carries pcs, so patches
+        // never touch it (values ride the out-of-band per-key delta POST). curRoot is
+        // a fresh rest-copy, so the live db.pluginCustomStorage is untouched (plugins
+        // keep reading it). The one-time legacy inline block is stripped by a forced
+        // full write, not a patch. No-op while the flag is off.
+        this.excludePluginStorageInPlace(curRoot)
 
         // Per-KEY cheap pre-check over the root. While typing into a root field
         // (e.g. personaPrompt) the root changes on every save, so a whole-root

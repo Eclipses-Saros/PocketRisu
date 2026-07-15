@@ -131,43 +131,38 @@ describe('B step 0 — pluginCustomStorage save cost (baseline before B)', () =>
 // pluginCustomStorage down to the directory marker, so the whole-store
 // re-serialization the baseline above measured is GONE from the patch-sync path
 // (PocketRisu's live runtime). Values ride the out-of-band per-key delta POST.
-describe('B inc3 — patcher stubs pluginCustomStorage → marker (flag ON kills the whole-store cost)', () => {
+describe('B b3 — patcher EXCLUDES pluginCustomStorage (flag ON: out-of-band, zero whole-store cost)', () => {
     afterEach(() => setPluginStorageSidecarWriteEnabled(false))
 
-    it('flag ON: patch carries the directory marker, NOT the inline store; whole-store stringify = 0', async () => {
+    it('flag ON: patch carries NO pluginCustomStorage (no inline, no marker); whole-store stringify = 0', async () => {
         const db = makeDb()
         setPluginStorageSidecarWriteEnabled(true)
         expect(isPluginStorageSidecarWriteEnabled()).toBe(true)
         const patcher = new RisuSavePatcher()
         await patcher.init(db)
-        // change one shard by one char — the case that used to still cost a whole-store diff
         db.pluginCustomStorage['vector_rag_memory:shard:0'] += ' '
         let patch: any[] = []
         const patcherWhole = await countWholeStoreStringifies(async () => {
             const r = await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
             patch = r.patch
         })
-        // whole-store cost gone
+        // the whole-store re-serialization is gone (pcs never enters the diff)
         expect(patcherWhole).toBe(0)
-        // no patch op touches the inline pluginCustomStorage root
-        expect(patch.some((op: any) => typeof op.path === 'string' && op.path.startsWith('/pluginCustomStorage'))).toBe(false)
-        // the directory marker is what the patch tracks (value change → keys same →
-        // marker unchanged → no op here; presence is asserted on a key-set change below)
+        // and the patch touches neither the inline root nor any marker
+        expect(patch.some((op: any) => typeof op.path === 'string' && (op.path.startsWith('/pluginCustomStorage') || op.path.startsWith(`/${PLUGIN_STORAGE_SIDECAR_MARKER}`)))).toBe(false)
     })
 
-    it('flag ON: adding a plugin key emits a marker op (directory), never the inline map', async () => {
+    it('flag ON: adding a plugin key emits NO patch op for pcs (the add rides the per-key delta, not database.bin)', async () => {
         const db = makeDb()
         setPluginStorageSidecarWriteEnabled(true)
         const patcher = new RisuSavePatcher()
         await patcher.init(db)
         db.pluginCustomStorage['vector_rag_memory:shard:NEW'] = bigValue(99)
         const { patch } = await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
-        const markerOps = patch.filter((op: any) => typeof op.path === 'string' && op.path.startsWith(`/${PLUGIN_STORAGE_SIDECAR_MARKER}`))
-        expect(markerOps.length).toBeGreaterThanOrEqual(1)
-        // the new key is listed in the directory the patch carries
-        const carried = JSON.stringify(markerOps)
-        expect(carried).toContain('vector_rag_memory:shard:NEW')
-        // and NO whole shard value rode along in the patch
+        const carried = JSON.stringify(patch)
+        // pcs is fully out-of-band: no inline op, no marker op, no shard value in the patch
+        expect(carried).not.toContain('pluginCustomStorage')
+        expect(carried).not.toContain(PLUGIN_STORAGE_SIDECAR_MARKER)
         expect(carried).not.toContain(MARK)
     })
 

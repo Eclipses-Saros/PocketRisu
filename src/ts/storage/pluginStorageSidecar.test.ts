@@ -105,41 +105,16 @@ describe('RisuSaveEncoder write-enable flag (B inc 3d-i) — default OFF is byte
         expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
     })
 
-    it('flag ON: encode strips inline pluginCustomStorage and emits the directory marker', async () => {
+    it('flag ON: encode writes NO pluginStorage block — pcs is fully out-of-band', async () => {
         const db = makeDb()
         setPluginStorageSidecarWriteEnabled(true)
         const enc = new RisuSaveEncoder()
         await enc.init(clone(db))
         const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
-        // No inline payload in database.bin ...
+        // neither inline pluginCustomStorage nor any directory marker rides database.bin;
+        // the values live per-key on the server and load via the /api/plugin-storage GET.
         expect(back.pluginCustomStorage).toBeUndefined()
-        // ... but the directory marker is present, with the key list.
-        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER]).toBeTruthy()
-        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].version).toBe(2)
-        // keys are sorted (deterministic marker) — compare against the sorted set
-        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].keys).toEqual(Object.keys(db.pluginCustomStorage).sort())
-    })
-
-    it('flag ON round-trip: decode + hydrate(sidecar loader) restores pluginCustomStorage identically', async () => {
-        const db = makeDb()
-        const pcs = clone(db.pluginCustomStorage)
-        setPluginStorageSidecarWriteEnabled(true)
-        const enc = new RisuSaveEncoder()
-        await enc.init(clone(db))
-        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
-        await hydratePluginCustomStorage(back, async () => pcs)
-        // marker keys are sorted → key ORDER may differ; the map is equal
-        expect(back.pluginCustomStorage).toEqual(pcs)
         expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
-    })
-
-    it('flag ON + missing sidecar: hydrate fails closed (never silently empty)', async () => {
-        const db = makeDb()
-        setPluginStorageSidecarWriteEnabled(true)
-        const enc = new RisuSaveEncoder()
-        await enc.init(clone(db))
-        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
-        await expect(hydratePluginCustomStorage(back, async () => null)).rejects.toThrow(/fail closed/i)
     })
 })
 

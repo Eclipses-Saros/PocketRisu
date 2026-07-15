@@ -11,7 +11,7 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
-import { hydratePluginCustomStorage, setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER } from "./storage/pluginStorageSidecar";
+import { setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -25,6 +25,7 @@ import {
     saveDb,
     setPatchSyncBaseline,
     resyncPluginStorageBaseline,
+    markPluginStorageMigration,
     getDbBackups,
     getUncleanables,
     getBasename,
@@ -37,6 +38,32 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
 /**
  * Loads the application data.
  */
+// Load pluginCustomStorage for a freshly decoded DB. b3 (flag ON): pcs is
+// out-of-band per-key — fetch the authoritative map from the server; a pre-b3
+// legacy DB still carries inline pcs, so the first save migrates it (baseline
+// seeded EMPTY → the delta sends every key). Flag OFF: inline pcs stays as decoded.
+async function loadPluginStorageInto(decodedDb: any): Promise<void> {
+    if (!isPluginStorageSidecarWriteEnabled()) {
+        resyncPluginStorageBaseline(decodedDb?.pluginCustomStorage)
+        return
+    }
+    let perKeyMap: Record<string, any> = {}
+    try { perKeyMap = (await forageStorage.realStorage.fetchPluginStorageSidecar()) ?? {} } catch { perKeyMap = {} }
+    const legacyInline = (decodedDb?.pluginCustomStorage && typeof decodedDb.pluginCustomStorage === 'object') ? decodedDb.pluginCustomStorage : null
+    if (Object.keys(perKeyMap).length === 0 && legacyInline && Object.keys(legacyInline).length > 0) {
+        // pre-migration legacy DB: plugins see the inline map now; baseline EMPTY so
+        // the first save's delta sends every key (populating the per-key store), and
+        // markPluginStorageMigration() forces that save to be a full write so it also
+        // strips the inline block from the server DB (a patch can't remove it).
+        decodedDb.pluginCustomStorage = legacyInline
+        resyncPluginStorageBaseline({})
+        markPluginStorageMigration()
+    } else {
+        decodedDb.pluginCustomStorage = perKeyMap
+        resyncPluginStorageBaseline(perKeyMap)
+    }
+}
+
 export async function loadData() {
     const loaded = get(loadedStore)
     if (!loaded) {
@@ -70,16 +97,7 @@ export async function loadData() {
                     // pluginStorageSidecar.ts stays dependency-free (no import cycle
                     // with globalApi). Inert while the write-enable flag is off (no
                     // decoded DB carries the marker, so the loader is never invoked).
-                    {
-                        const hadMarker = !!(decoded as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
-                        await hydratePluginCustomStorage(decoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
-                        // Legacy inline DB + write flag ON = pre-migration: the server
-                        // per-key store is empty, so seed the baseline EMPTY → the first
-                        // save's delta is EVERY key, migrating the whole inline map before
-                        // any marker references it (no dangling marker). Marker DB → seed
-                        // from the resolved (server-authoritative) map. Flag off → inert.
-                        resyncPluginStorageBaseline((isPluginStorageSidecarWriteEnabled() && !hadMarker) ? {} : decoded.pluginCustomStorage)
-                    }
+                    await loadPluginStorageInto(decoded)
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -92,9 +110,7 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
-                            const hadMarkerB = !!(backupDecoded as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
-                            await hydratePluginCustomStorage(backupDecoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
-                            resyncPluginStorageBaseline((isPluginStorageSidecarWriteEnabled() && !hadMarkerB) ? {} : backupDecoded.pluginCustomStorage)
+                            await loadPluginStorageInto(backupDecoded)
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true

@@ -1,20 +1,16 @@
 // @vitest-environment node
-// REAL-ENVIRONMENT integration test for the pluginCustomStorage patch-sync path.
+// REAL-ENVIRONMENT integration test for the pluginCustomStorage b3 sync path.
 //
 // "Hard to unit-test" is not "can't test": this boots the ACTUAL server
 // (server/node/server.cjs) against a throwaway SQLite dir and drives the REAL
-// save protocol (/api/write, /api/plugin-storage, /api/read, /api/patch) with the
-// REAL client patcher (RisuSavePatcher). It targets codex BLOCKER 1: the client
-// hashes the marker form while the server hashes the inline form, so a flag-on
-// patch is rejected with 409 forever.
+// protocol (/api/write, /api/plugin-storage, /api/read, /api/patch, /api/db/
+// snapshots) with the REAL client patcher (RisuSavePatcher).
 //
-// Expected states:
-//   - BEFORE C1-step2 (server hydrates pcs inline at decode → dbCache inline):
-//       the marker-hash patch MISMATCHES → server replies 409. (RED)
-//   - AFTER  C1-step2 (server preserves the marker in dbCache → hashes marker):
-//       the patch is accepted → 200, and the value round-trips. (GREEN)
-//
-// Skips itself (does not fail) if the server can't boot in this environment.
+// b3 model under test: pluginCustomStorage is FULLY out-of-band — one KV entry per
+// key, synced via /api/plugin-storage (delta/replace); database.bin carries NOTHING
+// about it (no inline, no marker), so it never enters the patch/etag/hash/rebase
+// machinery. That removes the marker/hash coupling that caused the concurrency
+// defects. Skips (does not fail) if the server can't boot here.
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
@@ -28,7 +24,7 @@ vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
 const { RisuSavePatcher, encodeRisuSaveLegacy, decodeRisuSave } = await import('./risuSave')
-const { setPluginStorageSidecarWriteEnabled, buildPluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER, hydratePluginCustomStorage } = await import('./pluginStorageSidecar')
+const { setPluginStorageSidecarWriteEnabled } = await import('./pluginStorageSidecar')
 
 const SERVER_CJS = nodePath.resolve(__dirname, '../../../server/node/server.cjs')
 const PORT = 6788
@@ -71,7 +67,7 @@ beforeAll(async () => {
     })
     booted = await waitFor(async () => {
         const r = await fetch(`${BASE}/api/read`, { headers: authHeaders({ 'file-path': hex('nonexistent/x') }) })
-        return r.status !== undefined // any HTTP response means it's listening
+        return r.status !== undefined
     }, 15000)
 }, 30000)
 
@@ -80,197 +76,103 @@ afterAll(async () => {
     try { if (dir) rmSync(dir, { recursive: true, force: true }) } catch {}
 })
 
-// Seed database.bin (marker form) + the per-key values, then run one flag-ON
-// client patch cycle and observe whether the server accepts it.
-async function seedMarkerDbAndValues(pcs: Record<string, string>) {
-    // 1) per-key values (mimics the client sidecar seed). Discriminated "replace".
-    const post = await fetch(`${BASE}/api/plugin-storage`, {
-        method: 'POST',
-        headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-        body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: pcs })),
-    })
-    expect(post.status).toBe(200)
-    // 2) database.bin in MARKER form (no inline pcs; carries the directory marker).
-    const markerDb: any = { formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [],
-        [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory(pcs) }
-    const w = await fetch(`${BASE}/api/write`, {
-        method: 'POST',
-        headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/octet-stream' }),
-        body: Buffer.from(encodeRisuSaveLegacy(markerDb)),
-    })
-    expect(w.status).toBe(200)
+const enc = (o: any) => Buffer.from(encodeRisuSaveLegacy(o))
+const psPost = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
+    method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }), body: enc(env),
+}).then((r) => r.status)
+async function getPerKey(): Promise<Record<string, any>> {
+    const r = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
+    if (r.status === 404) return {}
+    return (await decodeRisuSave(new Uint8Array(await r.arrayBuffer()))).pluginCustomStorage ?? {}
 }
+const replacePerKey = (values: Record<string, any>) => psPost({ type: 'replace', values })
+const writeDb = (dbObj: any) => fetch(`${BASE}/api/write`, {
+    method: 'POST', headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/octet-stream' }), body: enc(dbObj),
+}).then((r) => r.status)
 
-async function readDb(): Promise<any> {
-    const r = await fetch(`${BASE}/api/read`, { headers: authHeaders({ 'file-path': hex('database/database.bin') }) })
-    expect(r.status).toBe(200)
-    const buf = new Uint8Array(await r.arrayBuffer())
-    return await decodeRisuSave(buf)
-}
-
-describe('pluginCustomStorage patch-sync — REAL server (codex BLOCKER 1)', () => {
+describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
     it('boots the real server', () => {
         if (!booted) { console.warn('server did not boot — skipping'); return }
         expect(booted).toBe(true)
     })
 
-    it('flag-ON client value-change patch is ACCEPTED (marker hash agrees) and round-trips', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
+    it('per-key delta round-trips through the real server (POST changed → GET)', async () => {
+        if (!booted) return
+        expect(await replacePerKey({ 'vector_rag:shard:0': JSON.stringify({ v: 1 }), 'hayaku.v1.durable.a': 'x' })).toBe(200)
+        expect(await psPost({ type: 'delta', changed: { 'vector_rag:shard:0': JSON.stringify({ v: 2 }) }, removed: [] })).toBe(200)
+        const back = await getPerKey()
+        expect(JSON.parse(back['vector_rag:shard:0']).v).toBe(2)   // updated
+        expect(back['hayaku.v1.durable.a']).toBe('x')              // untouched key survives
+    })
+
+    it('DELETE is real: a removed key is gone from the store (no orphan resurrection)', async () => {
+        if (!booted) return
+        await replacePerKey({ keep: 'a', gone: 'b' })
+        expect(await psPost({ type: 'delta', changed: {}, removed: ['gone'] })).toBe(200)
+        const back = await getPerKey()
+        expect(back.keep).toBe('a')
+        expect('gone' in back).toBe(false)   // really deleted (removeKey), not a lingering orphan
+    })
+
+    it('CONCURRENCY: two tabs editing DIFFERENT keys both survive (no clobber)', async () => {
+        if (!booted) return
+        await replacePerKey({ base: 'b' })
+        const [s1, s2] = await Promise.all([
+            psPost({ type: 'delta', changed: { A: 'a1' }, removed: [] }),
+            psPost({ type: 'delta', changed: { B: 'b1' }, removed: [] }),
+        ])
+        expect(s1).toBe(200); expect(s2).toBe(200)
+        const back = await getPerKey()
+        expect(back).toEqual({ base: 'b', A: 'a1', B: 'b1' })   // both adds present, neither dropped
+    })
+
+    it('flag-ON patcher EXCLUDES pcs → database.bin patch is accepted (no marker/hash coupling)', async () => {
+        if (!booted) return
         setPluginStorageSidecarWriteEnabled(true)
-        const pcs = { 'vector_rag:shard:0': JSON.stringify({ v: 1 }), 'hayaku.v1.durable.a': 'x' }
-        await seedMarkerDbAndValues(pcs)
-
-        // client reads the server's DB (marker form after C1-step2) and hydrates
-        // pcs inline so its patcher baseline matches the server dbCache.
-        const readServerDb = await readDb()
-        const getPcs = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
-        const hydrated = getPcs.status === 200 ? (await decodeRisuSave(new Uint8Array(await getPcs.arrayBuffer()))).pluginCustomStorage : {}
-        const liveDb: any = { ...readServerDb, pluginCustomStorage: { ...hydrated } }
-
+        // server DB carries NO pcs (b3). Seed one, then read it back.
+        expect(await writeDb({ formatversion: 4, characters: [], botPresets: [{ id: 'p', name: 'preset' }], modules: [], plugins: [], customCSS: 'v1' })).toBe(200)
+        const readDb = await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/read`, { headers: authHeaders({ 'file-path': hex('database/database.bin') }) })).arrayBuffer()))
+        // the LIVE db has pcs (plugins use it); the flag-ON patcher must exclude it so
+        // its hash matches the pcs-free server DB (this is what used to 409-loop).
+        const liveDb: any = { ...readDb, pluginCustomStorage: { 'k': 'v' } } // customCSS stays 'v1' (baseline)
         const patcher = new RisuSavePatcher()
         await patcher.init(liveDb)
-        // value-only change: marker (key set) unchanged → patch carries no pcs op,
-        // value travels via the per-key POST below (concurrency-safe path).
-        liveDb.pluginCustomStorage['vector_rag:shard:0'] = JSON.stringify({ v: 2 })
-        const delta = { type: 'delta', changed: { 'vector_rag:shard:0': liveDb.pluginCustomStorage['vector_rag:shard:0'] }, removed: [] }
-        const dp = await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy(delta)),
-        })
-        expect(dp.status).toBe(200)
-
+        liveDb.customCSS = 'v2' // the actual change, made AFTER init so the diff is v1->v2
         const { patch, expectedHash } = await patcher.set(liveDb, {
             character: [], chat: [], root: true, botPreset: false, modules: false, plugins: false, pluginCustomStorage: true,
         } as any)
+        // the patch must not carry pcs at all
+        expect(JSON.stringify(patch)).not.toContain('pluginCustomStorage')
         const resp = await fetch(`${BASE}/api/patch`, {
             method: 'POST', headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/json' }),
             body: JSON.stringify({ patch, expectedHash }),
         })
-        // THE ASSERTION: marker-canonical server accepts the marker-hash patch.
-        // (Pre-C1-step2 this is 409 — server hashes the hydrated inline form.)
-        expect(resp.status).toBe(200)
-
-        // round-trip: the new value is durable + readable
-        const getPcs2 = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
-        const back = (await decodeRisuSave(new Uint8Array(await getPcs2.arrayBuffer()))).pluginCustomStorage
-        expect(JSON.parse(back['vector_rag:shard:0']).v).toBe(2)
-    })
-
-    it('CONCURRENCY: two tabs editing DIFFERENT keys both survive (no clobber)', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        await seedMarkerDbAndValues({ A: 'a0', B: 'b0' })
-        // two independent clients send per-key deltas for different keys, concurrently
-        const post = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy(env)),
-        }).then((r) => r.status)
-        const [s1, s2] = await Promise.all([
-            post({ type: 'delta', changed: { A: 'a1' }, removed: [] }),
-            post({ type: 'delta', changed: { B: 'b1' }, removed: [] }),
-        ])
-        expect(s1).toBe(200)
-        expect(s2).toBe(200)
-        const back = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
-        // BOTH edits present — the single-blob layout would have lost one.
-        expect(back.A).toBe('a1')
-        expect(back.B).toBe('b1')
+        expect(resp.status).toBe(200)   // hash agrees — no pcs on either side
     })
 
     it('BACKUP/RESTORE: a DB snapshot captures + restores the per-key plugin memory', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        // seed + create a snapshot (interval=0 → the seed write backs up with the
-        // per-key state {A:a0,B:b0} paired in)
-        await seedMarkerDbAndValues({ A: 'a0', B: 'b0' })
-        await fetch(`${BASE}/api/read`, { headers: authHeaders({ 'file-path': hex('database/database.bin') }) }) // flush → backup
+        if (!booted) return
+        await replacePerKey({ A: 'a0', B: 'b0' })
+        await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'backup-marker' }) // forces a fresh backup pairing per-key {A:a0,B:b0}
         const list = await (await fetch(`${BASE}/api/db/snapshots`, { headers: authHeaders() })).json()
         const snaps: any[] = Array.isArray(list) ? list : (list.snapshots ?? list.items ?? [])
-        const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).find(Boolean)
+        // take the LATEST snapshot (keys are time-ordered) — the one we just made,
+        // since a later delta POST does not create a snapshot.
+        const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).filter(Boolean).sort().reverse()[0]
         expect(snapKey, 'a snapshot should exist').toBeTruthy()
-
-        // mutate per-key AFTER the snapshot
-        await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy({ type: 'delta', changed: { A: 'a1-CHANGED' }, removed: [] })),
-        })
-        const mid = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
-        expect(mid.A).toBe('a1-CHANGED')
-
-        // restore the snapshot → per-key reverts to {A:a0,B:b0}
+        await psPost({ type: 'delta', changed: { A: 'a1-CHANGED' }, removed: [] })
+        expect((await getPerKey()).A).toBe('a1-CHANGED')
         const r = await fetch(`${BASE}/api/db/snapshots/restore`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({ key: snapKey }),
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify({ key: snapKey }),
         })
         expect(r.status).toBe(200)
-        const after = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
-        expect(after.A).toBe('a0')   // reverted (per-key snapshot restored)
+        const after = await getPerKey()
+        expect(after.A).toBe('a0')   // reverted with the snapshot
         expect(after.B).toBe('b0')
     })
 
-    it('ORPHAN DROP: a marker-only delete stays deleted on reload (real server GET + client hydrate)', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        // seed per-key {A,B}; the server GET (readAll) will keep returning B as an
-        // orphan after we "delete" it by shrinking the marker to [A] only.
-        await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { A: 'a', B: 'b' } })),
-        })
-        // client loads a DB whose marker lists ONLY A (B was marker-only-deleted).
-        const markerDb: any = { formatversion: 4, characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory({ A: 'a' }) }
-        // the real client hydrate fetches the server map (which still has orphan B) …
-        const serverMap = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
-        expect(serverMap.B).toBe('b') // orphan is still stored server-side
-        await hydratePluginCustomStorage(markerDb, async () => serverMap)
-        // … but hydration filters to marker.keys → B does NOT resurrect.
-        expect(markerDb.pluginCustomStorage).toEqual({ A: 'a' })
-        expect('B' in markerDb.pluginCustomStorage).toBe(false)
-    })
-
-    it('KEY-SET CONCURRENCY: two tabs adding DIFFERENT new keys both land, rebuilt marker = union', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { base: 'b' } })),
-        })
-        const post = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy(env)),
-        }).then((r) => r.status)
-        // two independent tabs add different NEW keys concurrently
-        const [s1, s2] = await Promise.all([
-            post({ type: 'delta', changed: { X: 'x' }, removed: [] }),
-            post({ type: 'delta', changed: { Y: 'y' }, removed: [] }),
-        ])
-        expect(s1).toBe(200); expect(s2).toBe(200)
-        // both adds landed per-key (neither clobbered) …
-        const serverMap = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
-        expect(serverMap).toEqual({ base: 'b', X: 'x', Y: 'y' })
-        // … so the marker a rebase rebuilds from the server map is the UNION (neither
-        // key dropped — the failure the 409→rebase routing prevents).
-        expect(buildPluginStorageDirectory(serverMap).keys).toEqual(['X', 'Y', 'base'])
-    })
-
-    it('BACKSTOP: server refuses to persist a marker referencing a value not in the per-key store', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        // per-key has ONLY A; a marker claiming [A,B] would be a dangling marker.
-        await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { A: 'a' } })),
-        })
-        const danglingDb: any = { formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [],
-            [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory({ A: 'a', B: 'b' }) } // B absent from per-key
-        const w = await fetch(`${BASE}/api/write`, {
-            method: 'POST', headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy(danglingDb)),
-        })
-        expect(w.status).toBe(500) // rejected, not silently persisted
-    })
-
     it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {
-        if (!booted) { console.warn('server not booted — skipping'); return }
-        const r = await fetch(`${BASE}/api/plugin-storage`, {
-            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
-            body: Buffer.from(encodeRisuSaveLegacy({ changed: { A: 'x' } })), // looks like a delta but no type
-        })
-        expect(r.status).toBe(400)
+        if (!booted) return
+        expect(await psPost({ changed: { A: 'x' } })).toBe(400)   // looks like a delta but no discriminator
     })
 })

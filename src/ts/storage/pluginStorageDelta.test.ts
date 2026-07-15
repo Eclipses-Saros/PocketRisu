@@ -92,6 +92,17 @@ describe('pluginStorageDelta — per-key delta without a resident copy (C3)', ()
         expect(({} as any).evil).toBeUndefined() // global prototype not polluted
     })
 
+    it('detects distinctions msgpack persists but JSON.stringify collapses (F4)', () => {
+        // {a:undefined} vs {}, [undefined] vs [null], NaN vs null all JSON.stringify
+        // to the same text but encode to DIFFERENT msgpack bytes -> must be detected.
+        expect(Object.keys(computePluginStorageDelta({ k: {} }, seedPluginStorageBaseline({ k: { a: undefined } }))).length >= 0).toBe(true)
+        expect(computePluginStorageDelta({ k: {} }, seedPluginStorageBaseline({ k: { a: undefined } })).changed).toHaveProperty('k')
+        expect(computePluginStorageDelta({ k: [null] }, seedPluginStorageBaseline({ k: [undefined] })).changed).toHaveProperty('k')
+        expect(computePluginStorageDelta({ k: null }, seedPluginStorageBaseline({ k: NaN })).changed).toHaveProperty('k')
+        // and no false positive when genuinely unchanged
+        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: { a: undefined } }, seedPluginStorageBaseline({ k: { a: undefined } })))).toBe(true)
+    })
+
     it('snapshots object values at compute time (later mutation does not change the delta)', () => {
         const obj: any = { n: 1 }
         const base = seedPluginStorageBaseline({ k: { n: 0 } })
