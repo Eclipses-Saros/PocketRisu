@@ -117,6 +117,31 @@ export type requestDataResponse = {
 
 export interface StreamResponseChunk{[key:string]:string}
 
+// Failure texts that mean the CONNECTION died rather than the provider
+// rejecting the request. Such a request may have already reached the provider
+// and started a (billed) generation — Safari in particular kills in-flight
+// fetches (~60s without response bytes, tab backgrounding/screen lock on iOS)
+// long after delivery. Provider-issued HTTP errors (429/500/overloaded) never
+// match these and keep auto-retrying as before.
+const networkInterruptionPatterns = [
+    'load failed',                     // Safari fetch TypeError
+    'failed to fetch',                 // Chromium fetch TypeError
+    'networkerror when attempting',    // Firefox fetch TypeError
+    'the request timed out',           // Safari CFNetwork -1001
+    'the network connection was lost', // Safari CFNetwork -1005
+    'proxy request timed out',         // /proxy2 504 timeout body
+    'operation was aborted',           // AbortSignal timeout
+    'aborterror',
+]
+
+function isNetworkInterruptionFail(result: unknown): boolean {
+    if(typeof result !== 'string'){
+        return false
+    }
+    const r = result.toLowerCase()
+    return networkInterruptionPatterns.some(p => r.includes(p))
+}
+
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
     const fallBackModels:string[] = safeStructuredClone(db?.fallbackModels?.[model] ?? [])
@@ -211,6 +236,13 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                     type: 'fail',
                     result: 'Aborted'
                 }
+            }
+
+            // Never silently re-send after a network-level interruption: the
+            // provider may already be generating (and billing) the first
+            // request. Surface the failure so the user retries manually.
+            if(da.type === 'fail' && !da.noRetry && isNetworkInterruptionFail(da.result)){
+                da.noRetry = true
             }
 
             if(da.type === 'success' && arg.escape){
