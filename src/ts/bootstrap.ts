@@ -11,7 +11,7 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
-import { hydratePluginCustomStorage } from "./storage/pluginStorageSidecar";
+import { hydratePluginCustomStorage, setPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -42,6 +42,16 @@ export async function loadData() {
     if (!loaded) {
         try {
             applyEarlyLanguage()
+            // Opt-in per-device enable for the pluginCustomStorage per-key sidecar
+            // (b3). Shipped default is OFF (byte-identical to today). Set
+            // localStorage 'pocketrisu_plugin_sidecar_write' = 'true' to turn it on
+            // for a real-app smoke without a rebuild; the coordinated default flip
+            // lands after that smoke passes. Inert unless the key is explicitly set.
+            try {
+                if (typeof localStorage !== 'undefined' && localStorage.getItem('pocketrisu_plugin_sidecar_write') === 'true') {
+                    setPluginStorageSidecarWriteEnabled(true)
+                }
+            } catch {}
             let createdFreshDatabase = false
             {
                 await forageStorage.Init()
