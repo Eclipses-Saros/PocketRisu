@@ -55,7 +55,11 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
-                    await hydratePluginCustomStorage(decoded)
+                    // Real client loader (GET /api/plugin-storage) injected here so
+                    // pluginStorageSidecar.ts stays dependency-free (no import cycle
+                    // with globalApi). Inert while the write-enable flag is off (no
+                    // decoded DB carries the marker, so the loader is never invoked).
+                    await hydratePluginCustomStorage(decoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -68,7 +72,7 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
-                            await hydratePluginCustomStorage(backupDecoded)
+                            await hydratePluginCustomStorage(backupDecoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true
