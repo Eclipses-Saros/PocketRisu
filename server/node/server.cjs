@@ -33,10 +33,17 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
-// Server home for the pluginCustomStorage sidecar (a dedicated KV key, outside
-// database.bin). Durable: kvSet is synchronous SQLite, so a write is durable
-// before the endpoint ACKs. Dormant until the client write-enable POSTs a payload.
+const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.cjs');
+// Server home for the pluginCustomStorage sidecar. b3 layout: each plugin key is
+// its own KV entry under pluginStorage/, so a write touches only that key and
+// concurrent writes to DIFFERENT keys never collide (mirrors the per-chat model).
+// Durable: kvSet is synchronous SQLite, so a write is durable before the endpoint
+// ACKs. Dormant until the client write-enable POSTs a payload.
+//   pluginStorageSidecarStore (single-blob) is retained ONLY for the export/import
+//   backup-entry transient + snapshot pairing until inc2b retargets those; the
+//   live read/write path (hydrate + endpoints) uses the per-key store below.
 const pluginStorageSidecarStore = createPluginStorageSidecarStore({ get: kvGet, set: kvSet, del: kvDel });
+const pluginStoragePerKeyStore = createPluginStoragePerKeyStore({ get: kvGet, set: kvSet, del: kvDel, listPrefix: kvList });
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -237,7 +244,12 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
+                // marker-canonical: do NOT hydrate pcs here. The marker rides
+                // database.bin/dbCache (and is what the client patcher hashes);
+                // values live in the per-key store and the client hydrates them on
+                // read. Hydrating here would put inline pcs into the hashed/cached
+                // form and permanently mismatch the client's marker hash. (Upstream
+                // export still hydrates explicitly, since external tools need inline.)
                 const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
@@ -306,11 +318,13 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         if (fresh) raw = fresh;
     }
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
-    // Resolve pluginCustomStorage from a sidecar if this DB is in the new layout,
-    // BEFORE any downstream re-persist below could re-encode it away. Inert today
-    // (no DB carries the marker → pass-through). Must exist before the client ever
-    // writes the new layout, since this server is a separate deploy.
-    await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
+    // marker-canonical: preserve the pcs representation as decoded. A marker DB
+    // stays a marker here (values live in the per-key store; the client hydrates
+    // them on read), so the marker is what flows into dbCache and the protocol
+    // hash — matching the client patcher, which also hashes the marker. Hydrating
+    // to inline here is what permanently mismatched the client (codex BLOCKER 1).
+    // A legacy inline DB (no marker) is preserved inline and hashes inline, which
+    // matches a flag-off client. (Upstream export hydrates explicitly below.)
     let needsPersist = false;
 
     const hadMissingIds = assignMissingChatIds(dbObj);
@@ -452,11 +466,12 @@ function mergeChatStubWithFullChat(stub, fullChat) {
 }
 
 function reassembleFullDb(strippedDb) {
-    // Backstop: never re-encode a DB that still carries an unresolved sidecar
-    // marker (would drop pluginCustomStorage). All re-persist paths feed through
-    // here; the known ones hydrate first (marker already stripped), so this only
-    // fires if a future/missed path forgets — fail closed instead of losing data.
-    assertPluginStorageResolved(strippedDb);
+    // marker-canonical: a pluginStorageSidecar marker is now a LEGITIMATE persisted
+    // form (values live in the per-key store, not inline), so we no longer fail on
+    // its presence here. pcs is not reassembled inline — it stays a marker on disk
+    // and the client hydrates it from the per-key store on read (mirrors how chat
+    // bodies live outside database.bin). Read-time fail-closed (per-key loader +
+    // client key-set check) guards against a marker whose values went missing.
     if (!strippedDb?.characters || !fullChatStore) return strippedDb;
     const full = { ...strippedDb };
     full.characters = strippedDb.characters.map(char => {
@@ -3596,7 +3611,10 @@ app.post('/api/write', async (req, res, next) => {
                 // Client sends stubs-only DB — merge full chats from server before persisting
                 try {
                     const incomingDb = await decodeRisuSave(fileContent);
-                    await hydratePluginCustomStorageServer(incomingDb, pluginStorageSidecarStore.loader);
+                    // marker-canonical: preserve the incoming pcs form. A flag-on
+                    // client full-writes a MARKER DB (values already POSTed to the
+                    // per-key store); persisting the marker keeps disk/dbCache and
+                    // the client's next patcher baseline in the same (marker) form.
                     await ensureChatStore();
                     const fullDb = reassembleFullDb(incomingDb);
 
@@ -4009,11 +4027,16 @@ app.get('/api/backup/export', async (req, res, next) => {
             try {
                 const decoded = normalizeJSON(await decodeRisuSave(dbExportBuffer));
                 if (decoded && decoded[PLUGIN_STORAGE_SIDECAR_MARKER]) {
-                    await hydratePluginCustomStorageServer(decoded, pluginStorageSidecarStore.loader);
+                    await hydratePluginCustomStorageServer(decoded, pluginStoragePerKeyStore.loader);
                     dbExportBuffer = Buffer.from(encodeRisuSaveLegacy(decoded));
                 }
             } catch (e) {
-                logger.warn('[Export] upstream re-inline of pluginCustomStorage failed:', e?.message || e);
+                // FAIL CLOSED: upstream can't read our per-key sidecar, so if we
+                // can't re-inline the values we must NOT ship a marker DB with empty
+                // pluginCustomStorage — that silently drops plugin memory from the
+                // exported file. Abort the export instead of exporting a lossy blob.
+                logger.error('[Export] upstream re-inline of pluginCustomStorage failed — aborting export:', e?.message || e);
+                throw new Error(`Export aborted: could not re-inline pluginCustomStorage for upstream (refusing to export lossy data): ${e?.message || e}`);
             }
         }
         const dbSize = dbExportBuffer ? dbExportBuffer.length : 0;
@@ -4708,7 +4731,12 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            await hydratePluginCustomStorageServer(dbObj, pluginStorageSidecarStore.loader);
+                            // marker-canonical: do NOT hydrate pcs here. The marker rides
+                // database.bin/dbCache (and is what the client patcher hashes);
+                // values live in the per-key store and the client hydrates them on
+                // read. Hydrating here would put inline pcs into the hashed/cached
+                // form and permanently mismatch the client's marker hash. (Upstream
+                // export still hydrates explicitly, since external tools need inline.)
                             const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
@@ -4749,24 +4777,35 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 // here instead of embedding it in database.bin. Dormant until then. Durable:
 // store.write → synchronous SQLite, so the write is durable before we ACK.
 
-// POST /api/plugin-storage — receive the full pluginCustomStorage sidecar payload.
+// POST /api/plugin-storage — receive a pluginCustomStorage update. Accepts BOTH
+// a full-map payload ({ pluginCustomStorage } / bare map) and a per-key delta
+// ({ changed, removed }). The delta path is concurrency-safe: it touches only the
+// named keys, so two clients editing DIFFERENT keys never clobber each other.
 app.post('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
     try {
         await queueStorageOperation(async () => {
-            let pcs;
+            let body;
             if (Buffer.isBuffer(req.body)) {
-                let decoded;
-                try { decoded = await decodeRisuSave(req.body); }
+                try { body = await decodeRisuSave(req.body); }
                 catch { return res.status(400).json({ error: 'Invalid binary plugin-storage payload' }); }
-                pcs = decoded && typeof decoded === 'object' ? (decoded.pluginCustomStorage ?? decoded) : {};
             } else if (req.body && typeof req.body === 'object') {
-                pcs = req.body.pluginCustomStorage ?? req.body;
+                body = req.body;
             } else {
                 return res.status(400).json({ error: 'plugin-storage payload required' });
             }
-            pluginStorageSidecarStore.write(pcs);
+            if (!body || typeof body !== 'object') return res.status(400).json({ error: 'plugin-storage payload required' });
+            // Discriminated envelope (no bare-map guessing): a plugin key literally
+            // named "changed"/"removed"/"values" must never be mistaken for the
+            // envelope. type is REQUIRED.
+            if (body.type === 'delta') {
+                pluginStoragePerKeyStore.applyDelta({ changed: body.changed, removed: body.removed });
+            } else if (body.type === 'replace') {
+                pluginStoragePerKeyStore.replaceAll(body.values ?? {});
+            } else {
+                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace"' });
+            }
             res.json({ success: true });
         });
     } catch (error) {
@@ -4774,12 +4813,14 @@ app.post('/api/plugin-storage', async (req, res, next) => {
     }
 });
 
-// GET /api/plugin-storage — return the sidecar payload for the client loader.
+// GET /api/plugin-storage — return the full pluginCustomStorage map for the client
+// loader, reassembled from the per-key entries. 404 when no entries exist, so the
+// client keeps the "no sidecar" (fail-closed) signal it relies on.
 app.get('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const pcs = await pluginStorageSidecarStore.read();
-        if (pcs === null) {
+        const pcs = await pluginStoragePerKeyStore.readAll();
+        if (!pcs || Object.keys(pcs).length === 0) {
             res.status(404).json({ error: 'No plugin-storage sidecar' });
             return;
         }

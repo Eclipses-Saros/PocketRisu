@@ -15,7 +15,8 @@ import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEnc
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
-import { isPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
+import { isPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER } from "./storage/pluginStorageSidecar";
+import { seedPluginStorageBaseline, computePluginStorageDelta, advancePluginStorageBaseline, pluginStorageDeltaIsEmpty, type PluginStorageBaseline } from "./storage/pluginStorageDelta";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -44,6 +45,16 @@ interface fetchLog {
 }
 
 let fetchLog: fetchLog[] = []
+
+// Per-key fingerprint baseline for the pluginCustomStorage sidecar sync (b3/C3).
+// Tracks what the server's per-key store already has, so each save sends only the
+// keys it changed. Re-seeded whenever pluginCustomStorage is (re)established from
+// the server: load/hydrate, full-write re-init, and 409 rebase. A fingerprint map
+// (key -> hash), never a resident copy of the values.
+let pluginStorageSyncBaseline: PluginStorageBaseline = new Map()
+export function resyncPluginStorageBaseline(map: Record<string, any> | null | undefined): void {
+    pluginStorageSyncBaseline = seedPluginStorageBaseline(map)
+}
 
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
     if (typeof (dat) === 'string') {
@@ -734,7 +745,20 @@ export async function saveDb() {
             if (toSave.modules) {
                 mergedDb.modules = safeStructuredClone(localDb.modules)
             }
-            if (toSave.pluginCustomStorage) {
+            if (toSave.pluginCustomStorage && isPluginStorageSidecarWriteEnabled()) {
+                // marker layout: plugin VALUES are per-key on the server and were
+                // already applied (this tab's delta POST runs BEFORE the database.bin
+                // write that 409'd, and per-key writes don't clobber). So the server's
+                // per-key map is ALREADY the correct merge of every tab's edits — take
+                // it as truth. Give the merged DB the inline map (for plugins + the next
+                // fingerprint baseline) and drop the marker (the encoder re-stubs it on
+                // save). No inline overlay: the values never rode database.bin here.
+                let serverMap: Record<string, any> = {}
+                try { serverMap = (await forageStorage.realStorage.fetchPluginStorageSidecar()) ?? {} } catch { serverMap = {} }
+                ;(mergedDb as any).pluginCustomStorage = serverMap
+                delete (mergedDb as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
+                resyncPluginStorageBaseline(serverMap)
+            } else if (toSave.pluginCustomStorage) {
                 const serverPS = (mergedDb.pluginCustomStorage ?? {}) as Record<string, any>
                 const localPS = (localDb.pluginCustomStorage ?? {}) as Record<string, any>
                 if (pluginStorageBaseline) {
@@ -851,16 +875,33 @@ export async function saveDb() {
             throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
         }
 
-        // ── pluginCustomStorage sidecar (new layout only; flag OFF by default) ──
-        // Send the sidecar BEFORE encoding/writing database.bin, so the payload is
-        // durable before the marker-bearing DB can be relied upon. If the send
-        // fails, throw — never persist a marker DB whose sidecar is missing (that
-        // would read back as fail-closed / lost memory). Inert while the flag is off.
+        // ── pluginCustomStorage per-key sidecar (new layout only; flag OFF default) ──
+        // Send the changed keys BEFORE encoding/writing database.bin, so the values
+        // are durable before the marker DB that references them. Only the keys this
+        // save touched travel (a delta vs the per-key fingerprint baseline), so two
+        // tabs editing DIFFERENT keys never clobber. If the send fails, throw —
+        // never persist a marker DB whose values didn't land (fail-closed / lost
+        // memory). Advance the baseline only after the server acked, so a retry
+        // re-sends the same delta idempotently. Inert while the flag is off.
         if (isPluginStorageSidecarWriteEnabled() && toSave.pluginCustomStorage) {
-            try {
-                await forageStorage.realStorage.savePluginStorageSidecar(db.pluginCustomStorage)
-            } catch (e) {
-                throw new Error(`Failed to save pluginCustomStorage sidecar (aborting save to avoid losing plugin memory): ${e}`)
+            const delta = computePluginStorageDelta(db.pluginCustomStorage as any, pluginStorageSyncBaseline)
+            if (!pluginStorageDeltaIsEmpty(delta)) {
+                try {
+                    // Send only CHANGED values, before the database.bin marker write
+                    // (value-before-marker: the marker never references a value that
+                    // hasn't landed). Removals are NOT deleted here — they're dropped
+                    // from the marker by the patcher, so an interrupted delete can't
+                    // leave the marker pointing at a missing value (which would fail
+                    // closed on read). The removed keys' per-key entries become inert
+                    // orphans (unreferenced by any marker); reclaiming that space is a
+                    // separate GC concern, not correctness. (Storage traded for safety,
+                    // which the plan explicitly allows.)
+                    await forageStorage.realStorage.savePluginStorageDelta({ changed: delta.changed, removed: [] })
+                } catch (e) {
+                    throw new Error(`Failed to save pluginCustomStorage delta (aborting save to avoid losing plugin memory): ${e}`)
+                }
+                // Baseline drops removed keys too, so they aren't re-sent as changes.
+                advancePluginStorageBaseline(pluginStorageSyncBaseline, delta)
             }
         }
 

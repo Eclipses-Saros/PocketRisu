@@ -24,6 +24,7 @@ import {
     forageStorage,
     saveDb,
     setPatchSyncBaseline,
+    resyncPluginStorageBaseline,
     getDbBackups,
     getUncleanables,
     getBasename,
@@ -60,6 +61,7 @@ export async function loadData() {
                     // with globalApi). Inert while the write-enable flag is off (no
                     // decoded DB carries the marker, so the loader is never invoked).
                     await hydratePluginCustomStorage(decoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
+                    resyncPluginStorageBaseline(decoded.pluginCustomStorage)
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -73,6 +75,7 @@ export async function loadData() {
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
                             await hydratePluginCustomStorage(backupDecoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
+                            resyncPluginStorageBaseline(backupDecoded.pluginCustomStorage)
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true

@@ -1,4 +1,4 @@
-import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, test, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 // Measurement test (B step 0). Proves the certain core rationale behind plan B:
 // pluginCustomStorage rides the monolithic save, so every save that touches it
@@ -12,6 +12,7 @@ vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
 const { RisuSaveEncoder, RisuSavePatcher } = await import('./risuSave')
+const { isPluginStorageSidecarWriteEnabled, setPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER } = await import('./pluginStorageSidecar')
 
 // Distinctive marker embedded in every stored value, so a JSON.stringify spy can
 // tell "stringified the whole plugin store" from unrelated stringify calls.
@@ -123,5 +124,78 @@ describe('B step 0 — pluginCustomStorage save cost (baseline before B)', () =>
         // The whole store is re-serialized even though only one key changed by 1 char.
         expect(encoderWhole).toBeGreaterThanOrEqual(1)
         expect(patcherWhole).toBeGreaterThanOrEqual(1)
+    })
+})
+
+// inc3 — the patcher fix: with the sidecar write layout on, the patcher stubs
+// pluginCustomStorage down to the directory marker, so the whole-store
+// re-serialization the baseline above measured is GONE from the patch-sync path
+// (PocketRisu's live runtime). Values ride the out-of-band per-key delta POST.
+describe('B inc3 — patcher stubs pluginCustomStorage → marker (flag ON kills the whole-store cost)', () => {
+    afterEach(() => setPluginStorageSidecarWriteEnabled(false))
+
+    it('flag ON: patch carries the directory marker, NOT the inline store; whole-store stringify = 0', async () => {
+        const db = makeDb()
+        setPluginStorageSidecarWriteEnabled(true)
+        expect(isPluginStorageSidecarWriteEnabled()).toBe(true)
+        const patcher = new RisuSavePatcher()
+        await patcher.init(db)
+        // change one shard by one char — the case that used to still cost a whole-store diff
+        db.pluginCustomStorage['vector_rag_memory:shard:0'] += ' '
+        let patch: any[] = []
+        const patcherWhole = await countWholeStoreStringifies(async () => {
+            const r = await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
+            patch = r.patch
+        })
+        // whole-store cost gone
+        expect(patcherWhole).toBe(0)
+        // no patch op touches the inline pluginCustomStorage root
+        expect(patch.some((op: any) => typeof op.path === 'string' && op.path.startsWith('/pluginCustomStorage'))).toBe(false)
+        // the directory marker is what the patch tracks (value change → keys same →
+        // marker unchanged → no op here; presence is asserted on a key-set change below)
+    })
+
+    it('flag ON: adding a plugin key emits a marker op (directory), never the inline map', async () => {
+        const db = makeDb()
+        setPluginStorageSidecarWriteEnabled(true)
+        const patcher = new RisuSavePatcher()
+        await patcher.init(db)
+        db.pluginCustomStorage['vector_rag_memory:shard:NEW'] = bigValue(99)
+        const { patch } = await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
+        const markerOps = patch.filter((op: any) => typeof op.path === 'string' && op.path.startsWith(`/${PLUGIN_STORAGE_SIDECAR_MARKER}`))
+        expect(markerOps.length).toBeGreaterThanOrEqual(1)
+        // the new key is listed in the directory the patch carries
+        const carried = JSON.stringify(markerOps)
+        expect(carried).toContain('vector_rag_memory:shard:NEW')
+        // and NO whole shard value rode along in the patch
+        expect(carried).not.toContain(MARK)
+    })
+
+    it('flag OFF (default): unchanged — patch still carries inline pluginCustomStorage', async () => {
+        const db = makeDb()
+        const patcher = new RisuSavePatcher()
+        await patcher.init(db)
+        db.pluginCustomStorage['vector_rag_memory:shard:0'] += ' '
+        const { patch } = await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
+        expect(patch.some((op: any) => typeof op.path === 'string' && op.path.startsWith('/pluginCustomStorage'))).toBe(true)
+        expect(patch.some((op: any) => typeof op.path === 'string' && op.path.startsWith(`/${PLUGIN_STORAGE_SIDECAR_MARKER}`))).toBe(false)
+    })
+
+    // PLUGIN COMPATIBILITY: the marker stub must NEVER mutate the live in-memory
+    // db.pluginCustomStorage — the sandbox pluginStorage API + the db proxy +
+    // PluginStorageViewer all read/write that live object. Any plugin must keep
+    // seeing the full inline map, flag ON or OFF.
+    it('flag ON: patcher init+set leave the LIVE db.pluginCustomStorage inline & intact', async () => {
+        const db = makeDb()
+        const before = JSON.stringify(db.pluginCustomStorage)
+        const beforeKeys = Object.keys(db.pluginCustomStorage).length
+        setPluginStorageSidecarWriteEnabled(true)
+        const patcher = new RisuSavePatcher()
+        await patcher.init(db)
+        await patcher.set(db, { ...emptyToSave(), pluginCustomStorage: true })
+        // live object untouched: still inline, same keys/values, no marker leaked onto it
+        expect(JSON.stringify(db.pluginCustomStorage)).toBe(before)
+        expect(Object.keys(db.pluginCustomStorage).length).toBe(beforeKeys)
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in db).toBe(false)
     })
 })

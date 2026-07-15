@@ -114,8 +114,9 @@ describe('RisuSaveEncoder write-enable flag (B inc 3d-i) — default OFF is byte
         expect(back.pluginCustomStorage).toBeUndefined()
         // ... but the directory marker is present, with the key list.
         expect(back[PLUGIN_STORAGE_SIDECAR_MARKER]).toBeTruthy()
-        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].version).toBe(1)
-        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].keys).toEqual(Object.keys(db.pluginCustomStorage))
+        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].version).toBe(2)
+        // keys are sorted (deterministic marker) — compare against the sorted set
+        expect(back[PLUGIN_STORAGE_SIDECAR_MARKER].keys).toEqual(Object.keys(db.pluginCustomStorage).sort())
     })
 
     it('flag ON round-trip: decode + hydrate(sidecar loader) restores pluginCustomStorage identically', async () => {

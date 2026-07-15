@@ -25,18 +25,54 @@ export const PLUGIN_STORAGE_SIDECAR_MARKER = 'pluginStorageSidecar'
 // client loader + persistence exits + downgrade guard) AND the end-to-end run
 // passes. Kept as module state (not a build const) so tests can exercise both
 // branches; production leaves it off until the coordinated flip.
+//
+// NOT YET FLIPPED: only the RisuSaveEncoder (full-write path) emits the marker.
+// PocketRisu runs patch-sync (server enablePatchSync=true), whose RisuSavePatcher
+// diff re-inlines pluginCustomStorage every save and is marker-unaware. So with
+// the flag on, steady-state saves keep the whole-store cost in the patcher AND
+// add a redundant whole-store sidecar write — measured encoder=0 / patcher=1.
+// The flip only pays off once the patch-sync path treats pluginCustomStorage as
+// a marker/stub (mirroring chatToStub for chats). Safe either way (marker ⟹
+// sidecar sent first; patcher re-inline removes the marker → no fail-closed).
 let sidecarWriteEnabled = false
 export function isPluginStorageSidecarWriteEnabled(): boolean { return sidecarWriteEnabled }
 export function setPluginStorageSidecarWriteEnabled(value: boolean): void { sidecarWriteEnabled = !!value }
 
+// Layout discriminator for the directory marker. v2 = PER-KEY store (one KV entry
+// per plugin key). v1 was the never-shipped single-blob sidecar; no v1 data exists
+// in production (the write flag was OFF since inception), so readers treat a v1 (or
+// any non-v2) marker as unrecognized and FAIL CLOSED rather than mis-serve it.
+export const PLUGIN_STORAGE_LAYOUT_VERSION = 2
+
 // The directory stub embedded in database.bin (in place of the inline payload)
 // when the new layout is written. Its presence is the marker the dual-read
-// resolver keys on; the key list lets a reader/validator know what the sidecar
-// must contain. The payload itself never goes in here — it travels to the
-// sidecar store.
+// resolver keys on; the key list lets a reader/validator know exactly which
+// per-key entries the sidecar MUST contain (fail-closed cross-check). The values
+// never go in here — they travel to the per-key store.
 export function buildPluginStorageDirectory(pluginCustomStorage: Record<string, any> | null | undefined): { version: number, keys: string[] } {
-    const keys = pluginCustomStorage && typeof pluginCustomStorage === 'object' ? Object.keys(pluginCustomStorage) : []
-    return { version: 1, keys }
+    // Keys are SORTED so the marker is deterministic: the client (patcher stub)
+    // and the server (strip) build it from independently-ordered maps, and the
+    // protocol hash of the key array is order-sensitive — sorting makes the two
+    // sides agree regardless of insertion order.
+    const keys = pluginCustomStorage && typeof pluginCustomStorage === 'object' ? Object.keys(pluginCustomStorage).sort() : []
+    return { version: PLUGIN_STORAGE_LAYOUT_VERSION, keys }
+}
+
+// Validate a directory marker before a loader trusts it. A malformed marker
+// (missing/non-array keys, unrecognized version) must FAIL CLOSED — treating it
+// as "empty" would silently drop plugin memory. Returns the validated key list.
+export function validatePluginStorageDirectory(directory: unknown): string[] {
+    if (!directory || typeof directory !== 'object') {
+        throw new Error('pluginCustomStorage directory marker malformed (not an object) — failing closed')
+    }
+    const d = directory as { version?: unknown, keys?: unknown }
+    if (d.version !== PLUGIN_STORAGE_LAYOUT_VERSION) {
+        throw new Error(`pluginCustomStorage directory marker version ${String(d.version)} unrecognized (expected ${PLUGIN_STORAGE_LAYOUT_VERSION}) — failing closed`)
+    }
+    if (!Array.isArray(d.keys) || !d.keys.every((k) => typeof k === 'string')) {
+        throw new Error('pluginCustomStorage directory marker keys missing or not a string[] — failing closed')
+    }
+    return d.keys as string[]
 }
 
 // Pure dual-read resolver.

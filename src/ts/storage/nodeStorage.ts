@@ -651,18 +651,29 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
     }
 
-    // ── pluginCustomStorage sidecar (B inc 3d) ──────────────────────────────────
-    // Same wire format as /api/chat-content: encodeRisuSaveLegacy({pluginCustomStorage}).
-    // The server endpoint + store already exist and are proven against this format.
+    // ── pluginCustomStorage per-key sidecar (b3) ────────────────────────────────
+    // Writes use a discriminated envelope so a plugin key named "changed"/"removed"/
+    // "values" can never be mis-parsed. Delta = only the keys this save touched
+    // (concurrency-safe: per-key on the server); replace = the whole map (seed /
+    // reconcile). GET returns the full reassembled map for load-time hydration.
 
-    async savePluginStorageSidecar(pluginCustomStorage: any): Promise<void> {
-        const encoded = encodeRisuSaveLegacy({ pluginCustomStorage: pluginCustomStorage ?? {} })
+    // Send ONLY changed/removed keys — the concurrency-safe steady-state path.
+    async savePluginStorageDelta(delta: { changed: Record<string, any>; removed: string[] }): Promise<void> {
+        const encoded = encodeRisuSaveLegacy({ type: 'delta', changed: delta.changed ?? {}, removed: delta.removed ?? [] })
         const da = await this.authFetch('/api/plugin-storage', {
-            method: 'POST',
-            headers: { 'content-type': 'application/octet-stream' },
-            body: encoded,
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
         })
-        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageSidecar error: ${da.status}`)
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageDelta error: ${da.status}`)
+    }
+
+    // Replace the whole map (write EVERY given key, delete stale). Used to seed /
+    // reconcile, not the hot path (concurrent full replaces still last-write-wins).
+    async savePluginStorageReplace(values: Record<string, any>): Promise<void> {
+        const encoded = encodeRisuSaveLegacy({ type: 'replace', values: values ?? {} })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
+        })
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageReplace error: ${da.status}`)
     }
 
     async fetchPluginStorageSidecar(): Promise<any | null> {

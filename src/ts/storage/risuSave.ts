@@ -896,11 +896,29 @@ export class RisuSavePatcher {
         return this.lastSyncedDb?.[key]
     }
 
+    // Replace inline pluginCustomStorage with the directory marker, in place, when
+    // the sidecar write layout is on. Mirrors chatToStub: the heavy payload (the
+    // per-key values) travels out-of-band (per-key delta POST, like chat bodies),
+    // so the patch diff only ever sees the tiny {version, keys} directory — the
+    // whole-store re-serialization that made saves spike is gone. Applied to BOTH
+    // the baseline (init) and the current root (set) so the diff is marker-vs-
+    // marker. No-op while the flag is off (inline stays, byte-identical to today).
+    private stubPluginStorageInPlace(root: any) {
+        if (!isPluginStorageSidecarWriteEnabled()) return
+        if (!root || typeof root !== 'object' || !Object.hasOwn(root, 'pluginCustomStorage')) return
+        root[PLUGIN_STORAGE_SIDECAR_MARKER] = buildPluginStorageDirectory(root.pluginCustomStorage)
+        delete root.pluginCustomStorage
+    }
+
     async init(data: any) {
         this.lastSyncedDb = normalizeJSON(data);
         if (!Array.isArray(this.lastSyncedDb.characters)) {
             this.lastSyncedDb.characters = [];
         }
+        // Baseline holds the marker (not the inline map) when the sidecar layout is
+        // on, so per-key baselines below seed from the directory and the diff stays
+        // marker-vs-marker. Before hashBlocks so pluginCustomStorage never hashes.
+        this.stubPluginStorageInPlace(this.lastSyncedDb);
         this.hashBlocks = {};
 
         const keys = Object.keys(this.lastSyncedDb)
@@ -965,6 +983,12 @@ export class RisuSavePatcher {
             modules: curModules,
             ...curRoot
         } = data
+
+        // Current root mirrors the baseline: when the sidecar layout is on, diff the
+        // directory marker, not the inline map. curRoot is a fresh rest-copy, so the
+        // live `data.pluginCustomStorage` is untouched (values still ride the
+        // out-of-band per-key delta POST). No-op while the flag is off.
+        this.stubPluginStorageInPlace(curRoot)
 
         // Per-KEY cheap pre-check over the root. While typing into a root field
         // (e.g. personaPrompt) the root changes on every save, so a whole-root
