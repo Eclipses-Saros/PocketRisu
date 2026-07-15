@@ -2097,6 +2097,17 @@ function listColdStorageBackupEntries() {
     });
 }
 
+// Backup entry for the pluginCustomStorage sidecar (B inc 3f). Returns null when
+// no live sidecar exists → inert while the write-enable flag is off (backups then
+// look exactly as before). When present, it rides the backup like the DB blob and
+// maps back via resolveBackupStorageKey on import/restore.
+function pluginStorageBackupEntry() {
+    const size = kvSize(PLUGIN_STORAGE_SIDECAR_KEY) || 0;
+    return size > 0
+        ? { kind: 'kv', key: PLUGIN_STORAGE_SIDECAR_KEY, backupName: 'pluginStorage.risudat', sortKey: 'pluginStorage.risudat', size }
+        : null;
+}
+
 function resolveBackupStorageKey(name) {
     if (Buffer.byteLength(name, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
         throw new Error(`Backup entry name too long: ${name.slice(0, 64)}`);
@@ -2104,6 +2115,10 @@ function resolveBackupStorageKey(name) {
 
     if (name === 'database.risudat') {
         return 'database/database.bin';
+    }
+
+    if (name === 'pluginStorage.risudat') {
+        return PLUGIN_STORAGE_SIDECAR_KEY;
     }
 
     if (
@@ -3978,6 +3993,13 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+        // Carry the pluginCustomStorage sidecar in nodeonly backups (feeds both
+        // content-length and the stream below). Upstream target re-inlines it
+        // separately (a later exit), since upstream can't read our sidecar.
+        if (target !== 'upstream') {
+            const pse = pluginStorageBackupEntry();
+            if (pse) namespacedEntries.push(pse);
+        }
         const dbSize = kvSize('database/database.bin');
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
@@ -4215,6 +4237,11 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries,
         ];
+        // Carry the pluginCustomStorage sidecar in server backups too (inert when absent).
+        {
+            const pse = pluginStorageBackupEntry();
+            if (pse) namespacedEntries.push(pse);
+        }
 
         const totalEntries = namespacedEntries.length + 1; // +1 for database
         const totalBytes = namespacedEntries.reduce((sum, e) => sum + e.size, 0);
