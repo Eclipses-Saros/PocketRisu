@@ -873,6 +873,15 @@ export class RisuSavePatcher {
         return (rootHash >>> 0).toString(16);
     }
 
+    // Last server-synced (normalized) value of a root key. Read BEFORE set()
+    // advances the baseline — the conflict rebase uses it to tell "this tab
+    // changed key K" from "this tab holds a stale copy of K", so a 409 merge
+    // overlays only genuinely-changed keys instead of clobbering the server's
+    // concurrent edits. Returns a live reference; callers must clone.
+    getSyncedRootKey(key: string): any {
+        return this.lastSyncedDb?.[key]
+    }
+
     async init(data: any) {
         this.lastSyncedDb = normalizeJSON(data);
         if (!Array.isArray(this.lastSyncedDb.characters)) {
