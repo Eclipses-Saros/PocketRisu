@@ -11,6 +11,7 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
+import { hydratePluginCustomStorage } from "./storage/pluginStorageSidecar";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -54,6 +55,7 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
+                    await hydratePluginCustomStorage(decoded)
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -66,6 +68,7 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
+                            await hydratePluginCustomStorage(backupDecoded)
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true
