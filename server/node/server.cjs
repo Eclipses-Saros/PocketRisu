@@ -6201,6 +6201,14 @@ async function startServer() {
                 console.log(`[Server] http://localhost:${port}/`);
             });
         }
+
+        // Node closes idle keep-alive sockets after 5s by default. Safari
+        // silently retries a POST whose reused socket died before any
+        // response bytes arrived, which duplicates /proxy2 LLM requests.
+        // Keep sockets open longer than a browser would reasonably reuse
+        // them (headersTimeout must exceed keepAliveTimeout).
+        server.keepAliveTimeout = 65000;
+        server.headersTimeout = 66000;
     } catch (error) {
         logger.error('[Server] Failed to start server :', error);
         process.exit(1);
