@@ -34,6 +34,15 @@ interface AbortSignalRef {
     aborted: boolean;
 }
 
+// WebKit (Safari <= 26) throws DataCloneError when a ReadableStream/
+// WritableStream/TransformStream is transferred through postMessage
+// (WebKit bug 215485). Chromium/Firefox transfer them fine. Safari 27
+// adds native transferable-stream support, so this can be version-gated
+// away once Safari <= 26 is out of scope.
+const isWebKit = typeof navigator !== 'undefined'
+    && /Safari/.test(navigator.userAgent)
+    && !/Chrome|Chromium/.test(navigator.userAgent);
+
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
@@ -557,7 +566,6 @@ export class SandboxHost {
                     // WebKit on iOS fails when Response.body (ReadableStream)
                     // is transferred through postMessage. Pre-read into an
                     // ArrayBuffer (preserves binary data) and send that instead.
-                    const isWebKit = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium/.test(navigator.userAgent);
                     if (isWebKit && result instanceof Response && result.body) {
                         try {
                             const buf = await result.arrayBuffer();
@@ -584,11 +592,32 @@ export class SandboxHost {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                const transferables = this.collectTransferables(response);
+                let transferables = this.collectTransferables(response);
+
+                // Top-level Response bodies are pre-read into an ArrayBuffer
+                // above, so a stream surviving into the transfer list here means
+                // a host API returned a bare or nested ReadableStream/
+                // WritableStream/TransformStream. WebKit (Safari <= 26) would
+                // reject the postMessage with an opaque "DataCloneError: The
+                // object can not be cloned." Fail with a diagnostic that names
+                // the offending method instead. WritableStream/TransformStream
+                // cannot be pre-read, so this is the only safe outcome there.
+                if (isWebKit && !response.error) {
+                    const streamed = transferables.find(t =>
+                        t instanceof ReadableStream
+                        || t instanceof WritableStream
+                        || t instanceof TransformStream);
+                    if (streamed) {
+                        response.result = undefined;
+                        response.error = `WebKit (Safari <= 26) cannot transfer ${streamed.constructor.name} through postMessage (WebKit bug 215485). API "${data.method}" returned a stream; return a Response or ArrayBuffer instead, or gate the feature on Safari 27+.`;
+                        transferables = [];
+                    }
+                }
+
                 console.log("Original request:", data);
                 console.log('Original response:', response, transferables);
                 try {
-                    this.iframe.contentWindow?.postMessage(response, '*', transferables);                    
+                    this.iframe.contentWindow?.postMessage(response, '*', transferables);
                 } catch (error) {
                     this.iframe.contentWindow?.postMessage({
                         type: 'RESPONSE',
