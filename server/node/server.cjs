@@ -2526,6 +2526,55 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
     }
 }
 
+// Safari (CFNetwork) kills a connection after ~60s without receiving any
+// bytes, which cuts SSE streams during long silent gaps (e.g. reasoning
+// models thinking). Pipe the upstream SSE body manually and emit an SSE
+// comment line while idle. Comments are only injected right after a
+// newline so a chunk split mid-line can never be corrupted; a single
+// "\n"-terminated comment line cannot terminate a pending event either.
+const SSE_KEEPALIVE_IDLE_MS = 20000;
+async function pipeSseWithKeepalive(body, res) {
+    const reader = body.getReader();
+    let endedWithNewline = true;
+    let timer = null;
+    const armTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            if (endedWithNewline && !res.writableEnded && !res.destroyed) {
+                res.write(': risu-keepalive\n');
+            }
+            armTimer();
+        }, SSE_KEEPALIVE_IDLE_MS);
+        timer.unref?.();
+    };
+    const onClose = () => {
+        reader.cancel().catch(() => {});
+    };
+    res.on('close', onClose);
+    armTimer();
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (value?.length) {
+                endedWithNewline = value[value.length - 1] === 0x0a;
+                if (!res.write(value)) {
+                    await new Promise((resolve) => res.once('drain', resolve));
+                }
+            }
+            armTimer();
+        }
+        if (!res.writableEnded && !res.destroyed) {
+            res.end();
+        }
+    } finally {
+        clearTimeout(timer);
+        res.off('close', onClose);
+    }
+}
+
 const reverseProxyFunc = async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -2603,7 +2652,13 @@ const reverseProxyFunc = async (req, res, next) => {
         // send response status to client
         res.status(originalResponse.status);
         // send response body to client
-        await pipeline(originalResponse.body, res);
+        if ((head.get('content-type') ?? '').includes('text/event-stream')) {
+            res.flushHeaders();
+            await pipeSseWithKeepalive(originalBody, res);
+        }
+        else {
+            await pipeline(originalResponse.body, res);
+        }
 
 
     }
