@@ -31,7 +31,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
 // Server home for the pluginCustomStorage sidecar (a dedicated KV key, outside
 // database.bin). Durable: kvSet is synchronous SQLite, so a write is durable
@@ -4000,7 +4000,23 @@ app.get('/api/backup/export', async (req, res, next) => {
             const pse = pluginStorageBackupEntry();
             if (pse) namespacedEntries.push(pse);
         }
-        const dbSize = kvSize('database/database.bin');
+        // Upstream target can't read our sidecar, so re-inline pluginCustomStorage
+        // into database.risudat (decode → hydrate from sidecar → re-encode inline).
+        // Compute the exact export buffer up front so content-length is correct.
+        // Inert for nodeonly and for flag-off DBs (no marker → raw blob unchanged).
+        let dbExportBuffer = kvGet('database/database.bin');
+        if (target === 'upstream' && dbExportBuffer) {
+            try {
+                const decoded = normalizeJSON(await decodeRisuSave(dbExportBuffer));
+                if (decoded && decoded[PLUGIN_STORAGE_SIDECAR_MARKER]) {
+                    await hydratePluginCustomStorageServer(decoded, pluginStorageSidecarStore.loader);
+                    dbExportBuffer = Buffer.from(encodeRisuSaveLegacy(decoded));
+                }
+            } catch (e) {
+                logger.warn('[Export] upstream re-inline of pluginCustomStorage failed:', e?.message || e);
+            }
+        }
+        const dbSize = dbExportBuffer ? dbExportBuffer.length : 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
@@ -4045,7 +4061,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = kvGet('database/database.bin');
+            const dbValue = dbExportBuffer;
             if (dbValue) {
                 const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
                 if (!ok) {

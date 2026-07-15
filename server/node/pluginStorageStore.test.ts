@@ -3,7 +3,7 @@ import store from './pluginStorageStore.cjs'
 import utils from './utils.cjs'
 
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = store as any
-const { hydratePluginCustomStorageServer, PLUGIN_STORAGE_SIDECAR_MARKER, encodeRisuSaveLegacy, decodeRisuSave } = utils as any
+const { hydratePluginCustomStorageServer, PLUGIN_STORAGE_SIDECAR_MARKER, encodeRisuSaveLegacy, decodeRisuSave, normalizeJSON } = utils as any
 
 // Minimal in-memory kv matching the store's interface (Buffer values).
 function fakeKv() {
@@ -84,6 +84,27 @@ describe('pluginStorageStore — server sidecar store (inc 3c-i)', () => {
     it('rejects a bad kv interface', () => {
         expect(() => createPluginStorageSidecarStore(null as any)).toThrow(/kv/i)
         expect(() => createPluginStorageSidecarStore({} as any)).toThrow(/kv/i)
+    })
+
+    // exit 3 core transform: upstream export re-inlines a marker DB from the sidecar.
+    // decode(markerBlob) → hydrate(from store) → encode → the exported blob decodes
+    // back with inline pluginCustomStorage and NO marker (upstream can read it).
+    it('upstream re-inline transform: marker DB + sidecar → inline DB blob (no marker)', async () => {
+        const kv = fakeKv()
+        const s = createPluginStorageSidecarStore(kv)
+        const pcs = makePcs()
+        s.write(clone(pcs))
+        // A marker-layout DB blob (no inline pcs, carries the directory marker).
+        const markerDb: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { version: 1, keys: Object.keys(pcs) } }
+        const markerBlob = encodeRisuSaveLegacy(markerDb)
+        // Re-inline (what /api/backup/export does for target=upstream).
+        const decoded = normalizeJSON(await decodeRisuSave(markerBlob))
+        await hydratePluginCustomStorageServer(decoded, s.loader)
+        const inlineBlob = Buffer.from(encodeRisuSaveLegacy(decoded))
+        // The exported blob decodes with inline pcs and no marker.
+        const back = normalizeJSON(await decodeRisuSave(inlineBlob))
+        expect(JSON.stringify(back.pluginCustomStorage)).toBe(JSON.stringify(pcs))
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
     })
 
     // Endpoint wire-format contract (proven without booting express): the bytes a
