@@ -28,7 +28,7 @@ vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
 const { RisuSavePatcher, encodeRisuSaveLegacy, decodeRisuSave } = await import('./risuSave')
-const { setPluginStorageSidecarWriteEnabled, buildPluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER } = await import('./pluginStorageSidecar')
+const { setPluginStorageSidecarWriteEnabled, buildPluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER, hydratePluginCustomStorage } = await import('./pluginStorageSidecar')
 
 const SERVER_CJS = nodePath.resolve(__dirname, '../../../server/node/server.cjs')
 const PORT = 6788
@@ -204,6 +204,65 @@ describe('pluginCustomStorage patch-sync — REAL server (codex BLOCKER 1)', () 
         const after = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
         expect(after.A).toBe('a0')   // reverted (per-key snapshot restored)
         expect(after.B).toBe('b0')
+    })
+
+    it('ORPHAN DROP: a marker-only delete stays deleted on reload (real server GET + client hydrate)', async () => {
+        if (!booted) { console.warn('server not booted — skipping'); return }
+        // seed per-key {A,B}; the server GET (readAll) will keep returning B as an
+        // orphan after we "delete" it by shrinking the marker to [A] only.
+        await fetch(`${BASE}/api/plugin-storage`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { A: 'a', B: 'b' } })),
+        })
+        // client loads a DB whose marker lists ONLY A (B was marker-only-deleted).
+        const markerDb: any = { formatversion: 4, characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory({ A: 'a' }) }
+        // the real client hydrate fetches the server map (which still has orphan B) …
+        const serverMap = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
+        expect(serverMap.B).toBe('b') // orphan is still stored server-side
+        await hydratePluginCustomStorage(markerDb, async () => serverMap)
+        // … but hydration filters to marker.keys → B does NOT resurrect.
+        expect(markerDb.pluginCustomStorage).toEqual({ A: 'a' })
+        expect('B' in markerDb.pluginCustomStorage).toBe(false)
+    })
+
+    it('KEY-SET CONCURRENCY: two tabs adding DIFFERENT new keys both land, rebuilt marker = union', async () => {
+        if (!booted) { console.warn('server not booted — skipping'); return }
+        await fetch(`${BASE}/api/plugin-storage`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { base: 'b' } })),
+        })
+        const post = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy(env)),
+        }).then((r) => r.status)
+        // two independent tabs add different NEW keys concurrently
+        const [s1, s2] = await Promise.all([
+            post({ type: 'delta', changed: { X: 'x' }, removed: [] }),
+            post({ type: 'delta', changed: { Y: 'y' }, removed: [] }),
+        ])
+        expect(s1).toBe(200); expect(s2).toBe(200)
+        // both adds landed per-key (neither clobbered) …
+        const serverMap = (await decodeRisuSave(new Uint8Array(await (await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })).arrayBuffer()))).pluginCustomStorage
+        expect(serverMap).toEqual({ base: 'b', X: 'x', Y: 'y' })
+        // … so the marker a rebase rebuilds from the server map is the UNION (neither
+        // key dropped — the failure the 409→rebase routing prevents).
+        expect(buildPluginStorageDirectory(serverMap).keys).toEqual(['X', 'Y', 'base'])
+    })
+
+    it('BACKSTOP: server refuses to persist a marker referencing a value not in the per-key store', async () => {
+        if (!booted) { console.warn('server not booted — skipping'); return }
+        // per-key has ONLY A; a marker claiming [A,B] would be a dangling marker.
+        await fetch(`${BASE}/api/plugin-storage`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy({ type: 'replace', values: { A: 'a' } })),
+        })
+        const danglingDb: any = { formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [],
+            [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory({ A: 'a', B: 'b' }) } // B absent from per-key
+        const w = await fetch(`${BASE}/api/write`, {
+            method: 'POST', headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/octet-stream' }),
+            body: Buffer.from(encodeRisuSaveLegacy(danglingDb)),
+        })
+        expect(w.status).toBe(500) // rejected, not silently persisted
     })
 
     it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {

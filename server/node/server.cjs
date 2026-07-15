@@ -44,6 +44,21 @@ const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.c
 //   live read/write path (hydrate + endpoints) uses the per-key store below.
 const pluginStorageSidecarStore = createPluginStorageSidecarStore({ get: kvGet, set: kvSet, del: kvDel });
 const pluginStoragePerKeyStore = createPluginStoragePerKeyStore({ get: kvGet, set: kvSet, del: kvDel, listPrefix: kvList });
+
+// Backstop: never persist a database.bin whose pluginCustomStorage marker lists a
+// key that is NOT in the per-key store — a dangling marker reads back fail-closed
+// (lost memory). Values are POSTed (delta/replace) before the database.bin write,
+// so in the correct flow every marker key is present; this catches a client that
+// mis-seeded or skipped the migration and turns silent loss into a loud abort.
+function assertPerKeyCoversMarker(dbObj) {
+    const dir = (dbObj && typeof dbObj === 'object') ? dbObj[PLUGIN_STORAGE_SIDECAR_MARKER] : null;
+    if (!dir || !Array.isArray(dir.keys) || dir.keys.length === 0) return;
+    const have = new Set(pluginStoragePerKeyStore.listKeys() || []);
+    const missing = dir.keys.filter((k) => !have.has(k));
+    if (missing.length) {
+        throw new Error(`refusing to persist a pluginCustomStorage marker with ${missing.length} value(s) absent from the per-key store (dangling marker would lose memory). sample=${missing.slice(0, 3).join(',')}`);
+    }
+}
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -736,6 +751,16 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
         }
     }
 
+    // Dangling-marker backstop (only meaningful for the main DB blob).
+    if (decodedKey === 'database/database.bin') {
+        try {
+            assertPerKeyCoversMarker(fullDb);
+        } catch (err) {
+            recordPersistFailure(err, 'persistDbCacheWithChats:dangling-marker');
+            delete dbCache[filePath];
+            throw err;
+        }
+    }
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
     try {
         kvSet(decodedKey, data);
@@ -3659,6 +3684,7 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
+                    assertPerKeyCoversMarker(fullDb); // dangling-marker backstop (throws → caught below, disk preserved)
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
                     // Re-init chat store from merged result
                     initChatStore(fullDb);

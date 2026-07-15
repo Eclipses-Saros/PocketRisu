@@ -15,7 +15,7 @@ import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEnc
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
-import { isPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER } from "./storage/pluginStorageSidecar";
+import { isPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER, resolvePluginCustomStorageByDirectory } from "./storage/pluginStorageSidecar";
 import { seedPluginStorageBaseline, computePluginStorageDelta, advancePluginStorageBaseline, pluginStorageDeltaIsEmpty, type PluginStorageBaseline } from "./storage/pluginStorageDelta";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -749,15 +749,20 @@ export async function saveDb() {
                 // marker layout: plugin VALUES are per-key on the server and were
                 // already applied (this tab's delta POST runs BEFORE the database.bin
                 // write that 409'd, and per-key writes don't clobber). So the server's
-                // per-key map is ALREADY the correct merge of every tab's edits — take
-                // it as truth. Give the merged DB the inline map (for plugins + the next
-                // fingerprint baseline) and drop the marker (the encoder re-stubs it on
-                // save). No inline overlay: the values never rode database.bin here.
-                let serverMap: Record<string, any> = {}
-                try { serverMap = (await forageStorage.realStorage.fetchPluginStorageSidecar()) ?? {} } catch { serverMap = {} }
-                ;(mergedDb as any).pluginCustomStorage = serverMap
+                // per-key state is ALREADY the merge of every tab's edits — take it as
+                // truth, but read it MARKER-AUTHORITATIVELY: the latest server DB's
+                // marker is the allowlist, so orphans (marker-only-deleted keys still
+                // stored per-key) do NOT resurrect, and a missing value FAILS CLOSED.
+                let fetched: unknown
+                try { fetched = await forageStorage.realStorage.fetchPluginStorageSidecar() }
+                catch (e) { throw new Error(`409 rebase: failed to fetch server pluginCustomStorage — aborting to avoid clobbering with empty: ${e}`) }
+                const latestMarker = (mergedDb as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
+                const mergedPcs = latestMarker
+                    ? resolvePluginCustomStorageByDirectory(latestMarker, fetched)   // exactly the server marker's keys
+                    : ((mergedDb.pluginCustomStorage ?? {}) as Record<string, any>)  // server DB is legacy inline
+                ;(mergedDb as any).pluginCustomStorage = mergedPcs
                 delete (mergedDb as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
-                resyncPluginStorageBaseline(serverMap)
+                resyncPluginStorageBaseline(mergedPcs)
             } else if (toSave.pluginCustomStorage) {
                 const serverPS = (mergedDb.pluginCustomStorage ?? {}) as Record<string, any>
                 const localPS = (localDb.pluginCustomStorage ?? {}) as Record<string, any>
@@ -1101,6 +1106,17 @@ export async function saveDb() {
                 if (patchResult.chatGuardRejected) {
                     console.error('[Save] Server rejected patch — chat-internal field ops detected server-side')
                     showChatGuardToastThrottled('server')
+                }
+                // PURE hash/etag conflict (a concurrent tab moved the DB on): REBASE
+                // now. Do NOT fall through to the full write below — patchItem already
+                // advanced the cached etag to the server's, so a full write would
+                // SUCCEED and clobber the concurrent change (e.g. drop a key another
+                // tab just added from the authoritative marker). Rebase merges instead.
+                else if (!saved && patchResult.etag) {
+                    console.warn('[Save] Patch hash/etag conflict — rebasing on latest server DB (no stale full-write)')
+                    await rebaseTrackedLocalChangesOnLatestServerDb(patchResult.etag ?? null, db, toSave, pluginStorageBaseline)
+                    await sleep(Math.min(500 * (savetrys + 1), 3000))
+                    return 'retry'
                 }
             }
         }

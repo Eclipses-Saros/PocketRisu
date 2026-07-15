@@ -63,14 +63,14 @@ export function buildPluginStorageDirectory(pluginCustomStorage: Record<string, 
 // as "empty" would silently drop plugin memory. Returns the validated key list.
 export function validatePluginStorageDirectory(directory: unknown): string[] {
     if (!directory || typeof directory !== 'object') {
-        throw new Error('pluginCustomStorage directory marker malformed (not an object) — failing closed')
+        throw new Error('pluginCustomStorage directory marker malformed (not an object) — fail closed')
     }
     const d = directory as { version?: unknown, keys?: unknown }
     if (d.version !== PLUGIN_STORAGE_LAYOUT_VERSION) {
-        throw new Error(`pluginCustomStorage directory marker version ${String(d.version)} unrecognized (expected ${PLUGIN_STORAGE_LAYOUT_VERSION}) — failing closed`)
+        throw new Error(`pluginCustomStorage directory marker version ${String(d.version)} unrecognized (expected ${PLUGIN_STORAGE_LAYOUT_VERSION}) — fail closed`)
     }
     if (!Array.isArray(d.keys) || !d.keys.every((k) => typeof k === 'string')) {
-        throw new Error('pluginCustomStorage directory marker keys missing or not a string[] — failing closed')
+        throw new Error('pluginCustomStorage directory marker keys missing or not a string[] — fail closed')
     }
     return d.keys as string[]
 }
@@ -93,31 +93,48 @@ export function resolvePluginCustomStorage(args: {
     throw new Error('pluginCustomStorage sidecar expected by directory marker but missing — refusing to report empty (fail closed)')
 }
 
-// Sidecar payload loader. Stub for increment 2: no sidecar store exists yet, so
-// it always reports "absent". Increment 3 implements the real read; until then a
-// present directory marker with this returning null trips the fail-closed guard,
-// which is exactly the safety we want if a new-layout DB ever appears early.
+// MARKER-AUTHORITATIVE resolver: the directory's key list is the allowlist. Build
+// the map from EXACTLY those keys out of whatever the loader fetched (which may
+// include orphans — values of deleted keys that linger per-key). Orphans are
+// dropped (not in the marker) so a marker-only delete stays deleted on reload. A
+// listed key missing from the fetched payload FAILS CLOSED — never silently short.
+export function resolvePluginCustomStorageByDirectory(directory: unknown, fetched: unknown): Record<string, unknown> {
+    const keys = validatePluginStorageDirectory(directory) // throws on malformed / wrong-version
+    const out: Record<string, unknown> = {}
+    if (keys.length === 0) return out // legitimately empty — no fetch needed, never 404-fails
+    const map = (fetched && typeof fetched === 'object') ? fetched as Record<string, unknown> : null
+    for (const k of keys) {
+        if (!map || !Object.hasOwn(map, k)) {
+            throw new Error(`pluginCustomStorage directory lists "${k}" but the sidecar payload is missing it — fail closed (no silent memory loss)`)
+        }
+        out[k] = (map as any)[k]
+    }
+    return out
+}
+
+// Sidecar payload loader. Default stub: no sidecar available → "absent" (null). The
+// real client loader (GET /api/plugin-storage) is injected at boot. A directory
+// marker with this returning null trips fail-closed, the safe outcome.
 export async function loadPluginStorageSidecar(_directory: unknown): Promise<unknown | null> {
     return null
 }
 
-// Load-path hydration, wired into the DB decode path. Inert today: no decoded DB
-// carries the marker, so this returns `db` unchanged (pluginCustomStorage stays
-// exactly as decoded). When a real sidecar layout arrives (increment 3+), it
-// resolves pluginCustomStorage from the sidecar and strips the marker.
+// Load-path hydration. Legacy layout (no marker) → returns db unchanged (inline
+// pcs stays). Marker layout → resolves pcs from the sidecar, filtered to EXACTLY
+// the marker's keys (orphans excluded, missing → fail closed), and strips the
+// marker. An empty marker resolves to {} without any fetch (so a zero-key store
+// never 404-fails boot).
 export async function hydratePluginCustomStorage<T extends Record<string, any>>(
     db: T,
     loader: (directory: unknown) => Promise<unknown | null> = loadPluginStorageSidecar,
 ): Promise<T> {
     if (!db || typeof db !== 'object') return db
-    const hasSidecarDirectory = !!(db as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
-    if (!hasSidecarDirectory) return db
-    const sidecar = await loader((db as any)[PLUGIN_STORAGE_SIDECAR_MARKER])
-    ;(db as any).pluginCustomStorage = resolvePluginCustomStorage({
-        inline: (db as any).pluginCustomStorage,
-        sidecar,
-        hasSidecarDirectory: true,
-    })
+    const directory = (db as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
+    if (!directory) return db
+    const keys = validatePluginStorageDirectory(directory)
+    // Only fetch when the marker actually references keys.
+    const fetched = keys.length === 0 ? {} : await loader(directory)
+    ;(db as any).pluginCustomStorage = resolvePluginCustomStorageByDirectory(directory, fetched)
     delete (db as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
     return db
 }

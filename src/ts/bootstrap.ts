@@ -11,7 +11,7 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
-import { hydratePluginCustomStorage, setPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
+import { hydratePluginCustomStorage, setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled, PLUGIN_STORAGE_SIDECAR_MARKER } from "./storage/pluginStorageSidecar";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -70,8 +70,16 @@ export async function loadData() {
                     // pluginStorageSidecar.ts stays dependency-free (no import cycle
                     // with globalApi). Inert while the write-enable flag is off (no
                     // decoded DB carries the marker, so the loader is never invoked).
-                    await hydratePluginCustomStorage(decoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
-                    resyncPluginStorageBaseline(decoded.pluginCustomStorage)
+                    {
+                        const hadMarker = !!(decoded as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
+                        await hydratePluginCustomStorage(decoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
+                        // Legacy inline DB + write flag ON = pre-migration: the server
+                        // per-key store is empty, so seed the baseline EMPTY → the first
+                        // save's delta is EVERY key, migrating the whole inline map before
+                        // any marker references it (no dangling marker). Marker DB → seed
+                        // from the resolved (server-authoritative) map. Flag off → inert.
+                        resyncPluginStorageBaseline((isPluginStorageSidecarWriteEnabled() && !hadMarker) ? {} : decoded.pluginCustomStorage)
+                    }
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -84,8 +92,9 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
+                            const hadMarkerB = !!(backupDecoded as any)[PLUGIN_STORAGE_SIDECAR_MARKER]
                             await hydratePluginCustomStorage(backupDecoded, () => forageStorage.realStorage.fetchPluginStorageSidecar())
-                            resyncPluginStorageBaseline(backupDecoded.pluginCustomStorage)
+                            resyncPluginStorageBaseline((isPluginStorageSidecarWriteEnabled() && !hadMarkerB) ? {} : backupDecoded.pluginCustomStorage)
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true

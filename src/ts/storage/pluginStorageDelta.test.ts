@@ -1,19 +1,11 @@
-import { describe, it, expect, vi } from 'vitest'
-
-// pluginStorageDelta imports calculateHash from ./risuSave, which transitively
-// pulls in database.svelte's Svelte runes. Mock the heavy deps (same as
-// pluginStorageSaveCost.test.ts) so the import stays pure in the test runtime.
-// In production globalApi already imports risuSave, so no new coupling.
-vi.mock('./database.svelte', () => ({}))
-vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
-vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
-
-const {
+import { describe, it, expect } from 'vitest'
+// Self-contained now (no risuSave/Svelte import) → no mocks needed.
+import {
     seedPluginStorageBaseline,
     computePluginStorageDelta,
     advancePluginStorageBaseline,
     pluginStorageDeltaIsEmpty,
-} = await import('./pluginStorageDelta')
+} from './pluginStorageDelta'
 
 describe('pluginStorageDelta — per-key delta without a resident copy (C3)', () => {
     it('no change → empty delta', () => {
@@ -72,5 +64,39 @@ describe('pluginStorageDelta — per-key delta without a resident copy (C3)', ()
         const d = computePluginStorageDelta({}, base)
         expect(Object.keys(d.changed)).toEqual([])
         expect(d.removed.sort()).toEqual(['a', 'b', 'c'])
+    })
+
+    // B4: the OLD 32-bit order-independent object hash collided ({a:1,b:2} vs
+    // {a:2,b:1}) → a real value change was suppressed → server kept stale. The
+    // content-string digest must DETECT this.
+    it('detects order-swapped object values (no hash collision → no silent staleness)', () => {
+        const base = seedPluginStorageBaseline({ k: { a: 1, b: 2 } })
+        const d = computePluginStorageDelta({ k: { a: 2, b: 1 } }, base)
+        expect(Object.keys(d.changed)).toEqual(['k'])
+        expect(JSON.stringify(d.changed.k)).toBe(JSON.stringify({ a: 2, b: 1 }))
+    })
+
+    it('distinguishes values that differ only in type/shape (1 vs "1", [] vs {})', () => {
+        const base = seedPluginStorageBaseline({ n: 1, e: [] })
+        const d = computePluginStorageDelta({ n: '1', e: {} }, base)
+        expect(Object.keys(d.changed).sort()).toEqual(['e', 'n'])
+    })
+
+    it('changed map is null-prototype: a "__proto__" key becomes an OWN entry, no pollution', () => {
+        const base = seedPluginStorageBaseline({})
+        const cur: Record<string, any> = {}
+        Object.defineProperty(cur, '__proto__', { value: 'evil', enumerable: true, configurable: true, writable: true })
+        const d = computePluginStorageDelta(cur, base)
+        expect(Object.hasOwn(d.changed, '__proto__')).toBe(true)
+        expect(Object.getPrototypeOf(d.changed)).toBeNull()
+        expect(({} as any).evil).toBeUndefined() // global prototype not polluted
+    })
+
+    it('snapshots object values at compute time (later mutation does not change the delta)', () => {
+        const obj: any = { n: 1 }
+        const base = seedPluginStorageBaseline({ k: { n: 0 } })
+        const d = computePluginStorageDelta({ k: obj }, base)
+        obj.n = 999 // plugin mutates the live value after we computed the delta
+        expect(d.changed.k.n).toBe(1) // delta holds the compute-time snapshot
     })
 })
