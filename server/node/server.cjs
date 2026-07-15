@@ -32,7 +32,7 @@ const {
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved } = require('./utils.cjs');
-const { createPluginStorageSidecarStore } = require('./pluginStorageStore.cjs');
+const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
 // Server home for the pluginCustomStorage sidecar (a dedicated KV key, outside
 // database.bin). Durable: kvSet is synchronous SQLite, so a write is durable
 // before the endpoint ACKs. Dormant until the client write-enable POSTs a payload.
@@ -185,7 +185,10 @@ function trimSnapshotsToLimits() {
             toDelete.push(e.key);
         }
     }
-    for (const key of toDelete) kvDel(key);
+    for (const key of toDelete) {
+        kvDel(key);
+        kvDel(sidecarSnapshotKeyFor(key)); // evict the paired sidecar snapshot too (no-op if absent)
+    }
     return { kept: entries.length - toDelete.length, removed: toDelete.length };
 }
 
@@ -215,6 +218,11 @@ function createBackupAndRotate() {
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
     kvCopyValue('database/database.bin', backupKey);
+    // Pair the sidecar into the snapshot so a sidecar-layout DB restores intact.
+    // Guarded: only when a live sidecar exists (inert while the flag is off).
+    if (kvGet(PLUGIN_STORAGE_SIDECAR_KEY)) {
+        kvCopyValue(PLUGIN_STORAGE_SIDECAR_KEY, sidecarSnapshotKeyFor(backupKey));
+    }
     trimSnapshotsToLimits();
 }
 
@@ -5009,6 +5017,15 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
+// Paired sidecar snapshot for each DB snapshot (B inc 3f). A snapshot of a
+// sidecar-layout DB must capture the sidecar too, or restoring it yields a
+// marker DB with no sidecar (fail-closed / lost plugin memory). Distinct prefix
+// so DB-snapshot enumeration/sizing/rotation is untouched; paired by timestamp.
+// Guarded everywhere on the live sidecar existing → inert while the write-enable
+// flag is off (no sidecar key exists, so nothing is paired).
+const DB_SIDECAR_BACKUP_PREFIX = 'database/pluginStorage-dbbackup-';
+const sidecarSnapshotKeyFor = (dbSnapshotKey) =>
+    DB_SIDECAR_BACKUP_PREFIX + String(dbSnapshotKey).slice(DB_BACKUP_PREFIX.length);
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
 
 function statsBasename(s) {
@@ -5548,6 +5565,7 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         kvDel(key);
+        kvDel(sidecarSnapshotKeyFor(key)); // drop the paired sidecar snapshot too
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5574,6 +5592,13 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
             kvCopyValue(key, DB_BLOB_KEY);
+            // Restore the paired sidecar so a sidecar-layout snapshot comes back
+            // as a consistent (database.bin + sidecar) pair. If the snapshot has
+            // no paired sidecar (taken in the legacy inline layout), leave the
+            // live sidecar untouched — that DB carries no marker, so inline wins.
+            if (kvGet(sidecarSnapshotKeyFor(key))) {
+                kvCopyValue(sidecarSnapshotKeyFor(key), PLUGIN_STORAGE_SIDECAR_KEY);
+            }
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
