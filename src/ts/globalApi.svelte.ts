@@ -2099,21 +2099,45 @@ export async function fetchNative(url: string, arg: {
             })
         }
 
-        // Try direct fetch first (upstream behavior), fall back to proxy on CORS/network error
-        try {
+        // usePlainFetch: user explicitly opted into direct fetch — no proxy fallback
+        if (!throughProxy) {
             return await fetch(url, {
                 body: realBody as any,
                 headers: headers,
                 method: arg.method,
                 signal: requestSignal,
             })
-        } catch (e) {
-            if (requestSignal?.aborted) throw e
-            return await fetchViaProxy2(url, headers, realBody, {
-                ...arg,
-                signal: requestSignal
-            })
         }
+
+        // Bodyless requests are safe to re-send, and localhost targets may be
+        // unreachable from the server: keep direct-first with proxy fallback.
+        if (realBody === undefined || knownHostes.includes(new URL(url).hostname)) {
+            try {
+                return await fetch(url, {
+                    body: realBody as any,
+                    headers: headers,
+                    method: arg.method,
+                    signal: requestSignal,
+                })
+            } catch (e) {
+                if (requestSignal?.aborted) throw e
+                return await fetchViaProxy2(url, headers, realBody, {
+                    ...arg,
+                    signal: requestSignal
+                })
+            }
+        }
+
+        // Bodyful requests (LLM generations) must never be auto re-sent after a
+        // failed direct attempt: Safari kills in-flight fetches (~60s without
+        // response bytes, tab backgrounding/screen lock on iOS) after the
+        // provider has already received the request, so a fallback re-send
+        // duplicates the generation and the billing. Route through the proxy
+        // from the start instead.
+        return await fetchViaProxy2(url, headers, realBody, {
+            ...arg,
+            signal: requestSignal
+        })
     } finally {
         timeoutSignal.cleanup()
     }
