@@ -752,6 +752,16 @@ export function getDatabase(options:getDatabaseOptions = {}):Database{
 }
 
 export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
+    // snapshot: clone ONLY the selected character, not the whole DB. The old
+    // `getDatabase({snapshot:true})` here deep-cloned every character, module,
+    // and pluginCustomStorage on each call just to return one character — pure
+    // waste that plugins amplify by calling it on every request/GUI open. The
+    // returned value is byte-identical; the sibling-DB clone was never
+    // observable through it.
+    if(options.snapshot){
+        const char = DBState.db.characters?.[get(selectedCharID)]
+        return char === undefined ? char : $state.snapshot(char) as character
+    }
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []
@@ -768,6 +778,11 @@ export function setCurrentCharacter(char:character){
 }
 
 export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}):character{
+    // snapshot: clone only the requested character (see getCurrentCharacter).
+    if(options.snapshot){
+        const char = DBState.db.characters?.[index]
+        return char === undefined ? char : $state.snapshot(char) as character
+    }
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []
