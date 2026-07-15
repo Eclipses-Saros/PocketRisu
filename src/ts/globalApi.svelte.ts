@@ -709,7 +709,7 @@ export async function saveDb() {
         }
     }
 
-    async function rebaseTrackedLocalChangesOnLatestServerDb(conflictEtag: string | null, db: Database, toSave: toSaveType) {
+    async function rebaseTrackedLocalChangesOnLatestServerDb(conflictEtag: string | null, db: Database, toSave: toSaveType, pluginStorageBaseline: Record<string, any> | null = null) {
         forageStorage.setDbEtag(conflictEtag ?? null)
         const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
         if (latestData && latestData.length > 0) {
@@ -732,6 +732,37 @@ export async function saveDb() {
             }
             if (toSave.modules) {
                 mergedDb.modules = safeStructuredClone(localDb.modules)
+            }
+            if (toSave.pluginCustomStorage) {
+                const serverPS = (mergedDb.pluginCustomStorage ?? {}) as Record<string, any>
+                const localPS = (localDb.pluginCustomStorage ?? {}) as Record<string, any>
+                if (pluginStorageBaseline) {
+                    // Baseline-diff overlay. Start from the latest server map, then
+                    // apply ONLY the keys this tab actually changed vs the baseline
+                    // it started from — so a concurrent tab's edits to OTHER keys
+                    // survive, instead of being reverted by this tab's stale copy.
+                    // Values are flat strings for the memory plugins, so equality is
+                    // exact; a locally-removed key becomes a real tombstone.
+                    const baseline = pluginStorageBaseline
+                    const merged: Record<string, any> = { ...serverPS }
+                    const sameValue = (a: any, b: any) => {
+                        if (a === b) return true
+                        try { return JSON.stringify(a) === JSON.stringify(b) } catch { return false }
+                    }
+                    for (const k of Object.keys(localPS)) {
+                        if (!(k in baseline) || !sameValue(baseline[k], localPS[k])) merged[k] = localPS[k]
+                    }
+                    for (const k of Object.keys(baseline)) {
+                        if (!(k in localPS)) delete merged[k]
+                    }
+                    mergedDb.pluginCustomStorage = merged
+                } else {
+                    // No baseline (non-patch-sync path): fall back to whole-map
+                    // local-wins. Keeps every local write; can revert a concurrent
+                    // server change to an unchanged local key — strictly better than
+                    // the old total-local-loss, and this path has no cheaper baseline.
+                    mergedDb.pluginCustomStorage = { ...serverPS, ...localPS }
+                }
             }
 
             const trackedCharIds = new Set<string>(toSave.character.filter(Boolean))
@@ -830,6 +861,13 @@ export async function saveDb() {
 
         let saved = false
         let newEtag: string | undefined
+
+        // Captured BEFORE patcher.set() advances the baseline optimistically:
+        // the server-synced pluginCustomStorage this attempt started from. A 409
+        // rebase diffs local against this to overlay only locally-changed keys.
+        const pluginStorageBaseline = (supportsPatchSync && toSave.pluginCustomStorage)
+            ? safeStructuredClone(patcher.getSyncedRootKey('pluginCustomStorage') ?? {})
+            : null
 
         if (supportsPatchSync && !options?.forceFullWrite) {
             const patchData = await patcher.set(db, safeStructuredClone(toSave))
@@ -1021,7 +1059,7 @@ export async function saveDb() {
             } catch (conflictErr) {
                 if (conflictErr instanceof ConflictError) {
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave, pluginStorageBaseline)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return 'retry'
                 }

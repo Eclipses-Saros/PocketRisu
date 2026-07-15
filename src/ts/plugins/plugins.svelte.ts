@@ -710,9 +710,13 @@ export const getV2PluginAPIs = () => {
         },
         pluginStorage: {
             getItem: (key: string) => {
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
+                // Snapshot only the requested value, never the whole database:
+                // a full-db $state.snapshot deep-clones every character/chat on
+                // EVERY read, and storage-heavy plugins read dozens of keys per
+                // request. Plugins still must not receive a live $state proxy,
+                // so the value itself is snapshotted before returning.
+                const value = getDatabase().pluginCustomStorage?.[key];
+                return value ? $state.snapshot(value) : null;
             },
             setItem: (key: string, value: string) => {
                 const db = getDatabase();
