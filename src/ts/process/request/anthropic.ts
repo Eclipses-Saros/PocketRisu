@@ -925,7 +925,11 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         })
 
                     } catch (error) {
-                        await sleep(1)
+                        // reader.read() rejection is terminal (an errored stream
+                        // never recovers) — retrying spins forever and the
+                        // response never closes. Keep the partial text and stop.
+                        console.error('Claude stream read failed:', error)
+                        break
                     }
                 }
                 if(thinking){
