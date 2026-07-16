@@ -3505,20 +3505,27 @@ app.get('/api/remove', async (req, res, next) => {
         return;
     }
     try {
-        const key = Buffer.from(filePath, 'hex').toString('utf-8');
-        if (key.startsWith('inlay/')) {
-            const id = key.slice('inlay/'.length)
-            await deleteInlayFile(id)
+        // Serialize with the other mutators (/api/write, /api/patch, /api/plugin-storage,
+        // chat-content) on the shared storage queue so a delete can't interleave between a
+        // queued write's steps. kvDel is itself atomic/synchronous, but running outside the
+        // queue left removes as the one mutation with different ordering guarantees.
+        await queueStorageOperation(async () => {
+            const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            if (key.startsWith('inlay/')) {
+                const id = key.slice('inlay/'.length)
+                await deleteInlayFile(id)
+                kvDel(key);
+                kvDel(`inlay_thumb/${id}`);
+                kvDel(`inlay_info/${id}`);
+                res.send({ success: true });
+                return;
+            }
+            if (key.startsWith('inlay_info/')) {
+                await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+            }
             kvDel(key);
-            kvDel(`inlay_thumb/${id}`);
-            kvDel(`inlay_info/${id}`);
-            return res.send({ success: true });
-        }
-        if (key.startsWith('inlay_info/')) {
-            await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
-        }
-        kvDel(key);
-        res.send({ success: true });
+            res.send({ success: true });
+        });
     } catch (error) {
         next(error);
     }
