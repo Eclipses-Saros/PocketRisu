@@ -31,34 +31,17 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
-const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
+const { PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
 const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.cjs');
-// Server home for the pluginCustomStorage sidecar. b3 layout: each plugin key is
-// its own KV entry under pluginStorage/, so a write touches only that key and
-// concurrent writes to DIFFERENT keys never collide (mirrors the per-chat model).
-// Durable: kvSet is synchronous SQLite, so a write is durable before the endpoint
-// ACKs. Dormant until the client write-enable POSTs a payload.
-//   pluginStorageSidecarStore (single-blob) is retained ONLY for the export/import
-//   backup-entry transient + snapshot pairing until inc2b retargets those; the
-//   live read/write path (hydrate + endpoints) uses the per-key store below.
-const pluginStorageSidecarStore = createPluginStorageSidecarStore({ get: kvGet, set: kvSet, del: kvDel });
+// pluginCustomStorage lives out-of-band in a per-key SQLite store: one KV row per
+// plugin key under pluginStorage/data/, plus a per-account mode sentinel under
+// pluginStorage/control/. Durable: kvSet is synchronous SQLite, so a write is durable
+// before the endpoint ACKs. The old single-blob store and the database.bin marker are
+// RETIRED — nothing produces a marker (the encoder omits pcs entirely), and the store
+// is the single source of truth. PLUGIN_STORAGE_SIDECAR_KEY is kept only as the
+// transient staging key an imported pluginStorage.risudat lands on before fan-out.
 const pluginStoragePerKeyStore = createPluginStoragePerKeyStore({ get: kvGet, set: kvSet, del: kvDel, listPrefix: kvList, transaction: (fn) => sqliteDb.transaction(fn)() });
-
-// Backstop: never persist a database.bin whose pluginCustomStorage marker lists a
-// key that is NOT in the per-key store — a dangling marker reads back fail-closed
-// (lost memory). Values are POSTed (delta/replace) before the database.bin write,
-// so in the correct flow every marker key is present; this catches a client that
-// mis-seeded or skipped the migration and turns silent loss into a loud abort.
-function assertPerKeyCoversMarker(dbObj) {
-    const dir = (dbObj && typeof dbObj === 'object') ? dbObj[PLUGIN_STORAGE_SIDECAR_MARKER] : null;
-    if (!dir || !Array.isArray(dir.keys) || dir.keys.length === 0) return;
-    const have = new Set(pluginStoragePerKeyStore.listKeys() || []);
-    const missing = dir.keys.filter((k) => !have.has(k));
-    if (missing.length) {
-        throw new Error(`refusing to persist a pluginCustomStorage marker with ${missing.length} value(s) absent from the per-key store (dangling marker would lose memory). sample=${missing.slice(0, 3).join(',')}`);
-    }
-}
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -753,16 +736,6 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
         }
     }
 
-    // Dangling-marker backstop (only meaningful for the main DB blob).
-    if (decodedKey === 'database/database.bin') {
-        try {
-            assertPerKeyCoversMarker(fullDb);
-        } catch (err) {
-            recordPersistFailure(err, 'persistDbCacheWithChats:dangling-marker');
-            delete dbCache[filePath];
-            throw err;
-        }
-    }
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
     try {
         kvSet(decodedKey, data);
@@ -2142,13 +2115,15 @@ function listColdStorageBackupEntries() {
 // no live sidecar exists → inert while the write-enable flag is off (backups then
 // look exactly as before). When present, it rides the backup like the DB blob and
 // maps back via resolveBackupStorageKey on import/restore.
-// b3: reassemble the per-key store into one blob for the backup file (same
-// pluginStorage.risudat format the importer expects, which fans it back out to
-// per-key). Returns null when there is no plugin memory (inert while flag off).
+// Backup entry for the out-of-band plugin store. Only an INITIALIZED account has one:
+// a legacy account's pluginCustomStorage rides database.bin (already in the DB backup),
+// so return null (inert while the flag is off). An initialized-EMPTY store DOES get an
+// entry ({}), so a restore/import CLEARS any stale rows rather than leaving them. The
+// blob is JSON (not msgpack) → lossless for nested "__proto__"/surrogate value keys.
 async function pluginStorageBackupEntry() {
-    const map = await pluginStoragePerKeyStore.readAll();
-    if (!map || Object.keys(map).length === 0) return null;
-    const buffer = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: map }));
+    if (pluginStoragePerKeyStore.modeState() !== 'initialized') return null;
+    const map = await pluginStoragePerKeyStore.readAll(); // fail-closed on corrupt/flat
+    const buffer = Buffer.from(JSON.stringify({ pluginCustomStorage: map }), 'utf8');
     return { kind: 'buffer', buffer, backupName: 'pluginStorage.risudat', sortKey: 'pluginStorage.risudat', size: buffer.length };
 }
 
@@ -2485,7 +2460,9 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     try {
         const pcsBlob = kvGet(PLUGIN_STORAGE_SIDECAR_KEY);
         if (pcsBlob && pcsBlob.length > 0) {
-            const decodedPcs = await decodeRisuSave(pcsBlob);
+            // The backup blob is JSON (lossless for nested keys). JSON.parse throws on
+            // malformed input → caught below → fail closed (never coerce to {}/wipe).
+            const decodedPcs = JSON.parse(Buffer.from(pcsBlob).toString('utf8'));
             if (!decodedPcs || typeof decodedPcs !== 'object' || !Object.hasOwn(decodedPcs, 'pluginCustomStorage')) {
                 throw new Error('pluginStorage.risudat present but missing pluginCustomStorage — failing closed');
             }
@@ -3690,7 +3667,6 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
-                    assertPerKeyCoversMarker(fullDb); // dangling-marker backstop (throws → caught below, disk preserved)
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
                     // Re-init chat store from merged result
                     initChatStore(fullDb);
@@ -4068,23 +4044,23 @@ app.get('/api/backup/export', async (req, res, next) => {
             const pse = await pluginStorageBackupEntry();
             if (pse) namespacedEntries.push(pse);
         }
-        // Upstream target can't read our sidecar, so re-inline pluginCustomStorage
-        // into database.risudat (decode → hydrate from sidecar → re-encode inline).
-        // Compute the exact export buffer up front so content-length is correct.
-        // Inert for nodeonly and for flag-off DBs (no marker → raw blob unchanged).
+        // Upstream target can't read our per-key store, so re-inline pluginCustomStorage
+        // into database.risudat (decode → read the per-key map → set inline → re-encode).
+        // Triggered by the MODE sentinel (initialized), not a marker: an out-of-band DB
+        // carries no marker, so the old marker gate would ship it with pcs OMITTED
+        // (silent loss). Inert for a legacy DB (mode not initialized → inline already in
+        // the blob). Compute the buffer up front so content-length is correct.
         let dbExportBuffer = kvGet('database/database.bin');
-        if (target === 'upstream' && dbExportBuffer) {
+        if (target === 'upstream' && dbExportBuffer && pluginStoragePerKeyStore.modeState() === 'initialized') {
             try {
                 const decoded = normalizeJSON(await decodeRisuSave(dbExportBuffer));
-                if (decoded && decoded[PLUGIN_STORAGE_SIDECAR_MARKER]) {
-                    await hydratePluginCustomStorageServer(decoded, pluginStoragePerKeyStore.loader);
-                    dbExportBuffer = Buffer.from(encodeRisuSaveLegacy(decoded));
-                }
+                decoded.pluginCustomStorage = await pluginStoragePerKeyStore.readAll(); // fail-closed on corrupt/flat
+                if (decoded[PLUGIN_STORAGE_SIDECAR_MARKER]) delete decoded[PLUGIN_STORAGE_SIDECAR_MARKER]; // strip any legacy marker
+                dbExportBuffer = Buffer.from(encodeRisuSaveLegacy(decoded));
             } catch (e) {
-                // FAIL CLOSED: upstream can't read our per-key sidecar, so if we
-                // can't re-inline the values we must NOT ship a marker DB with empty
-                // pluginCustomStorage — that silently drops plugin memory from the
-                // exported file. Abort the export instead of exporting a lossy blob.
+                // FAIL CLOSED: if we can't re-inline the values we must NOT ship a DB
+                // with empty/absent pluginCustomStorage — that silently drops plugin
+                // memory from the exported file. Abort instead of exporting lossy data.
                 logger.error('[Export] upstream re-inline of pluginCustomStorage failed — aborting export:', e?.message || e);
                 throw new Error(`Export aborted: could not re-inline pluginCustomStorage for upstream (refusing to export lossy data): ${e?.message || e}`);
             }
@@ -4963,6 +4939,12 @@ function clearExistingData() {
     // stitch in stale cross-user data. Wiping here ensures only payloads
     // that arrived in this import survive.
     kvDelPrefix('remotes/');
+    // Clear the out-of-band plugin store (data/ rows + control/mode.json). A save
+    // folder carries pluginCustomStorage INLINE in database.bin (upstream format) and
+    // never per-key rows, so the imported inline DB is authoritative — clearing the
+    // live prefix resets the account to legacy (inline wins). Leaving a prior user's
+    // initialized sidecar would shadow the imported DB with the wrong plugin memory.
+    kvDelPrefix('pluginStorage/');
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
