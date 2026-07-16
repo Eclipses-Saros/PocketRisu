@@ -319,11 +319,25 @@ function createPluginStoragePerKeyStore(kv) {
     // list+gets in one read transaction. FAILS CLOSED on a listed key whose row is
     // empty/missing (corruption), never silently shorting the map.
     function readAllRaw() {
-        const keys = listKeys();
-        if (keys === null) throw new Error('pluginStorage per-key store: readAllRaw needs kv.listPrefix');
+        if (typeof kv.listPrefix !== 'function') throw new Error('pluginStorage per-key store: readAllRaw needs kv.listPrefix');
+        const rawKeys = (kv.listPrefix(PLUGIN_STORAGE_PERKEY_PREFIX) || [])
+            .filter((k) => k.startsWith(PLUGIN_STORAGE_PERKEY_PREFIX) && k.endsWith('.bin'));
         const rows = [];
-        for (const pluginKey of keys) {
-            const raw = kv.get(kvKeyFor(pluginKey));
+        const seen = new Set();
+        for (const rawKey of rawKeys) {
+            const pluginKey = decodeURIComponent(rawKey.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length, -'.bin'.length));
+            // Row-authority: a row's PATH must be the CANONICAL encoding of its key. A
+            // noncanonical alias (e.g. "%61.bin" for "a") decodes to the same key; reading it
+            // via the canonical path would miss the alias's bytes and silently short the map,
+            // and two rows would collapse to one. Fail closed on either.
+            if (kvKeyFor(pluginKey) !== rawKey) {
+                throw new Error(`pluginStorage: noncanonical row path "${rawKey}" (decodes to "${pluginKey}") — failing closed`);
+            }
+            if (seen.has(pluginKey)) {
+                throw new Error(`pluginStorage: duplicate decoded key "${pluginKey}" from multiple rows — failing closed`);
+            }
+            seen.add(pluginKey);
+            const raw = kv.get(rawKey); // read the ACTUAL enumerated row (canonical == rawKey here)
             if (!raw || raw.length === 0) {
                 throw new Error(`pluginStorage: listed key "${pluginKey}" has an empty/missing row — failing closed`);
             }

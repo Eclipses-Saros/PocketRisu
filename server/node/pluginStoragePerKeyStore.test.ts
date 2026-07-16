@@ -844,6 +844,16 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
         kv.m.set(`pluginStorage/${encodeURIComponent('flat')}.bin`, Buffer.from(JSON.stringify('v')))
         await expect(s.readAll()).rejects.toThrow(/flat|failing closed/i)
     })
+
+    it('noncanonical row alias → readAll throws (row-authority; never silently shorts, F6)', async () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        s.initializeFromMap({ a: '1' })                       // canonical pluginStorage/data/a.bin
+        // a hand-crafted alias row whose path is NOT the canonical encoding of its key:
+        // "%61" decodes to "a", but kvKeyFor("a") is ".../a.bin", not ".../%61.bin".
+        kv.m.set('pluginStorage/data/%61.bin', Buffer.from(JSON.stringify('alias')))
+        await expect(s.readAll()).rejects.toThrow(/noncanonical|duplicate|failing closed/i)
+    })
 })
 
 // Server hydrate/reassemble contract: the per-key loader is a drop-in for the
