@@ -195,55 +195,65 @@ describe('backup import — transaction isolation (real server)', () => {
         expect(await getPerKey()).toEqual({ k: 'RTA', other: 'keep' })
     }, 30000)
 
-    // TRUTHFUL CONCURRENCY (exclusion). A CAS-less write has no way to detect that the
-    // whole store is being replaced under it, so a 200 during an import would be a lie:
-    // a successful import silently supersedes it, and a failed partial import can erase it.
-    // The truthful contract is MUTUAL EXCLUSION — a write during an in-flight import is
-    // REJECTED (503) so the client retries and rebases against the imported state. This
-    // FAILS today (the importer does not serialize against mutators, so the write returns
-    // 200) and passes once every mutator refuses while importInProgress.
-    it('EXCLUSION: an /api/write during an in-flight import is rejected 503 (not a silent 200)', async () => {
+    // TRUTHFUL CONCURRENCY via serialization. The import's destructive install is a single
+    // queueStorageOperation, and every mutator runs through that same storage queue, so a
+    // concurrent write can never be erased mid-flight: it either completes before the install
+    // (a SUCCEEDING import then legitimately supersedes it) or after it (on the imported state).
+    // Here the import FAILS (no database.risudat), so its install never runs and the write it
+    // ACKed (200) SURVIVES — a truthful ACK, not the old tx-join rollback-erase, and no 503.
+    it('CONCURRENCY: an /api/write ACKed during a FAILING import survives (not erased)', async () => {
         expect(await writeCanary('before')).toBe(200)
-        expect(await readCanary()).toBe('before')
-
         const { req, done } = openStreamingImport()
+        let importStatus = 0
         try {
-            // Feed one complete asset entry so the importer enters its stream loop;
-            // importInProgress is set at handler entry, so it is already true here.
             req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
-            await delay(300) // let the server park mid-stream with importInProgress = true
-            // The write must be REFUSED, not accepted-then-superseded/erased.
-            expect(await writeCanary('after')).toBe(503)
+            await delay(300) // import parked mid-stream; the queue is free, so the write runs
+            expect(await writeCanary('after')).toBe(200) // accepted (no exclusion) and committed
         } finally {
-            // ALWAYS end the stream, even if an assertion above threw — otherwise the import
-            // stays parked with importInProgress=true and poisons later tests (409s / false pass).
             try { req.end() } catch {}
-            await done.catch(() => {})
+            importStatus = (await done.catch(() => ({ status: 0 }))).status
         }
-        // The prior value is intact: the refused write never applied, and the failed import
-        // (no database.risudat) rolled back without touching testonly/.
-        expect(await readCanary()).toBe('before')
+        expect(importStatus).not.toBe(200) // the import itself failed (no database.risudat)
+        expect(await readCanary()).toBe('after') // survived — the failed import's install never ran
     }, 30000)
 
-    // Same contract for pcs (which has NO CAS at all). A pcs write during an import must be
-    // 503-refused, not silently accepted. This is the case my earlier item-5 removal of the
-    // "2f" guard broke: without exclusion a pcs delta returns 200 and is then wiped by a
-    // successful import's pluginStorage/ reconcile — a silent supersede the client can't see.
-    it('EXCLUSION(pcs): a plugin-storage write during an in-flight import is rejected 503', async () => {
+    it('CONCURRENCY(pcs): a plugin-storage write ACKed during a FAILING import survives', async () => {
         await replacePerKey({ p: 'before' }) // initialize the store (a legacy store rejects deltas)
-        expect((await getPerKey()).p).toBe('before')
-
         const { req, done } = openStreamingImport()
         try {
             req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
-            await delay(300) // import parks mid-stream, importInProgress = true
-            // Refused, not accepted. Under the removed guard this returned 200 (silent supersede).
-            expect(await psDelta({ p: 'DURING' }, [])).toBe(503)
+            await delay(300)
+            expect(await psDelta({ p: 'DURING' }, [])).toBe(200) // accepted, not 503
         } finally {
             try { req.end() } catch {}
             await done.catch(() => {})
         }
-        expect((await getPerKey()).p).toBe('before') // unchanged — the write was refused
+        expect((await getPerKey()).p).toBe('DURING') // survived the failed import
+    }, 30000)
+
+    // A SUCCEEDING import atomically supersedes a concurrent write. The write is fired mid-stream,
+    // so it queues BEFORE the install (which is enqueued at end-of-stream): it commits, then the
+    // install clears + restores the backup's state on top. The final state is the imported one —
+    // the concurrent edit is superseded as one clean atomic transition, never a half-applied mix.
+    it('SUPERSEDE: a concurrent write during a SUCCEEDING import is superseded by the import', async () => {
+        await replacePerKey({ k: 'IMPORTED' })
+        expect(await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'IMPORTED' })).toBe(200)
+        const blob = await exportBackup() // captures pcs {k:'IMPORTED'} + db customCSS 'IMPORTED'
+        expect(blob.length).toBeGreaterThan(0)
+
+        const { req, done } = openStreamingImport()
+        try {
+            const half = Math.floor(blob.length / 2)
+            req.write(blob.subarray(0, half))
+            await delay(300) // mid-stream: a concurrent pcs write queues BEFORE the install
+            expect(await psDelta({ k: 'CONCURRENT-EDIT' }, [])).toBe(200)
+            req.write(blob.subarray(half))
+        } finally {
+            try { req.end() } catch {}
+        }
+        const result = await done
+        expect(result.status).toBe(200) // the import succeeded
+        expect((await getPerKey()).k).toBe('IMPORTED') // install (queued after the write) superseded it
     }, 30000)
 
     // ATOMICITY of the DB/PCS pair. The original importer reconciled pcs in the SAME
