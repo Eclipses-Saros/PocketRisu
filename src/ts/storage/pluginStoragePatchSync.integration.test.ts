@@ -184,6 +184,26 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         expect(after.B).toBe('b0')
     })
 
+    // codex round-8 HIGH#1: restore RESETS the live plugin memory to exactly the
+    // snapshot's — a key ADDED after the snapshot must be GONE after restore (never
+    // left stale), and the DB blob + plugin prefix are restored as one atomic pair.
+    it('BACKUP/RESTORE: a key added after the snapshot is removed on restore (no stale keys)', async () => {
+        if (!booted) return
+        await replacePerKey({ A: 'a', B: 'b' })
+        await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'stale-key-marker' }) // snapshot pairs {A,B}
+        const list = await (await fetch(`${BASE}/api/db/snapshots`, { headers: authHeaders() })).json()
+        const snaps: any[] = Array.isArray(list) ? list : (list.snapshots ?? list.items ?? [])
+        const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).filter(Boolean).sort().reverse()[0]
+        await psPost({ type: 'delta', changed: { C: 'c-added-after-snapshot' }, removed: [] })
+        expect((await getPerKey()).C).toBe('c-added-after-snapshot')
+        const r = await fetch(`${BASE}/api/db/snapshots/restore`, {
+            method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify({ key: snapKey }),
+        })
+        expect(r.status).toBe(200)
+        const after = await getPerKey()
+        expect(after).toEqual({ A: 'a', B: 'b' })   // C is gone — live reset to the snapshot, not merged
+    })
+
     it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {
         if (!booted) return
         expect(await psPost({ changed: { A: 'x' } })).toBe(400)   // looks like a delta but no discriminator

@@ -104,20 +104,23 @@ function isCodecSafeKey(k) {
 // object. Downstream code uses ONLY this snapshot and NEVER re-enumerates the
 // original — a stateful Proxy can return different keys on a second read (validate
 // vs encode/write), which would pass validation then wipe the store (TOCTOU).
+// A bad-input error the HTTP layer maps to 400 (vs a 500 for other failures).
+function badPayload(msg) { const e = new Error(msg); e.code = 'PLUGIN_STORAGE_BAD_PAYLOAD'; return e; }
+
 function canonicalizeMap(x, label) {
-    if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error(`pluginStorage: ${label} must be a plain object map`);
+    if (!x || typeof x !== 'object' || Array.isArray(x)) throw badPayload(`pluginStorage: ${label} must be a plain object map`);
     const proto = Object.getPrototypeOf(x);
-    if (proto !== Object.prototype && proto !== null) throw new Error(`pluginStorage: ${label} must be a plain object map`);
+    if (proto !== Object.prototype && proto !== null) throw badPayload(`pluginStorage: ${label} must be a plain object map`);
     // SINGLE enumeration — do NOT call isPlainMap first (that would enumerate a second
     // time; a stateful Proxy could return different keys between the two passes → TOCTOU
     // wipe). Validate + snapshot in one Reflect.ownKeys walk, reading each descriptor
     // value once (never x[k], so no getter/Proxy trap re-runs).
     const out = Object.create(null);
     for (const k of Reflect.ownKeys(x)) {
-        if (typeof k !== 'string') throw new Error(`pluginStorage: ${label} has a non-string key`);
+        if (typeof k !== 'string') throw badPayload(`pluginStorage: ${label} has a non-string key`);
         const d = Object.getOwnPropertyDescriptor(x, k);
-        if (!d || !d.enumerable || !('value' in d)) throw new Error(`pluginStorage: ${label} key "${k}" is not an enumerable data property`);
-        if (!isCodecSafeKey(k)) throw new Error(`pluginStorage: ${label} key "${k}" is codec-unsafe (__proto__ or lone surrogate) — rejected fail-closed`);
+        if (!d || !d.enumerable || !('value' in d)) throw badPayload(`pluginStorage: ${label} key "${k}" is not an enumerable data property`);
+        if (!isCodecSafeKey(k)) throw badPayload(`pluginStorage: ${label} key "${k}" is codec-unsafe (__proto__ or lone surrogate) — rejected fail-closed`);
         out[k] = d.value;
     }
     return out;
@@ -241,14 +244,25 @@ function createPluginStoragePerKeyStore(kv) {
     // key is codec-safe, so a Proxy/typed/codec-unsafe payload can never slip through.
     function applyDelta({ changed, removed } = {}) {
         const snap = (changed === undefined || changed === null) ? null : canonicalizeMap(changed, 'delta changed');
-        const rm = Array.isArray(removed) ? removed : [];
-        for (const k of rm) {
-            if (!isCodecSafeKey(k)) throw new Error(`pluginStorage: delta removed key "${String(k)}" is codec-unsafe — rejected fail-closed`);
+        // Materialize `removed` into a fresh array in ONE pass (never re-iterate the
+        // original — a stateful/Proxy array could present different elements to the
+        // validate pass vs the delete pass → TOCTOU deletion). Validate each here.
+        const rm = [];
+        if (removed !== undefined && removed !== null) {
+            if (!Array.isArray(removed)) throw badPayload('pluginStorage: delta removed must be an array');
+            for (const k of removed) {
+                if (typeof k !== 'string') throw badPayload('pluginStorage: delta removed key must be a string');
+                if (!isCodecSafeKey(k)) throw badPayload(`pluginStorage: delta removed key "${k}" is codec-unsafe — rejected fail-closed`);
+                rm.push(k);
+            }
         }
+        // A key in BOTH changed and removed would be written then deleted (net loss) —
+        // an ambiguous envelope; reject it rather than silently drop the value.
+        if (snap) for (const k of rm) if (Object.hasOwn(snap, k)) throw badPayload(`pluginStorage: delta key "${k}" appears in both changed and removed`);
         inTransaction(() => {
             assertInitialized();
             if (snap) for (const k of Object.keys(snap)) writeKey(k, snap[k]);
-            for (const k of rm) removeKey(k);
+            for (const k of rm) removeKey(k);   // use ONLY the materialized copy
         });
     }
     // Internal: overwrite the whole map + set initialized, in one transaction. The
@@ -356,10 +370,12 @@ function createPluginStoragePerKeyStore(kv) {
         if (hasLegacyFlatRows()) {
             throw new Error('pluginStorage: un-migrated flat rows present — failing closed (would be invisible to the data/ scan)');
         }
-        // rows present without an initialized mode = the ambiguous partial-migration
-        // state the classifier flags — never read those rows as authoritative.
-        if (st === 'legacy' && (listKeys() || []).length > 0) {
-            throw new Error('pluginStorage: data rows present without an initialized mode (ambiguous) — failing closed');
+        // readAll returns data ONLY when the store is initialized. A legacy store —
+        // whether empty or holding rows-without-a-mode (ambiguous partial migration) —
+        // throws, matching GET's discrimination (legacy → 404). This keeps every reader
+        // consistent: no caller ever reads a legacy store as an authoritative map.
+        if (st !== 'initialized') {
+            throw new Error('pluginStorage: readAll on a non-initialized (legacy) store — caller must check mode first');
         }
         const rows = readAllRaw();
         const out = {};

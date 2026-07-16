@@ -33,7 +33,7 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
-const { createPluginStoragePerKeyStore, isPlainMap: isPlainStorageMap } = require('./pluginStoragePerKeyStore.cjs');
+const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.cjs');
 // Server home for the pluginCustomStorage sidecar. b3 layout: each plugin key is
 // its own KV entry under pluginStorage/, so a write touches only that key and
 // concurrent writes to DIFFERENT keys never collide (mirrors the per-chat model).
@@ -239,11 +239,13 @@ function createBackupAndRotate() {
     lastBackupTime = now;
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
-    kvCopyValue('database/database.bin', backupKey);
-    // Pair the per-key plugin storage into the snapshot so a marker-layout DB
-    // restores with the matching plugin memory. Inert while the flag is off
-    // (no pluginStorage/* entries → no-op).
-    snapshotPluginStorageForDb(backupKey);
+    // Publish the database.bin snapshot and its plugin-prefix pair ATOMICALLY (one
+    // transaction), so a crash can never leave a DB snapshot without its matching
+    // plugin memory. Inert while the flag is off (no pluginStorage/* entries → no-op).
+    sqliteDb.transaction(() => {
+        kvCopyValue('database/database.bin', backupKey);
+        snapshotPluginStorageForDb(backupKey);
+    })();
     trimSnapshotsToLimits();
 }
 
@@ -4847,27 +4849,25 @@ app.post('/api/plugin-storage', async (req, res, next) => {
             // Discriminated envelope (no bare-map guessing): a plugin key literally
             // named "changed"/"removed"/"values" must never be mistaken for the
             // envelope. type is REQUIRED.
-            if (body.type === 'delta') {
-                pluginStoragePerKeyStore.applyDelta({ changed: body.changed, removed: body.removed });
-            } else if (body.type === 'replace') {
-                // values MUST be a PLAIN object map — never coerce a malformed/typed
-                // payload (string, array, Date, Uint8Array, …) to {} (a typed object has
-                // zero enumerable keys → would silently wipe the store on a bad request).
-                if (!isPlainStorageMap(body.values)) {
-                    return res.status(400).json({ error: 'plugin-storage replace requires values: a plain object map' });
+            // The store is the SINGLE validation point — it canonicalizes each payload
+            // in one enumeration (rejecting non-plain-object/typed/Proxy/codec-unsafe
+            // input) and throws a tagged bad-payload error we map to 400. The route does
+            // NOT pre-enumerate the payload (that would be a second, TOCTOU-prone pass).
+            try {
+                if (body.type === 'delta') {
+                    pluginStoragePerKeyStore.applyDelta({ changed: body.changed, removed: body.removed });
+                } else if (body.type === 'replace') {
+                    pluginStoragePerKeyStore.replaceAll(body.values);
+                } else if (body.type === 'reconcile') {
+                    pluginStoragePerKeyStore.reconcileReplace(body.values);
+                } else {
+                    return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
                 }
-                pluginStoragePerKeyStore.replaceAll(body.values);
-            } else if (body.type === 'reconcile') {
-                // EXPLICIT recovery/activation: authoritatively overwrite whatever state
-                // is live with the caller's complete map. Used by versioned activation
-                // when the full inline map is known authoritative (and by a migrated
-                // pre-sentinel account to establish 'initialized'). Same strict payload rule.
-                if (!isPlainStorageMap(body.values)) {
-                    return res.status(400).json({ error: 'plugin-storage reconcile requires values: a plain object map' });
+            } catch (e) {
+                if (e && e.code === 'PLUGIN_STORAGE_BAD_PAYLOAD') {
+                    return res.status(400).json({ error: e.message });
                 }
-                pluginStoragePerKeyStore.reconcileReplace(body.values);
-            } else {
-                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
+                throw e;
             }
             res.json({ success: true });
         });
@@ -5202,26 +5202,32 @@ const sidecarSnapshotKeyFor = (dbSnapshotKey) =>
 // authoritative short map (silent loss). All-or-nothing.
 const PLUGIN_STORAGE_PERKEY_PREFIX = 'pluginStorage/';
 const sidecarSnapshotPrefixFor = (dbSnapshotKey) => `${sidecarSnapshotKeyFor(dbSnapshotKey)}/`;
+// NO internal transaction: the caller wraps this together with the database.bin
+// snapshot in ONE sqliteDb.transaction so the DB blob and its plugin-prefix pair are
+// published atomically (a crash can never leave a DB snapshot without its pair).
 function snapshotPluginStorageForDb(dbSnapshotKey) {
     const dst = sidecarSnapshotPrefixFor(dbSnapshotKey);
-    sqliteDb.transaction(() => {
-        for (const k of kvList(PLUGIN_STORAGE_PERKEY_PREFIX)) {
-            kvCopyValue(k, dst + k.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length));
-        }
-    })();
+    kvDelPrefix(dst); // clean overwrite: re-snapshotting to the same key must be EXACTLY
+                      // the current prefix, never accumulate stale rows from a prior one
+    for (const k of kvList(PLUGIN_STORAGE_PERKEY_PREFIX)) {
+        kvCopyValue(k, dst + k.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length));
+    }
 }
 function dropPluginStorageSnapshotForDb(dbSnapshotKey) {
     kvDelPrefix(sidecarSnapshotPrefixFor(dbSnapshotKey));
     kvDel(sidecarSnapshotKeyFor(dbSnapshotKey)); // also clear any legacy single-blob pairing
 }
+// NO internal transaction: the caller wraps this with the database.bin restore in ONE
+// transaction. ALWAYS resets the live prefix to EXACTLY the snapshot's prefix. If the
+// snapshot has NO plugin rows (a legacy/pre-SSOT snapshot whose DB carries inline
+// pcs), this CLEARS the live prefix so the restored inline DB is authoritative again —
+// it must never leave a newer sidecar that would shadow the restored DB (data
+// mismatch / fewer keys served than the snapshot holds).
 function restorePluginStorageSnapshotForDb(dbSnapshotKey) {
     const src = sidecarSnapshotPrefixFor(dbSnapshotKey);
     const snap = kvList(src);
-    if (snap.length === 0) return false; // no paired snapshot (legacy/flag-off DB) — leave live as-is
-    sqliteDb.transaction(() => {
-        kvDelPrefix(PLUGIN_STORAGE_PERKEY_PREFIX); // clear current per-key state, then restore the snapshot's
-        for (const k of snap) kvCopyValue(k, PLUGIN_STORAGE_PERKEY_PREFIX + k.slice(src.length));
-    })();
+    kvDelPrefix(PLUGIN_STORAGE_PERKEY_PREFIX); // reset live to the snapshot's prefix (empty → cleared)
+    for (const k of snap) kvCopyValue(k, PLUGIN_STORAGE_PERKEY_PREFIX + k.slice(src.length));
     return true;
 }
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
@@ -5789,12 +5795,15 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
-            kvCopyValue(key, DB_BLOB_KEY);
-            // Restore the paired per-key plugin storage so a marker-layout snapshot
-            // comes back as a consistent (database.bin + per-key values) pair. If the
-            // snapshot has no paired per-key entries (legacy/flag-off DB), leave the
-            // live per-key store untouched — that DB carries no marker, so inline wins.
-            restorePluginStorageSnapshotForDb(key);
+            // Restore the database.bin blob and its plugin prefix ATOMICALLY as a pair
+            // (one transaction). restorePluginStorageSnapshotForDb resets the live
+            // prefix to EXACTLY the snapshot's — for a legacy/pre-SSOT snapshot (no
+            // paired rows) it CLEARS the live prefix so the restored inline DB is
+            // authoritative again, never leaving a newer sidecar that shadows it.
+            sqliteDb.transaction(() => {
+                kvCopyValue(key, DB_BLOB_KEY);
+                restorePluginStorageSnapshotForDb(key);
+            })();
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored

@@ -615,6 +615,38 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
         expect(await s.readAll()).toEqual({ a: '1' })   // untouched by the rejected deltas
     })
 
+    // codex round-8 HIGH#2: a key in both changed and removed = write-then-delete = net
+    // loss → rejected, nothing applied.
+    it('applyDelta rejects a key in BOTH changed and removed', async () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.initializeFromMap({ x: '0' })
+        expect(() => s.applyDelta({ changed: { a: '1' }, removed: ['a'] })).toThrow(/both changed and removed/i)
+        expect(await s.readAll()).toEqual({ x: '0' })   // nothing applied
+    })
+
+    // codex round-8 HIGH#2: `removed` is materialized in ONE pass; a stateful array that
+    // would present a different second reading cannot cause a different key to be deleted.
+    it('applyDelta materializes `removed` once — a stateful array cannot delete a different key', async () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.initializeFromMap({ keep: 'v', victim: 'v' })
+        let iter = 0
+        const removed: any = new Proxy([], {
+            get(t, p, r) {
+                if (p === Symbol.iterator) {
+                    iter++
+                    const seq = iter === 1 ? ['nonexistent'] : ['victim'] // 2nd read would target victim
+                    return function* () { yield* seq }
+                }
+                if (p === 'length') return 1
+                return Reflect.get(t, p, r)
+            },
+        })
+        s.applyDelta({ removed })                 // reads removed exactly once (→ ['nonexistent'], a no-op)
+        expect(iter).toBe(1)                       // materialized once, never re-read
+        expect(await s.readKey('victim')).toBe('v') // 'victim' survives (2nd-read sequence never used)
+        expect(await s.readKey('keep')).toBe('v')
+    })
+
     // codex round-4 HIGH: ordinary replace must not MASK corruption/ambiguity —
     // recovery is the explicit reconcileReplace.
     it('replaceAll REFUSES a corrupt or ambiguous store; reconcileReplace overwrites it', async () => {
@@ -637,7 +669,7 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
         expect(s.migrateLegacyLayout().migrated).toBe(1)
         expect(s.modeState()).toBe('legacy')               // NOT blessed initialized
         expect(s.classify({ characters: [] }).state).toBe('ambiguous') // rows without a mode → loud
-        await expect(s.readAll()).rejects.toThrow(/ambiguous|failing closed/i)
+        await expect(s.readAll()).rejects.toThrow(/non-initialized|legacy|ambiguous|failing closed/i)
         expect(await s.readKey('shard:0')).toBe('v')       // bytes are present (relocated), just not authoritative yet
         // an explicit reconcile (client's complete map) establishes initialized
         s.reconcileReplace({ 'shard:0': 'v' })
@@ -651,8 +683,8 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
     it('throws on a corrupt row (decoded record without a value field)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        s.writeKey('a', '1')
-        // a row that decodes to an object WITHOUT a `value` property
+        s.initializeFromMap({ a: '1' })                     // initialized store
+        // a row that decodes to an object WITHOUT a `value` property (out-of-band corruption)
         kv.m.set(kvKeyFor('b'), Buffer.from(encodeRisuSaveLegacy({ notValue: 'x' })))
         await expect(s.readAll()).rejects.toThrow(/corrupt row|failing closed/i)
     })
@@ -660,7 +692,7 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
     it('throws on a listed key whose row is zero-length (corruption, not a short map)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        s.writeKey('a', '1')
+        s.initializeFromMap({ a: '1' })
         kv.m.set(kvKeyFor('b'), Buffer.alloc(0)) // present under data/ but empty
         await expect(s.readAll()).rejects.toThrow(/empty\/missing|failing closed/i)
     })
