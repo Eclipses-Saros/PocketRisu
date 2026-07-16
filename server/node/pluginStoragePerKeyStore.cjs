@@ -1,9 +1,9 @@
 // Server-side PER-KEY store for pluginCustomStorage (b3 layout; SSOT).
 //
-// The single-blob sidecar (pluginStorageStore.cjs) keeps all plugin keys in ONE
-// KV entry. That reintroduces the coupling B set out to remove: two clients saving
-// concurrently both rewrite the whole blob, so the later write silently drops the
-// earlier client's per-key changes. It also keeps the whole-store re-serialization
+// The rejected alternative — a single-blob sidecar holding ALL plugin keys in ONE
+// KV entry — reintroduces the coupling this store set out to remove: two clients
+// saving concurrently both rewrite the whole blob, so the later write silently drops
+// the earlier client's per-key changes. It also keeps the whole-store re-serialization
 // in the save path.
 //
 // This store mirrors the proven PER-CHAT model: each pluginCustomStorage key is its
