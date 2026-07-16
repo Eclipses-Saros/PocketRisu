@@ -1106,23 +1106,38 @@ async function ensureInlayDir() {
 
 // Boot-time reconciliation of a backup import that crashed mid inlay-swap. The DB install is one
 // SQLite transaction and the inlay swap has an in-process rollback, so a clean rename FAILURE is
-// already handled; this covers a hard CRASH that left the scratch dirs behind. Best-effort and
-// idempotent: ensure inlayDir exists (prefer the pre-import backup if the live dir vanished mid-
-// swap, so inlays are never entirely lost), then clear the scratch dirs so they can't leak or be
-// mistaken for a fresh import. A residual DB↔inlay generation mismatch (new DB + restored old
-// inlays) shows as missing images and is recoverable by re-importing — an accepted low-severity
-// tradeoff (DEFECT.md §6); full cross-store atomicity would need the deferred generation-pointer.
+// already handled; this covers a hard CRASH that left the scratch dirs behind. The inlay swap is
+// ensureInlayDir → rename(inlays→backup) → rename(staging→inlays) → writeFile(marker) → rm(backup).
+// So a leftover scratch dir means the crash was between those steps. Reconcile WITHOUT ever losing
+// the sole copy of the inlays:
+//   - live inlays MISSING (crashed after inlays→backup, before staging→inlays): restore the prior
+//     inlays from backup; if no backup (first-ever import, crashed before inlays→backup), adopt the
+//     staged new inlays. FAIL CLOSED if that rename fails — throw so boot stops with the scratch
+//     dirs preserved, rather than delete the only copy and come up with an empty inlays dir.
+//   - live inlays PRESENT (crashed after staging→inlays, or before it with the prior dir intact):
+//     it is authoritative; the scratch dirs are redundant.
+// Only after inlays is guaranteed present do we clear the scratch. A residual DB↔inlay generation
+// mismatch (new DB + restored old inlays) shows as missing images, recoverable by re-import — an
+// accepted low-severity tradeoff (DEFECT.md §6); full cross-store atomicity is the deferred pointer.
 async function recoverCrashedInlayImport() {
     const hasStaging = existsSync(inlayImportStagingDir);
     const hasBackup = existsSync(inlayImportBackupDir);
     if (!hasStaging && !hasBackup) return; // no crashed import
     logger.warn('[Server] Detected leftover inlay import scratch dirs from a prior crash — reconciling.');
-    if (!existsSync(inlayDir) && hasBackup) {
-        // Crash between "inlays → backup" and "staging → inlays": the live dir is gone. Restore the
-        // pre-import inlays so nothing is lost outright.
-        try { await fs.rename(inlayImportBackupDir, inlayDir); }
-        catch (e) { logger.error('[Server] inlay backup restore failed:', e?.message || e); }
+    if (!existsSync(inlayDir)) {
+        // The live dir vanished mid-swap. Prefer the prior inlays (backup); else the staged new
+        // inlays. Do NOT delete either copy unless the restore succeeds — fail closed on error.
+        const source = hasBackup ? inlayImportBackupDir : (hasStaging ? inlayImportStagingDir : null);
+        if (source) {
+            try {
+                await fs.rename(source, inlayDir);
+            } catch (e) {
+                logger.error('[Server] inlay recovery: restoring the live dir failed — leaving scratch dirs intact for retry. ' + (e?.message || e));
+                throw new Error('inlay import recovery failed: could not restore the live inlays dir; resolve and restart (scratch preserved)');
+            }
+        }
     }
+    // inlays now exists (present already, or just restored) — the scratch dirs are safe to clear.
     await fs.rm(inlayImportStagingDir, { recursive: true, force: true }).catch(() => {});
     await fs.rm(inlayImportBackupDir, { recursive: true, force: true }).catch(() => {});
 }
@@ -6073,7 +6088,6 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
         res.status(409).json({ error: 'a backup import/restore is in progress — retry compression after it completes' });
         return;
     }
-    importInProgress = true;
     const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
 
     res.writeHead(200, {
@@ -6081,6 +6095,9 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
     });
+    // Set the flag AFTER writeHead (and only paired with the finally that clears it below), so a
+    // throw before the try can't leak importInProgress=true and permanently block all imports.
+    importInProgress = true;
 
     const send = (data) => {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
