@@ -858,6 +858,27 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
         return expect(s.readAll()).resolves.toEqual({ a: '1' })
     })
 
+    it('initializeFromMap on a CORRUPT sentinel throws UNTAGGED (→ endpoint 500, not 409) — fail closed (P3)', () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        kv.m.set('pluginStorage/control/mode.json', Buffer.from('garbage{', 'utf8')) // present-but-invalid
+        let err: any
+        try { s.initializeFromMap({ a: '1' }) } catch (e) { err = e }
+        expect(err).toBeTruthy()
+        expect(err.code).not.toBe('PLUGIN_STORAGE_ALREADY_INITIALIZED') // untagged → 500 (no coherent store to adopt), never 409
+        expect(String(err.message)).toMatch(/corrupt|failing closed/i)
+    })
+
+    it('initializeFromMap on rows-without-a-mode throws UNTAGGED (ambiguous → 500) — fail closed (P3)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.writeKey('a', '1') // rows exist, no mode sentinel
+        let err: any
+        try { s.initializeFromMap({ b: '2' }) } catch (e) { err = e }
+        expect(err).toBeTruthy()
+        expect(err.code).not.toBe('PLUGIN_STORAGE_ALREADY_INITIALIZED')
+        expect(String(err.message)).toMatch(/ambiguous|failing closed/i)
+    })
+
     it('noncanonical row alias → readAll throws (row-authority; never silently shorts, F6)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
