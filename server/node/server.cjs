@@ -4846,22 +4846,31 @@ app.post('/api/plugin-storage', async (req, res, next) => {
                 return res.status(400).json({ error: 'plugin-storage payload required' });
             }
             if (!body || typeof body !== 'object') return res.status(400).json({ error: 'plugin-storage payload required' });
-            // Discriminated envelope (no bare-map guessing): a plugin key literally
-            // named "changed"/"removed"/"values" must never be mistaken for the
-            // envelope. type is REQUIRED.
-            // The store is the SINGLE validation point — it canonicalizes each payload
-            // in one enumeration (rejecting non-plain-object/typed/Proxy/codec-unsafe
-            // input) and throws a tagged bad-payload error we map to 400. The route does
-            // NOT pre-enumerate the payload (that would be a second, TOCTOU-prone pass).
+            // Discriminated envelope: { type, json }. The pluginCustomStorage data
+            // travels as a JSON STRING in `json` — NEVER as msgpack object keys — so no
+            // codec can rewrite/collapse a key at any depth, and the client's single
+            // JSON.stringify is the only read of its live object (no TOCTOU). The store
+            // is the single validation point; a tagged bad-payload error maps to 400.
+            const t = body.type;
+            if (t !== 'delta' && t !== 'replace' && t !== 'reconcile') {
+                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
+            }
+            if (typeof body.json !== 'string') {
+                return res.status(400).json({ error: 'plugin-storage envelope requires a json string field' });
+            }
+            let payload;
+            try { payload = JSON.parse(body.json); }
+            catch { return res.status(400).json({ error: 'plugin-storage json is not valid JSON' }); }
             try {
-                if (body.type === 'delta') {
-                    pluginStoragePerKeyStore.applyDelta({ changed: body.changed, removed: body.removed });
-                } else if (body.type === 'replace') {
-                    pluginStoragePerKeyStore.replaceAll(body.values);
-                } else if (body.type === 'reconcile') {
-                    pluginStoragePerKeyStore.reconcileReplace(body.values);
+                if (t === 'delta') {
+                    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                        return res.status(400).json({ error: 'plugin-storage delta json must be an object' });
+                    }
+                    pluginStoragePerKeyStore.applyDelta({ changed: payload.changed, removed: payload.removed });
+                } else if (t === 'replace') {
+                    pluginStoragePerKeyStore.replaceAll(payload);
                 } else {
-                    return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
+                    pluginStoragePerKeyStore.reconcileReplace(payload);
                 }
             } catch (e) {
                 if (e && e.code === 'PLUGIN_STORAGE_BAD_PAYLOAD') {
@@ -4883,7 +4892,9 @@ app.post('/api/plugin-storage', async (req, res, next) => {
 //   legacy + no rows       → 404 (client uses inline; no out-of-band store)
 //   legacy + rows present  → 500 (ambiguous partial-migration; never serve as authoritative)
 //   corrupt sentinel       → 500
-//   initialized            → 200, encoded map (even when empty {})
+//   initialized            → 200, the map as a JSON string (even when empty {})
+// The map is returned as JSON (not msgpack) so nested "__proto__"/surrogate value
+// keys round-trip losslessly to the client.
 app.get('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
@@ -4905,8 +4916,8 @@ app.get('/api/plugin-storage', async (req, res, next) => {
         }
         // initialized — readAll fails closed on any corrupt/flat/short state
         const pcs = await pluginStoragePerKeyStore.readAll();
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.send(Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: pcs })));
+        res.setHeader('Content-Type', 'application/json');
+        res.send(JSON.stringify({ pluginCustomStorage: pcs }));
     } catch (error) {
         next(error);
     }
@@ -5800,10 +5811,24 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // prefix to EXACTLY the snapshot's — for a legacy/pre-SSOT snapshot (no
             // paired rows) it CLEARS the live prefix so the restored inline DB is
             // authoritative again, never leaving a newer sidecar that shadows it.
-            sqliteDb.transaction(() => {
-                kvCopyValue(key, DB_BLOB_KEY);
-                restorePluginStorageSnapshotForDb(key);
-            })();
+            // RE-CHECK the snapshot still exists INSIDE the lock+transaction: a
+            // concurrent DELETE/trim could have removed it while this restore awaited
+            // the queue, and kvCopyValue silently no-ops a missing source — so without
+            // this guard the DB would stay current while the live plugin prefix got
+            // cleared (a wipe). If it vanished, abort and touch NOTHING.
+            let snapshotGone = false;
+            try {
+                sqliteDb.transaction(() => {
+                    const snapBlob = kvGet(key);
+                    if (!snapBlob || snapBlob.length === 0) { const e = new Error('snapshot vanished'); e.code = 'SNAPSHOT_GONE'; throw e; }
+                    kvCopyValue(key, DB_BLOB_KEY);
+                    restorePluginStorageSnapshotForDb(key);
+                })();
+            } catch (e) {
+                if (e && e.code === 'SNAPSHOT_GONE') { snapshotGone = true; }
+                else throw e;
+            }
+            if (snapshotGone) { res.status(409).json({ error: 'Snapshot no longer exists' }); return; }
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
@@ -5830,7 +5855,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
             }
         });
-        res.json({ ok: true });
+        if (!res.headersSent) res.json({ ok: true });
     } catch (err) { next(err); }
 });
 

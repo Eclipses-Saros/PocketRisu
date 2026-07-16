@@ -37,33 +37,23 @@ export interface PatchItemResult {
     chatGuardRejected?: boolean
 }
 
-// A key is codec-safe iff it survives the msgpack save codec UNCHANGED. The codec
-// rewrites "__proto__" and replaces lone surrogates with U+FFFD — either silently
-// collapses a map key on the wire. Reject fail-closed rather than send a payload the
-// server would decode into a shorter map (and then delete the "vanished" row).
-function isCodecSafeStorageKey(k: string): boolean {
-    if (typeof k !== 'string') return false
-    if (k === '__proto__') return false
-    if (typeof (k as any).isWellFormed === 'function') return (k as any).isWellFormed()
-    return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(k)
-}
-
-// Build a CANONICAL snapshot of an untrusted map in ONE enumeration, BEFORE encoding:
-// a plain object with only enumerable string DATA keys, all codec-safe; copy each
-// descriptor value once into a fresh null-proto object. Encoding then uses ONLY this
-// snapshot — never the original — so a stateful Proxy (different keys on a second
-// enumeration), a Map/typed object (serializes to {}), or a codec-unsafe key cannot
-// slip through and produce a destructive shorter/empty replace.
+// pluginCustomStorage is arbitrary-key JSON data, sent to the server as a JSON STRING
+// (never msgpack object keys) — lossless for keys/values at any depth. Snapshot the
+// live map in ONE enumeration into a fresh null-proto object and JSON.stringify THAT
+// (never the original), so a stateful Proxy can't differ between validation and
+// serialization. Reject a non-plain-object (Map/Date/typed/array/primitive → would
+// coerce to {} and wipe on a full replace) and symbol/non-enumerable/accessor keys
+// (they drop through JSON and could silently shrink the map). No codec-safe-key check
+// is needed — JSON handles keys losslessly.
 function canonicalStorageMap(x: any, label: string): Record<string, any> {
-    if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error(`${label}: values must be a plain string-keyed object map`)
+    if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error(`${label}: values must be a plain object map`)
     const proto = Object.getPrototypeOf(x)
-    if (proto !== Object.prototype && proto !== null) throw new Error(`${label}: values must be a plain string-keyed object map`)
+    if (proto !== Object.prototype && proto !== null) throw new Error(`${label}: values must be a plain object map`)
     const out: Record<string, any> = Object.create(null)
     for (const k of Reflect.ownKeys(x)) {
-        if (typeof k !== 'string') throw new Error(`${label}: non-string key`)
+        if (typeof k !== 'string') throw new Error(`${label}: symbol key not allowed`)
         const d = Object.getOwnPropertyDescriptor(x, k)
-        if (!d || !d.enumerable || !('value' in d)) throw new Error(`${label}: key is not an enumerable data property`)
-        if (!isCodecSafeStorageKey(k)) throw new Error(`${label}: key "${k}" is codec-unsafe (__proto__ or lone surrogate)`)
+        if (!d || !d.enumerable || !('value' in d)) throw new Error(`${label}: key "${k}" is not an enumerable data property`)
         out[k] = d.value
     }
     return out
@@ -689,26 +679,22 @@ export class NodeStorage{
     // (concurrency-safe: per-key on the server); replace = the whole map (seed /
     // reconcile). GET returns the full reassembled map for load-time hydration.
 
-    // Send ONLY changed/removed keys — the concurrency-safe steady-state path.
+    // Send ONLY changed/removed keys — the concurrency-safe steady-state path. The
+    // data travels as a JSON string in the envelope (never msgpack object keys), so
+    // JSON.stringify is a single read of the live changed map and is lossless for its
+    // keys/values at any depth.
     async savePluginStorageDelta(delta: { changed: Record<string, any>; removed: string[] }): Promise<void> {
-        // Canonicalize changed + materialize removed into fresh structures in ONE pass
-        // each, BEFORE encoding, and encode ONLY those copies — so a stateful/Proxy
-        // input cannot present different contents to validation vs the encoder, and a
-        // codec-unsafe key can never reach the wire.
         const changed = canonicalStorageMap(delta?.changed ?? {}, 'savePluginStorageDelta')
         const removed: string[] = []
         const rawRemoved = delta?.removed
         if (rawRemoved !== undefined && rawRemoved !== null) {
             if (!Array.isArray(rawRemoved)) throw new Error('savePluginStorageDelta: removed must be an array')
             for (const k of rawRemoved) {
-                if (typeof k !== 'string' || !isCodecSafeStorageKey(k)) throw new Error(`savePluginStorageDelta: removed key "${String(k)}" is invalid or codec-unsafe`)
+                if (typeof k !== 'string') throw new Error(`savePluginStorageDelta: removed key "${String(k)}" must be a string`)
                 removed.push(k)
             }
         }
-        for (const k of removed) {
-            if (Object.hasOwn(changed, k)) throw new Error(`savePluginStorageDelta: key "${k}" appears in both changed and removed`)
-        }
-        const encoded = encodeRisuSaveLegacy({ type: 'delta', changed, removed })
+        const encoded = encodeRisuSaveLegacy({ type: 'delta', json: JSON.stringify({ changed, removed }) })
         const da = await this.authFetch('/api/plugin-storage', {
             method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
         })
@@ -716,14 +702,12 @@ export class NodeStorage{
     }
 
     // Replace the whole map (write EVERY given key, delete stale). Used to seed /
-    // reconcile, not the hot path (concurrent full replaces still last-write-wins).
+    // reconcile, not the hot path (concurrent full replaces still last-write-wins). The
+    // map travels as a JSON string; JSON.stringify is the single read of `values` (no
+    // TOCTOU) and a Map/typed/array/primitive is rejected first (would wipe the store).
     async savePluginStorageReplace(values: Record<string, any>): Promise<void> {
-        // canonicalize BEFORE encoding: a full replace of {} WIPES the store, and the
-        // codec erases the type of a Map/typed object to a plain {} (server can't tell
-        // it from a legit empty map), so the client is the only place that can catch a
-        // Map/Proxy/typed/codec-unsafe payload. Encode ONLY the snapshot.
         const snapshot = canonicalStorageMap(values, 'savePluginStorageReplace')
-        const encoded = encodeRisuSaveLegacy({ type: 'replace', values: snapshot })
+        const encoded = encodeRisuSaveLegacy({ type: 'replace', json: JSON.stringify(snapshot) })
         const da = await this.authFetch('/api/plugin-storage', {
             method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
         })
@@ -734,7 +718,8 @@ export class NodeStorage{
         const da = await this.authFetch('/api/plugin-storage')
         if (da.status === 404) return null
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchPluginStorageSidecar error: ${da.status}`)
-        const decoded = await decodeRisuSave(new Uint8Array(await da.arrayBuffer()))
+        // GET returns the map as a JSON string (lossless for nested keys).
+        const decoded = JSON.parse(await da.text())
         return decoded && typeof decoded === 'object' ? (decoded.pluginCustomStorage ?? null) : null
     }
 

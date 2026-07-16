@@ -18,7 +18,7 @@ describe('NodeStorage.savePluginStorageReplace — plain-map guard (codex round-
     const ns: any = new NodeStorage()
     // any network attempt would throw a DIFFERENT (fetch) error; asserting the guard
     // message proves it refused BEFORE encoding/sending.
-    const GUARD = /plain string-keyed|wipe the store/i
+    const GUARD = /plain object map|symbol key not allowed|enumerable data property/i
 
     it('refuses a Map (would serialize to {} and wipe)', async () => {
         await expect(ns.savePluginStorageReplace(new Map() as any)).rejects.toThrow(GUARD)
@@ -33,20 +33,22 @@ describe('NodeStorage.savePluginStorageReplace — plain-map guard (codex round-
         const nonEnum: any = {}; Object.defineProperty(nonEnum, 'k', { value: 'v', enumerable: false })
         const getterOnly: any = {}; Object.defineProperty(getterOnly, 'k', { get: () => 'v', enumerable: true })
         for (const bad of [symOnly, nonEnum, getterOnly]) {
-            await expect(ns.savePluginStorageReplace(bad)).rejects.toThrow(/plain string-keyed|non-string|enumerable data property/i)
+            await expect(ns.savePluginStorageReplace(bad)).rejects.toThrow(GUARD)
         }
     })
 
-    // codex round-7 HIGH #2: codec-unsafe keys rejected before encoding.
-    it('refuses codec-unsafe keys (__proto__, lone surrogate)', async () => {
+    // JSON representation: a "__proto__" key is now VALID (own key, round-trips
+    // losslessly) — it must PASS validation (the only rejection is the later network
+    // step, never a plain-object/symbol validation error).
+    it('accepts a __proto__ key (validation passes; only the network fails)', async () => {
         const protoKey: any = {}; Object.defineProperty(protoKey, '__proto__', { value: 'v', enumerable: true, writable: true, configurable: true })
-        await expect(ns.savePluginStorageReplace(protoKey)).rejects.toThrow(/codec-unsafe|__proto__/i)
-        const surrogate: any = {}; surrogate['\uD800'] = 'v'
-        await expect(ns.savePluginStorageReplace(surrogate)).rejects.toThrow(/codec-unsafe|surrogate/i)
+        const err = await ns.savePluginStorageReplace(protoKey).then(() => null, (e: any) => e)
+        expect(err).toBeTruthy()                          // rejects (no server → network error)
+        expect(String(err?.message)).not.toMatch(GUARD)   // NOT a validation rejection — the key was accepted
     })
 
-    // codex round-7 HIGH #1: a stateful Proxy is snapshotted in ONE enumeration before
-    // encoding, so it cannot present different keys to the validator vs the encoder.
+    // a stateful Proxy is snapshotted in ONE enumeration before encoding, so it cannot
+    // present different keys to the validator vs the encoder.
     it('reads a stateful Proxy exactly once (snapshot before encode)', async () => {
         let calls = 0
         const proxy = new Proxy({ keep: 'v' }, {

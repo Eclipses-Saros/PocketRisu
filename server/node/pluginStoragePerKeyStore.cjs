@@ -26,7 +26,7 @@
 //
 // Pure factory over a small kv interface so it unit-tests without booting the server.
 
-const { encodeRisuSaveLegacy, decodeRisuSave, validatePluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
+const { validatePluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
 
 // SSOT namespace. Per-key VALUE rows live under pluginStorage/data/, one KV row
 // each, never inside database.bin. The mode sentinel lives under pluginStorage/
@@ -65,62 +65,37 @@ function isValidMode(m) {
     return m.version === PLUGIN_STORAGE_MODE_VERSION && m.state === 'initialized';
 }
 
-// A replace payload MUST be a PLAIN object map. A string/array/null/typed object
-// (Date, Uint8Array, RegExp, Map, …) must NEVER be accepted or coerced to {} — a
-// typed object has zero enumerable own keys, so a full replace would silently DELETE
-// the whole store. Require the prototype to be Object.prototype or null (a bare map).
-function isPlainMap(x) {
-    if (!x || typeof x !== 'object' || Array.isArray(x)) return false;
-    const proto = Object.getPrototypeOf(x);
-    if (proto !== Object.prototype && proto !== null) return false;
-    // Every own key must be an ENUMERABLE STRING DATA property. A symbol key, a
-    // non-enumerable prop, or an accessor (getter) would vanish through Object.keys /
-    // serialization, so the map would silently shrink — and an object whose data is
-    // all in such props would serialize to {} and WIPE the store on a full replace.
-    // (A live Map/Date/typed array is already rejected by the prototype check.)
-    for (const k of Reflect.ownKeys(x)) {
-        if (typeof k !== 'string') return false;
-        const d = Object.getOwnPropertyDescriptor(x, k);
-        if (!d || !d.enumerable || !('value' in d)) return false;
-    }
-    return true;
-}
-
-// A key is codec-safe iff it survives the msgpack save codec UNCHANGED. The codec
-// rewrites "__proto__" (prototype-pollution guard) and replaces lone surrogates with
-// U+FFFD — either would silently collapse a map key on the wire. Reject such keys
-// FAIL-CLOSED (loud) rather than let a full replace delete the "vanished" row. Normal
-// keys (unicode, ':', '/', spaces, etc.) are unaffected.
-function isCodecSafeKey(k) {
-    if (typeof k !== 'string') return false;
-    if (k === '__proto__') return false;
-    if (typeof k.isWellFormed === 'function') return k.isWellFormed();
-    return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(k);
-}
-
-// Build a CANONICAL, immutable snapshot of an untrusted map in ONE enumeration:
-// validate it is a plain object with only enumerable string DATA keys, reject any
-// codec-unsafe key, and copy each descriptor VALUE once into a fresh null-proto
-// object. Downstream code uses ONLY this snapshot and NEVER re-enumerates the
-// original — a stateful Proxy can return different keys on a second read (validate
-// vs encode/write), which would pass validation then wipe the store (TOCTOU).
 // A bad-input error the HTTP layer maps to 400 (vs a 500 for other failures).
 function badPayload(msg) { const e = new Error(msg); e.code = 'PLUGIN_STORAGE_BAD_PAYLOAD'; return e; }
 
-function canonicalizeMap(x, label) {
+// FUNDAMENTAL REPRESENTATION: pluginCustomStorage is arbitrary-key JSON data. It is
+// transmitted (wire) and stored (per-key rows) as JSON — opaque strings — NEVER as
+// msgpack OBJECT keys. Consequences that dissolve the whole recurring class:
+//   - No codec ever re-interprets a key, so "__proto__"/lone-surrogate keys are never
+//     rewritten/collapsed at ANY depth (outer OR nested-in-value). JSON round-trips
+//     them losslessly; kvKeyFor makes the outer key a reversible path (a lone-surrogate
+//     OUTER key is genuinely un-representable as a path and fails closed there).
+//   - JSON.stringify at the client boundary is a SINGLE read of the live object, so a
+//     stateful Proxy / typed object cannot present different contents to validation vs
+//     serialization (no TOCTOU), and a Map/Date/array/primitive is not a plain object
+//     so it can never coerce to {} and wipe the store.
+// asPlainMap validates a full-map payload and snapshots it in ONE enumeration into a
+// fresh null-proto object used downstream. What it does NOT need (vs the old design):
+// a codec-safe-KEY check — keys now travel as JSON (lossless at any depth) and become
+// paths via kvKeyFor. What it STILL needs: reject a non-plain-object (Map/Date/typed/
+// array/primitive → would coerce to {} and wipe on a full replace), reject symbol /
+// non-enumerable / accessor keys (they drop through JSON and could silently shrink the
+// map), and read each value once (a stateful Proxy can't differ between validate and
+// use — single Reflect.ownKeys pass, descriptor value read once, never x[k]).
+function asPlainMap(x, label) {
     if (!x || typeof x !== 'object' || Array.isArray(x)) throw badPayload(`pluginStorage: ${label} must be a plain object map`);
     const proto = Object.getPrototypeOf(x);
     if (proto !== Object.prototype && proto !== null) throw badPayload(`pluginStorage: ${label} must be a plain object map`);
-    // SINGLE enumeration — do NOT call isPlainMap first (that would enumerate a second
-    // time; a stateful Proxy could return different keys between the two passes → TOCTOU
-    // wipe). Validate + snapshot in one Reflect.ownKeys walk, reading each descriptor
-    // value once (never x[k], so no getter/Proxy trap re-runs).
     const out = Object.create(null);
     for (const k of Reflect.ownKeys(x)) {
-        if (typeof k !== 'string') throw badPayload(`pluginStorage: ${label} has a non-string key`);
+        if (typeof k !== 'string') throw badPayload(`pluginStorage: ${label} has a non-string (symbol) key`);
         const d = Object.getOwnPropertyDescriptor(x, k);
         if (!d || !d.enumerable || !('value' in d)) throw badPayload(`pluginStorage: ${label} key "${k}" is not an enumerable data property`);
-        if (!isCodecSafeKey(k)) throw badPayload(`pluginStorage: ${label} key "${k}" is codec-unsafe (__proto__ or lone surrogate) — rejected fail-closed`);
         out[k] = d.value;
     }
     return out;
@@ -135,17 +110,17 @@ function createPluginStoragePerKeyStore(kv) {
     }
 
     // ---- Per-key primitives --------------------------------------------------
-    // One key's value → one KV row, wrapped in { value } so it decodes symmetrically.
-    // A single-key write is atomic in SQLite by itself; batch mutators below add a
-    // transaction (all-or-nothing) plus the mode/flat guard.
+    // One key's value → one KV row holding the value's JSON. JSON round-trips arbitrary
+    // JSON data LOSSLESSLY — including nested "__proto__"/surrogate keys the msgpack
+    // codec would rewrite. `value ?? null` so a stored undefined reads back as null; an
+    // ABSENT row reads back as undefined (the "no entry" signal loaders rely on).
     function writeKey(pluginKey, value) {
-        kv.set(kvKeyFor(pluginKey), Buffer.from(encodeRisuSaveLegacy({ value: value ?? null })));
+        kv.set(kvKeyFor(pluginKey), Buffer.from(JSON.stringify(value ?? null), 'utf8'));
     }
-    async function readKey(pluginKey) {
+    function readKey(pluginKey) {
         const raw = kv.get(kvKeyFor(pluginKey));
         if (!raw || raw.length === 0) return undefined;
-        const decoded = await decodeRisuSave(raw);
-        return decoded && typeof decoded === 'object' ? decoded.value : undefined;
+        return JSON.parse(Buffer.from(raw).toString('utf8'));
     }
     function removeKey(pluginKey) {
         kv.del(kvKeyFor(pluginKey));
@@ -208,7 +183,7 @@ function createPluginStoragePerKeyStore(kv) {
     // exist, or if un-migrated flat rows are present — a store with pre-existing rows
     // must be reconciled with replaceAll, not blessed into initialized (codex).
     function initializeFromMap(map) {
-        const snap = canonicalizeMap(map, 'initializeFromMap'); // one enumeration → immutable snapshot
+        const snap = asPlainMap(map, 'initializeFromMap'); // one enumeration → immutable snapshot
         inTransaction(() => {
             if (readMode() !== null) throw new Error('pluginStorage: initializeFromMap on a store that already has a mode sentinel');
             if ((listKeys() || []).length > 0) throw new Error('pluginStorage: initializeFromMap with pre-existing data rows — use reconcileReplace with the complete map');
@@ -239,11 +214,11 @@ function createPluginStoragePerKeyStore(kv) {
         });
     }
     // Delta apply: touch ONLY changed/removed keys — the concurrency-safe steady-state
-    // path. Requires an initialized store. Canonicalize `changed` (snapshot, one
-    // enumeration, codec-safe keys) BEFORE the transaction, and validate every removed
-    // key is codec-safe, so a Proxy/typed/codec-unsafe payload can never slip through.
+    // path. Requires an initialized store. `changed` is snapshotted (asPlainMap, one
+    // pass); `removed` is materialized into a fresh array in one pass. Keys are JSON/
+    // path-safe (kvKeyFor fails closed on an un-representable lone-surrogate key).
     function applyDelta({ changed, removed } = {}) {
-        const snap = (changed === undefined || changed === null) ? null : canonicalizeMap(changed, 'delta changed');
+        const snap = (changed === undefined || changed === null) ? null : asPlainMap(changed, 'delta changed');
         // Materialize `removed` into a fresh array in ONE pass (never re-iterate the
         // original — a stateful/Proxy array could present different elements to the
         // validate pass vs the delete pass → TOCTOU deletion). Validate each here.
@@ -252,7 +227,6 @@ function createPluginStoragePerKeyStore(kv) {
             if (!Array.isArray(removed)) throw badPayload('pluginStorage: delta removed must be an array');
             for (const k of removed) {
                 if (typeof k !== 'string') throw badPayload('pluginStorage: delta removed key must be a string');
-                if (!isCodecSafeKey(k)) throw badPayload(`pluginStorage: delta removed key "${k}" is codec-unsafe — rejected fail-closed`);
                 rm.push(k);
             }
         }
@@ -285,7 +259,7 @@ function createPluginStoragePerKeyStore(kv) {
     // or already-initialized. Corrupt / legacy-with-rows / flat all fail LOUD — use
     // reconcileReplace for explicit recovery/import.
     function replaceAll(map) {
-        const snap = canonicalizeMap(map, 'replace'); // snapshot BEFORE any precondition read
+        const snap = asPlainMap(map, 'replace'); // snapshot BEFORE any precondition read
         const st = modeState();
         if (st === 'corrupt') throw new Error('pluginStorage: refusing replace — mode sentinel is corrupt (use reconcileReplace to recover)');
         if (st === 'legacy' && (listKeys() || []).length > 0) throw new Error('pluginStorage: refusing replace — data rows without an initialized mode (ambiguous; use reconcileReplace)');
@@ -298,7 +272,7 @@ function createPluginStoragePerKeyStore(kv) {
     // Distinct from replaceAll so the steady-state path can never silently overwrite a
     // corrupt/ambiguous store — recovery must be an explicit choice.
     function reconcileReplace(map) {
-        const snap = canonicalizeMap(map, 'reconcile'); // snapshot; never re-enumerate the original
+        const snap = asPlainMap(map, 'reconcile'); // snapshot; never re-enumerate the original
         writeWholeMap(snap);
     }
 
@@ -380,11 +354,10 @@ function createPluginStoragePerKeyStore(kv) {
         const rows = readAllRaw();
         const out = {};
         for (const { pluginKey, raw } of rows) {
-            const decoded = await decodeRisuSave(raw);
-            if (!decoded || typeof decoded !== 'object' || !Object.hasOwn(decoded, 'value')) {
-                throw new Error(`pluginStorage: corrupt row for "${pluginKey}" (no value field) — failing closed`);
-            }
-            safeSet(out, pluginKey, decoded.value);
+            let v;
+            try { v = JSON.parse(Buffer.from(raw).toString('utf8')); }
+            catch { throw new Error(`pluginStorage: corrupt row for "${pluginKey}" (invalid JSON) — failing closed`); }
+            safeSet(out, pluginKey, v); // safeSet: a "__proto__" plugin key is an OWN key, no pollution
         }
         return out;
     }
@@ -496,5 +469,4 @@ module.exports = {
     PLUGIN_STORAGE_MODE_KEY,
     PLUGIN_STORAGE_MODE_VERSION,
     kvKeyFor,
-    isPlainMap,
 };

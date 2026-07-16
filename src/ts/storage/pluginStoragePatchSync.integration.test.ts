@@ -80,12 +80,15 @@ const enc = (o: any) => Buffer.from(encodeRisuSaveLegacy(o))
 const psPost = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
     method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }), body: enc(env),
 }).then((r) => r.status)
+// The pluginCustomStorage data travels as a JSON STRING in the envelope's `json` field
+// (never msgpack object keys), and GET returns the map as a JSON string.
 async function getPerKey(): Promise<Record<string, any>> {
     const r = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
     if (r.status === 404) return {}
-    return (await decodeRisuSave(new Uint8Array(await r.arrayBuffer()))).pluginCustomStorage ?? {}
+    return JSON.parse(await r.text()).pluginCustomStorage ?? {}
 }
-const replacePerKey = (values: Record<string, any>) => psPost({ type: 'replace', values })
+const replacePerKey = (values: Record<string, any>) => psPost({ type: 'replace', json: JSON.stringify(values) })
+const psDelta = (changed: Record<string, any>, removed: string[] = []) => psPost({ type: 'delta', json: JSON.stringify({ changed, removed }) })
 const writeDb = (dbObj: any) => fetch(`${BASE}/api/write`, {
     method: 'POST', headers: authHeaders({ 'file-path': hex('database/database.bin'), 'content-type': 'application/octet-stream' }), body: enc(dbObj),
 }).then((r) => r.status)
@@ -112,7 +115,7 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
     it('per-key delta round-trips through the real server (POST changed → GET)', async () => {
         if (!booted) return
         expect(await replacePerKey({ 'vector_rag:shard:0': JSON.stringify({ v: 1 }), 'hayaku.v1.durable.a': 'x' })).toBe(200)
-        expect(await psPost({ type: 'delta', changed: { 'vector_rag:shard:0': JSON.stringify({ v: 2 }) }, removed: [] })).toBe(200)
+        expect(await psDelta({ 'vector_rag:shard:0': JSON.stringify({ v: 2 }) }, [])).toBe(200)
         const back = await getPerKey()
         expect(JSON.parse(back['vector_rag:shard:0']).v).toBe(2)   // updated
         expect(back['hayaku.v1.durable.a']).toBe('x')              // untouched key survives
@@ -121,7 +124,7 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
     it('DELETE is real: a removed key is gone from the store (no orphan resurrection)', async () => {
         if (!booted) return
         await replacePerKey({ keep: 'a', gone: 'b' })
-        expect(await psPost({ type: 'delta', changed: {}, removed: ['gone'] })).toBe(200)
+        expect(await psDelta({}, ['gone'])).toBe(200)
         const back = await getPerKey()
         expect(back.keep).toBe('a')
         expect('gone' in back).toBe(false)   // really deleted (removeKey), not a lingering orphan
@@ -131,8 +134,8 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         if (!booted) return
         await replacePerKey({ base: 'b' })
         const [s1, s2] = await Promise.all([
-            psPost({ type: 'delta', changed: { A: 'a1' }, removed: [] }),
-            psPost({ type: 'delta', changed: { B: 'b1' }, removed: [] }),
+            psDelta({ A: 'a1' }, []),
+            psDelta({ B: 'b1' }, []),
         ])
         expect(s1).toBe(200); expect(s2).toBe(200)
         const back = await getPerKey()
@@ -173,7 +176,7 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         // since a later delta POST does not create a snapshot.
         const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).filter(Boolean).sort().reverse()[0]
         expect(snapKey, 'a snapshot should exist').toBeTruthy()
-        await psPost({ type: 'delta', changed: { A: 'a1-CHANGED' }, removed: [] })
+        await psDelta({ A: 'a1-CHANGED' }, [])
         expect((await getPerKey()).A).toBe('a1-CHANGED')
         const r = await fetch(`${BASE}/api/db/snapshots/restore`, {
             method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify({ key: snapKey }),
@@ -194,7 +197,7 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         const list = await (await fetch(`${BASE}/api/db/snapshots`, { headers: authHeaders() })).json()
         const snaps: any[] = Array.isArray(list) ? list : (list.snapshots ?? list.items ?? [])
         const snapKey = snaps.map((s: any) => (typeof s === 'string' ? s : s.key)).filter(Boolean).sort().reverse()[0]
-        await psPost({ type: 'delta', changed: { C: 'c-added-after-snapshot' }, removed: [] })
+        await psDelta({ C: 'c-added-after-snapshot' }, [])
         expect((await getPerKey()).C).toBe('c-added-after-snapshot')
         const r = await fetch(`${BASE}/api/db/snapshots/restore`, {
             method: 'POST', headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify({ key: snapKey }),
@@ -204,19 +207,21 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         expect(after).toEqual({ A: 'a', B: 'b' })   // C is gone — live reset to the snapshot, not merged
     })
 
-    it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {
+    it('malformed envelope is rejected 400 (no type, or no json string)', async () => {
         if (!booted) return
-        expect(await psPost({ changed: { A: 'x' } })).toBe(400)   // looks like a delta but no discriminator
+        expect(await psPost({ changed: { A: 'x' } })).toBe(400)             // no discriminator
+        expect(await psPost({ type: 'replace' })).toBe(400)                 // no json field
+        expect(await psPost({ type: 'replace', json: 'not json{' })).toBe(400) // invalid JSON
     })
 
-    it('replace with a non-object values is rejected 400 (never coerced to {} → no silent wipe)', async () => {
+    it('replace with a non-object json payload is rejected 400 (never coerced to {} → no silent wipe)', async () => {
         if (!booted) return
-        await replacePerKey({ survivor: 'keep-me' })                       // seed real memory
-        expect(await psPost({ type: 'replace', values: 'bad' })).toBe(400) // malformed → refused
-        expect(await psPost({ type: 'replace' })).toBe(400)               // missing values → refused
-        // a TYPED object survives the msgpack codec (Date has zero enumerable keys);
-        // accepting it would wipe every row. Must be refused, not coerced.
-        expect(await psPost({ type: 'replace', values: new Date() })).toBe(400)
-        expect((await getPerKey()).survivor).toBe('keep-me')              // memory intact (not wiped)
+        await replacePerKey({ survivor: 'keep-me' })                        // seed real memory
+        // JSON that parses to a non-object (string / array / number) must be refused —
+        // accepting it would coerce to {} and wipe every row.
+        expect(await psPost({ type: 'replace', json: JSON.stringify('bad') })).toBe(400)
+        expect(await psPost({ type: 'replace', json: JSON.stringify([1, 2]) })).toBe(400)
+        expect(await psPost({ type: 'replace', json: JSON.stringify(42) })).toBe(400)
+        expect((await getPerKey()).survivor).toBe('keep-me')               // memory intact (not wiped)
     })
 })

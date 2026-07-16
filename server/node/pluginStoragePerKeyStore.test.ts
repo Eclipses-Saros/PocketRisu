@@ -140,7 +140,7 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
     // empty key ("") and a key literally named "meta" — leaves the sentinel,
     // preflights conflicts, and fails closed on corruption.
     const flatPath = (k: string) => `pluginStorage/${encodeURIComponent(k)}.bin`
-    const seedFlat = (kv: any, k: string, v: any) => kv.m.set(flatPath(k), Buffer.from(encodeRisuSaveLegacy({ value: v })))
+    const seedFlat = (kv: any, k: string, v: any) => kv.m.set(flatPath(k), Buffer.from(JSON.stringify(v)))
 
     it('migrates every flat value incl. "" and "meta"; sentinel at control/ is left; idempotent', async () => {
         const kv = fakeKv()
@@ -173,7 +173,7 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         // identical dst → drop stale flat copy
         const kv1 = fakeKv()
         seedFlat(kv1, 'k', 'v')
-        kv1.m.set('pluginStorage/data/k.bin', Buffer.from(encodeRisuSaveLegacy({ value: 'v' }))) // identical dst
+        kv1.m.set('pluginStorage/data/k.bin', Buffer.from(JSON.stringify('v'))) // identical dst
         const s1 = createPluginStoragePerKeyStore(kv1)
         expect(s1.migrateLegacyLayout().migrated).toBe(1)
         expect(kv1.m.has(flatPath('k'))).toBe(false)
@@ -182,7 +182,7 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         // differing dst → throw, preserve BOTH (never overwrite possibly-newer memory)
         const kv2 = fakeKv()
         seedFlat(kv2, 'k', 'OLD')
-        kv2.m.set('pluginStorage/data/k.bin', Buffer.from(encodeRisuSaveLegacy({ value: 'NEW' }))) // differing dst
+        kv2.m.set('pluginStorage/data/k.bin', Buffer.from(JSON.stringify('NEW'))) // differing dst
         const s2 = createPluginStoragePerKeyStore(kv2)
         expect(() => s2.migrateLegacyLayout()).toThrow(/conflict|failing closed/i)
         expect(kv2.m.has(flatPath('k'))).toBe(true)          // flat preserved (rolled back)
@@ -242,7 +242,7 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         // decoding the captured buffers yields the pre-mutation values
         const map: Record<string, any> = {}
         for (const { pluginKey, raw } of rows) {
-            map[pluginKey] = (await decodeRisuSave(new Uint8Array(raw))).value
+            map[pluginKey] = JSON.parse(Buffer.from(raw).toString())
         }
         expect(map).toEqual({ A: 'a', B: 'b' })
     })
@@ -274,20 +274,21 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         const s = createPluginStoragePerKeyStore(kv)
         s.initializeFromMap({ keep: 'v', doomed: 'v' })
         const bad = String.fromCharCode(0xd800)
-        // a codec-unsafe changed key is rejected BEFORE the transaction → nothing applies
-        expect(() => s.applyDelta({ changed: { [bad]: 'x' }, removed: ['doomed'] })).toThrow(/codec-unsafe|surrogate/i)
-        expect(await s.readKey('doomed')).toBe('v')      // removal never happened
+        // an un-pathable (lone-surrogate) changed key throws in writeKey → the whole
+        // transaction rolls back → the removal of 'doomed' is undone too.
+        expect(() => s.applyDelta({ changed: { [bad]: 'x' }, removed: ['doomed'] })).toThrow(/not encodable|surrogate/i)
+        expect(await s.readKey('doomed')).toBe('v')      // removal rolled back
         expect(await s.readKey('keep')).toBe('v')
     })
 
-    // a codec-unsafe removed key is rejected BEFORE any removal runs → all survive.
-    it('applyDelta rejects a codec-unsafe removed key before touching anything', async () => {
+    // an un-pathable removed key throws mid-transaction → any completed removal rolls back.
+    it('applyDelta rolls back when a removed key is un-pathable (lone surrogate)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
         s.initializeFromMap({ keepA: '1', keepB: '2' })
         const bad = String.fromCharCode(0xd800)
-        expect(() => s.applyDelta({ removed: ['keepA', bad] })).toThrow(/codec-unsafe|surrogate/i)
-        expect(await s.readKey('keepA')).toBe('1')       // no removal happened
+        expect(() => s.applyDelta({ removed: ['keepA', bad] })).toThrow(/not encodable|surrogate/i)
+        expect(await s.readKey('keepA')).toBe('1')       // removal rolled back
         expect(await s.readKey('keepB')).toBe('2')
     })
 
@@ -420,7 +421,7 @@ describe('pluginStoragePerKeyStore — mode sentinel (SSOT step 1d)', () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
         s.initializeMode() // establish an empty out-of-band store first
-        kv.m.set(`pluginStorage/${encodeURIComponent('flat')}.bin`, Buffer.from(encodeRisuSaveLegacy({ value: 'v' }))) // a flat row appears (half-migrated)
+        kv.m.set(`pluginStorage/${encodeURIComponent('flat')}.bin`, Buffer.from(JSON.stringify('v'))) // a flat row appears (half-migrated)
         expect(() => s.writeMany({ x: '1' })).toThrow(/flat|reconcile|failing/i)
     })
 
@@ -433,7 +434,7 @@ describe('pluginStoragePerKeyStore — mode sentinel (SSOT step 1d)', () => {
     it('initializeMode refuses when data rows already exist (no blessing a partial set)', () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        kv.m.set(kvKeyFor('pre'), Buffer.from(encodeRisuSaveLegacy({ value: 'x' })))
+        kv.m.set(kvKeyFor('pre'), Buffer.from(JSON.stringify('x')))
         expect(() => s.initializeMode()).toThrow(/empty store|reconcileReplace/i)
     })
 
@@ -504,7 +505,7 @@ describe('pluginStoragePerKeyStore — reconciliation classifier (SSOT step 1e)'
     it('AMBIGUOUS: un-migrated flat legacy rows present → fail closed (not legacy)', () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        kv.m.set(`pluginStorage/${encodeURIComponent('legacyKey')}.bin`, Buffer.from(encodeRisuSaveLegacy({ value: 'v' })))
+        kv.m.set(`pluginStorage/${encodeURIComponent('legacyKey')}.bin`, Buffer.from(JSON.stringify('v')))
         expect(s.classify({ characters: [] }).state).toBe('ambiguous')
     })
 
@@ -549,7 +550,7 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
     it('initializeFromMap REFUSES pre-existing data rows (must reconcile via replaceAll)', () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        kv.m.set(kvKeyFor('pre'), Buffer.from(encodeRisuSaveLegacy({ value: 'x' }))) // a stray data row
+        kv.m.set(kvKeyFor('pre'), Buffer.from(JSON.stringify('x'))) // a stray data row
         expect(() => s.initializeFromMap({ a: '1' })).toThrow(/pre-existing data rows|reconcile/i)
     })
 
@@ -592,27 +593,48 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
         expect(calls).toBe(1)                              // proxy enumerated exactly once
     })
 
-    // codex round-7 HIGH #2: keys the msgpack codec would rewrite (__proto__) or mangle
-    // (lone surrogate) are rejected FAIL-CLOSED, never sent to collapse silently.
-    it('canonicalize rejects codec-unsafe keys (__proto__, lone surrogate); accepts normal keys', async () => {
+    // JSON representation: a "__proto__" key now round-trips LOSSLESSLY (own key, no
+    // pollution) — no codec rewrites it. A lone-surrogate OUTER key is un-representable
+    // as a KV path and is rejected fail-closed by kvKeyFor. Normal keys are fine.
+    it('__proto__ key round-trips (own key, no pollution); a lone-surrogate key is rejected', async () => {
         const s = createPluginStoragePerKeyStore(fakeKv())
-        const protoKey: any = {}; Object.defineProperty(protoKey, '__proto__', { value: 'v', enumerable: true, writable: true, configurable: true })
-        expect(() => s.replaceAll(protoKey)).toThrow(/codec-unsafe|__proto__/i)
+        const protoKey: any = {}; Object.defineProperty(protoKey, '__proto__', { value: 'first', enumerable: true, writable: true, configurable: true })
+        s.replaceAll(protoKey)
+        const back = await s.readAll()
+        expect(Object.hasOwn(back, '__proto__')).toBe(true)
+        expect((back as any).__proto__).toBe('first')
+        expect(Object.getPrototypeOf(back)).toBe(Object.prototype)   // NOT polluted
+
         const surrogate: any = {}; surrogate['\uD800'] = 'v'
-        expect(() => s.replaceAll(surrogate)).toThrow(/codec-unsafe|surrogate/i)
-        // normal unicode / slash / colon / space keys are fine
+        expect(() => createPluginStoragePerKeyStore(fakeKv()).replaceAll(surrogate)).toThrow(/not encodable|surrogate/i)
+
         const s2 = createPluginStoragePerKeyStore(fakeKv())
         s2.replaceAll({ 'a:b/c': '1', '記憶': '2', 'with space': '3' })
         expect(await s2.readAll()).toEqual({ 'a:b/c': '1', '記憶': '2', 'with space': '3' })
     })
 
-    it('applyDelta also canonicalizes changed and rejects codec-unsafe removed keys', async () => {
+    // JSON: a VALUE containing nested "__proto__"/surrogate keys survives losslessly
+    // (the msgpack codec would have collapsed them) — this was codex round-9 HIGH #2.
+    it('a value with nested __proto__ / surrogate keys round-trips losslessly', async () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        const nested: any = { plain: 1 }
+        Object.defineProperty(nested, '__proto__', { value: 'first', enumerable: true, writable: true, configurable: true })
+        nested['\uD800lone'] = 'surr'
+        s.replaceAll({ k: nested })
+        const back: any = (await s.readAll()).k
+        expect(back.__proto__).toBe('first')
+        expect(back['\uD800lone']).toBe('surr')
+        expect(back.plain).toBe(1)
+    })
+
+    it('applyDelta: a __proto__ changed key round-trips; a lone-surrogate removed key is rejected', async () => {
         const s = createPluginStoragePerKeyStore(fakeKv())
         s.initializeFromMap({ a: '1' })
-        const protoChanged: any = {}; Object.defineProperty(protoChanged, '__proto__', { value: 'v', enumerable: true, writable: true, configurable: true })
-        expect(() => s.applyDelta({ changed: protoChanged })).toThrow(/codec-unsafe|__proto__/i)
-        expect(() => s.applyDelta({ removed: ['\uD800'] })).toThrow(/codec-unsafe|surrogate/i)
-        expect(await s.readAll()).toEqual({ a: '1' })   // untouched by the rejected deltas
+        const protoChanged: any = {}; Object.defineProperty(protoChanged, '__proto__', { value: 'pv', enumerable: true, writable: true, configurable: true })
+        s.applyDelta({ changed: protoChanged })
+        expect(((await s.readAll()) as any).__proto__).toBe('pv')      // stored losslessly
+        expect(() => s.applyDelta({ removed: ['\uD800'] })).toThrow(/not encodable|surrogate/i) // un-pathable key
+        expect(await s.readKey('a')).toBe('1')                         // untouched by the rejected removal
     })
 
     // codex round-8 HIGH#2: a key in both changed and removed = write-then-delete = net
@@ -665,7 +687,7 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
     it('boot migration relocates flat rows but leaves the store AMBIGUOUS (not initialized)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        kv.m.set(`pluginStorage/${encodeURIComponent('shard:0')}.bin`, Buffer.from(encodeRisuSaveLegacy({ value: 'v' })))
+        kv.m.set(`pluginStorage/${encodeURIComponent('shard:0')}.bin`, Buffer.from(JSON.stringify('v')))
         expect(s.migrateLegacyLayout().migrated).toBe(1)
         expect(s.modeState()).toBe('legacy')               // NOT blessed initialized
         expect(s.classify({ characters: [] }).state).toBe('ambiguous') // rows without a mode → loud
@@ -680,12 +702,12 @@ describe('pluginStoragePerKeyStore — mode wiring (SSOT step 2)', () => {
 
 // codex HIGH: authoritative full reads must FAIL CLOSED, never serialize a short map.
 describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)', () => {
-    it('throws on a corrupt row (decoded record without a value field)', async () => {
+    it('throws on a corrupt row (invalid JSON bytes — out-of-band corruption)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
         s.initializeFromMap({ a: '1' })                     // initialized store
-        // a row that decodes to an object WITHOUT a `value` property (out-of-band corruption)
-        kv.m.set(kvKeyFor('b'), Buffer.from(encodeRisuSaveLegacy({ notValue: 'x' })))
+        // a row whose bytes are not valid JSON (out-of-band corruption)
+        kv.m.set(kvKeyFor('b'), Buffer.from('not json{', 'utf8'))
         await expect(s.readAll()).rejects.toThrow(/corrupt row|failing closed/i)
     })
 
@@ -708,7 +730,7 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
     it('un-migrated flat rows → readAll throws (would be invisible to the data/ scan)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)
-        kv.m.set(`pluginStorage/${encodeURIComponent('flat')}.bin`, Buffer.from(encodeRisuSaveLegacy({ value: 'v' })))
+        kv.m.set(`pluginStorage/${encodeURIComponent('flat')}.bin`, Buffer.from(JSON.stringify('v')))
         await expect(s.readAll()).rejects.toThrow(/flat|failing closed/i)
     })
 })
