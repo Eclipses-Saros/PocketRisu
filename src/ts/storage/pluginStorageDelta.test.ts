@@ -92,15 +92,33 @@ describe('pluginStorageDelta — per-key delta without a resident copy (C3)', ()
         expect(({} as any).evil).toBeUndefined() // global prototype not polluted
     })
 
-    it('detects distinctions msgpack persists but JSON.stringify collapses (F4)', () => {
-        // {a:undefined} vs {}, [undefined] vs [null], NaN vs null all JSON.stringify
-        // to the same text but encode to DIFFERENT msgpack bytes -> must be detected.
-        expect(Object.keys(computePluginStorageDelta({ k: {} }, seedPluginStorageBaseline({ k: { a: undefined } }))).length >= 0).toBe(true)
-        expect(computePluginStorageDelta({ k: {} }, seedPluginStorageBaseline({ k: { a: undefined } })).changed).toHaveProperty('k')
-        expect(computePluginStorageDelta({ k: [null] }, seedPluginStorageBaseline({ k: [undefined] })).changed).toHaveProperty('k')
-        expect(computePluginStorageDelta({ k: null }, seedPluginStorageBaseline({ k: NaN })).changed).toHaveProperty('k')
-        // and no false positive when genuinely unchanged
-        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: { a: undefined } }, seedPluginStorageBaseline({ k: { a: undefined } })))).toBe(true)
+    it('fingerprint matches the JSON that is actually sent — JSON-equal values do not re-send (F4)', () => {
+        // The wire + per-key store are JSON (savePluginStorageDelta JSON.stringifies; the
+        // row is JSON.stringify(value)). So the fingerprint is over that same JSON. Values
+        // that JSON.stringify identically ({a:undefined}=={} , [undefined]==[null], NaN==null)
+        // store IDENTICALLY, so there is nothing to re-send — the old msgpack fingerprint
+        // reported a phantom change that the JSON wire could never satisfy, so the baseline
+        // never converged (the F4 divergence). Now they are correctly equal → empty delta.
+        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: {} }, seedPluginStorageBaseline({ k: { a: undefined } })))).toBe(true)
+        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: [null] }, seedPluginStorageBaseline({ k: [undefined] })))).toBe(true)
+        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: null }, seedPluginStorageBaseline({ k: NaN })))).toBe(true)
+        // a genuine JSON-visible change IS still detected
+        expect(computePluginStorageDelta({ k: { a: 1 } }, seedPluginStorageBaseline({ k: { a: 2 } })).changed).toHaveProperty('k')
+        expect(computePluginStorageDelta({ k: 'x' }, seedPluginStorageBaseline({ k: 'y' })).changed).toHaveProperty('k')
+        // idempotent: an unchanged value never re-sends
+        expect(pluginStorageDeltaIsEmpty(computePluginStorageDelta({ k: { a: 1 } }, seedPluginStorageBaseline({ k: { a: 1 } })))).toBe(true)
+    })
+
+    it('refuses to compute a WIPING delta from a non-plain live container (F4)', () => {
+        // A Map/Date/typed-array/primitive enumerates to zero own keys; treating it as the
+        // map would mark every baseline key removed = full wipe. Reject loudly instead.
+        const base = seedPluginStorageBaseline({ a: '1', b: '2' })
+        for (const bad of [new Map([['a', 1]]), new Date(), new Uint8Array([1]), [1, 2], 'x', 42] as any[]) {
+            expect(() => computePluginStorageDelta(bad, base), String(bad)).toThrow(/plain object|wiping delta/i)
+        }
+        // null/undefined are legitimately-empty (not a malformed container): allowed
+        expect(computePluginStorageDelta(null, base).removed.sort()).toEqual(['a', 'b'])
+        expect(computePluginStorageDelta({}, base).removed.sort()).toEqual(['a', 'b'])
     })
 
     it('snapshots object values at compute time (later mutation does not change the delta)', () => {

@@ -12,24 +12,19 @@
 // settings viewer, clear(), or a direct/nested mutation), which an intercept/op-log
 // would miss.
 //
-// The digest MUST be collision-resistant AND match the PERSISTED serialization, or
-// a change is silently suppressed and the server left stale (the "never silent
-// loss" cardinal sin). A JSON.stringify digest is wrong twice: a 32-bit order-
-// independent hash collides ({a:1,b:2} vs {a:2,b:1}), AND JSON.stringify collapses
-// distinctions msgpack actually persists ({a:undefined} vs {}, [undefined] vs
-// [null], NaN vs null). So we fingerprint the EXACT msgpack bytes with the SAME
-// codec (Packr{useRecords:false}) that encodeRisuSaveLegacy persists with, plus a
-// length prefix and two seeded 53-bit hashes. Result: two values persist
-// identically exactly when their fingerprints match. msgpackr is a leaf dependency,
-// so this stays free of the risuSave/Svelte graph.
-import { Packr } from "msgpackr/index-no-eval"
+// The digest MUST be collision-resistant AND match the SERIALIZATION THAT IS ACTUALLY
+// SENT/PERSISTED, or a change is silently suppressed and the server left stale (the
+// "never silent loss" cardinal sin). In the rows-as-authority layout pcs travels the
+// wire as a JSON string (savePluginStorageDelta → JSON.stringify) and is stored per-key
+// as JSON.stringify(value) — NOT msgpack. So the fingerprint is taken over the EXACT
+// canonical JSON string that is sent: fingerprint equality then means the sent/stored
+// bytes are identical. (The old msgpack fingerprint mismatched the JSON wire — e.g. a
+// value with an `undefined` member fingerprinted one way but was JSON-sent another,
+// diverging the baseline. Fingerprinting the JSON that is actually sent removes that.)
+// Two seeded 53-bit hashes + a length prefix over the UTF-8 JSON bytes.
 
 export type PluginStorageBaseline = Map<string, string>
 export interface PluginStorageDelta { changed: Record<string, any>; removed: string[] }
-
-// MUST mirror encodeRisuSaveLegacy's packr config so fingerprint bytes equal the
-// persisted bytes (a less-discriminating codec here could miss a real change).
-const packr = new Packr({ useRecords: false })
 
 // cyrb53 over raw bytes: well-distributed 53-bit hash (imul-based); two seeds give
 // an effectively ~106-bit composite with the length prefix.
@@ -46,16 +41,38 @@ function cyrb53Bytes(bytes: Uint8Array, seed: number): number {
     return 4294967296 * (2097151 & h2) + (h1 >>> 0)
 }
 
+const _fpEnc = new TextEncoder()
 function fingerprint(value: any): string {
-    let bytes: Uint8Array
-    try { bytes = packr.encode(value) }
+    let json: string | undefined
+    try { json = JSON.stringify(value) }
     catch (e) {
-        // Non-encodable (cyclic, etc.): the actual send would throw too, so a change
-        // here surfaces loudly at save time. Distinct sentinel so it never silently
-        // equals a real encoded value.
-        return `!enc:${typeof value}:${(e as any)?.message ?? ''}:${String(value)}`
+        // Cyclic / BigInt / other non-JSON-encodable: the actual JSON send would throw
+        // too, so a change here surfaces loudly at save time. Distinct sentinel so it
+        // never silently equals a real encoded value.
+        return `!json:${typeof value}:${(e as any)?.message ?? ''}`
     }
+    // JSON.stringify(undefined | function | symbol) === undefined — not representable as
+    // a stored value; a stable sentinel keeps the baseline consistent (the wire omits
+    // such a key, so it is effectively "absent" and this never equals a real value).
+    if (json === undefined) return '!undef'
+    const bytes = _fpEnc.encode(json)
     return `${bytes.length}:${cyrb53Bytes(bytes, 0x9e3779b9)}:${cyrb53Bytes(bytes, 0x85ebca6b)}`
+}
+
+// The live pcs container MUST be a plain object before we diff it. A Map/Date/typed-
+// array/class-instance enumerates to ZERO own keys via Object.keys, so treating it as
+// the map would mark EVERY baseline key as removed — a full wipe. A primitive is
+// likewise not a map. Reject loudly (abort the save) rather than compute a destructive
+// delta. null/undefined are allowed and mean "genuinely empty" (→ {} below).
+function assertPlainPcsContainer(current: unknown): void {
+    if (current === null || current === undefined) return
+    if (typeof current !== 'object' || Array.isArray(current)) {
+        throw new Error('pluginCustomStorage delta: live value is not a plain object (refusing to compute a wiping delta)')
+    }
+    const proto = Object.getPrototypeOf(current)
+    if (proto !== null && proto !== Object.prototype) {
+        throw new Error('pluginCustomStorage delta: live value is a non-plain object (Map/Date/typed/instance) — refusing to compute a wiping delta')
+    }
 }
 
 // Snapshot a value so the delta captures it AT compute time. A plugin can mutate an
@@ -82,6 +99,7 @@ export function computePluginStorageDelta(
     current: Record<string, any> | null | undefined,
     baseline: PluginStorageBaseline,
 ): PluginStorageDelta {
+    assertPlainPcsContainer(current) // throw on Map/Date/typed/array/primitive (would wipe)
     const cur = current && typeof current === 'object' ? current : {}
     const changed: Record<string, any> = Object.create(null)
     const seen = new Set<string>()
