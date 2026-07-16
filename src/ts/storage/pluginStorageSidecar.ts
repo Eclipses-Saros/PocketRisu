@@ -38,6 +38,62 @@ let sidecarWriteEnabled = false
 export function isPluginStorageSidecarWriteEnabled(): boolean { return sidecarWriteEnabled }
 export function setPluginStorageSidecarWriteEnabled(value: boolean): void { sidecarWriteEnabled = !!value }
 
+// ── Boot reconciliation (pure decision; the applier lives in bootstrap) ───────
+// The ACCOUNT mode is authoritative and account-wide, so boot ALWAYS probes it (even
+// when this device isn't opted in): once any device migrates the account out-of-band,
+// every device must use the sidecar or diverge from an empty inline block. The GET is
+// discriminated and MUST NOT be collapsed to "empty":
+//   fetchSidecar() === null   → legacy (404): no rows; inline in database.bin is authority.
+//   fetchSidecar() === object → initialized (200, even {}): the per-key store is authority.
+//   fetchSidecar() throws     → error (500/network): FAIL CLOSED — send nothing (never wipe
+//                               the server rows), keep the decoded inline for this session.
+// A legacy store REJECTS deltas, so the FIRST initialization on an opted-in device must be a
+// full REPLACE (this was the missing production call). This function returns a plan; bootstrap
+// applies the effects (flag, in-memory pcs, baseline, migration full-write). Kept pure so the
+// blocker paths (404 / 200 {} / 500 / migrate) are unit-testable without a live server.
+export interface PcsBootPlan {
+    enableSidecar: boolean                    // → setPluginStorageSidecarWriteEnabled
+    pcs: Record<string, any> | null           // non-null → set decodedDb.pluginCustomStorage
+    baseline: Record<string, any>             // → resyncPluginStorageBaseline
+    markMigration: boolean                    // true → markPluginStorageMigration (strip inline)
+    warn?: string                             // set on fail-closed paths (bootstrap logs it)
+}
+
+export async function planPcsBoot(args: {
+    localOptIn: boolean
+    inlineObj: Record<string, any>
+    fetchSidecar: () => Promise<Record<string, any> | null>
+    replaceSidecar: (map: Record<string, any>) => Promise<void>
+}): Promise<PcsBootPlan> {
+    const { localOptIn, inlineObj, fetchSidecar, replaceSidecar } = args
+    let fetched: Record<string, any> | null
+    try {
+        fetched = await fetchSidecar()
+    } catch (e) {
+        // FAIL CLOSED: mode unknown → disable sidecar (send nothing), keep decoded inline.
+        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `account-mode probe failed — sidecar writes disabled this session (fail closed): ${e}` }
+    }
+    if (fetched !== null) {
+        // INITIALIZED (authoritative, even {}). Adopt the sidecar regardless of local flag.
+        // Strip any stale inline block still riding this DB via a full write.
+        return { enableSidecar: true, pcs: fetched, baseline: fetched, markMigration: Object.keys(inlineObj).length > 0 }
+    }
+    // LEGACY (404).
+    if (!localOptIn) {
+        // Not opted in: stay legacy, inline authoritative (byte-identical to pre-b3).
+        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false }
+    }
+    // Opted-in device MIGRATES: replace-first (delta is rejected on a legacy store).
+    try {
+        await replaceSidecar(inlineObj)
+    } catch (e) {
+        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `legacy→initialized migration (replace) failed — staying legacy this session (fail closed): ${e}` }
+    }
+    // Replace acked: server now holds exactly inlineObj as rows. Adopt the sidecar, seed the
+    // baseline, and full-write to strip the inline block from database.bin.
+    return { enableSidecar: true, pcs: inlineObj, baseline: inlineObj, markMigration: true }
+}
+
 // Layout discriminator for the directory marker. v2 = PER-KEY store (one KV entry
 // per plugin key). v1 was the never-shipped single-blob sidecar; no v1 data exists
 // in production (the write flag was OFF since inception), so readers treat a v1 (or

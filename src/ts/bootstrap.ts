@@ -11,7 +11,8 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
-import { setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
+import { setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled, planPcsBoot } from "./storage/pluginStorageSidecar";
+import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -38,30 +39,41 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
 /**
  * Loads the application data.
  */
-// Load pluginCustomStorage for a freshly decoded DB. b3 (flag ON): pcs is
-// out-of-band per-key — fetch the authoritative map from the server; a pre-b3
-// legacy DB still carries inline pcs, so the first save migrates it (baseline
-// seeded EMPTY → the delta sends every key). Flag OFF: inline pcs stays as decoded.
+// Load pluginCustomStorage for a freshly decoded DB, reconciling the ACCOUNT-WIDE
+// server mode with this device's per-device opt-in.
+//
+// The server mode is authoritative and account-wide, so we ALWAYS probe it (even when
+// this device isn't opted in): once ANY device migrates the account out-of-band, every
+// device must read/write the sidecar or it would diverge from an empty inline block.
+// The GET is DISCRIMINATED and consumed as such — never collapsed to "empty":
+//   fetch() === null  → legacy (404): no per-key rows; inline in database.bin is authority.
+//   fetch() === object → initialized (200, even {}): the per-key store is authority.
+//   fetch() throws     → error (500/network): FAIL CLOSED — mode unknown, so send nothing
+//                        (never wipe the server rows) and use the decoded inline this session.
 async function loadPluginStorageInto(decodedDb: any): Promise<void> {
-    if (!isPluginStorageSidecarWriteEnabled()) {
+    // The out-of-band pcs store is a patch-sync (server) feature. On non-server platforms
+    // there is no /api/plugin-storage endpoint, so pcs stays inline (legacy) — do not probe.
+    if (!supportsPatchSync) {
         resyncPluginStorageBaseline(decodedDb?.pluginCustomStorage)
         return
     }
-    let perKeyMap: Record<string, any> = {}
-    try { perKeyMap = (await forageStorage.realStorage.fetchPluginStorageSidecar()) ?? {} } catch { perKeyMap = {} }
-    const legacyInline = (decodedDb?.pluginCustomStorage && typeof decodedDb.pluginCustomStorage === 'object') ? decodedDb.pluginCustomStorage : null
-    if (Object.keys(perKeyMap).length === 0 && legacyInline && Object.keys(legacyInline).length > 0) {
-        // pre-migration legacy DB: plugins see the inline map now; baseline EMPTY so
-        // the first save's delta sends every key (populating the per-key store), and
-        // markPluginStorageMigration() forces that save to be a full write so it also
-        // strips the inline block from the server DB (a patch can't remove it).
-        decodedDb.pluginCustomStorage = legacyInline
-        resyncPluginStorageBaseline({})
-        markPluginStorageMigration()
-    } else {
-        decodedDb.pluginCustomStorage = perKeyMap
-        resyncPluginStorageBaseline(perKeyMap)
-    }
+    const inlineObj: Record<string, any> =
+        (decodedDb?.pluginCustomStorage && typeof decodedDb.pluginCustomStorage === 'object' && !Array.isArray(decodedDb.pluginCustomStorage))
+            ? decodedDb.pluginCustomStorage : {}
+
+    // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate); this is
+    // the thin applier of its plan.
+    const plan = await planPcsBoot({
+        localOptIn: isPluginStorageSidecarWriteEnabled(),
+        inlineObj,
+        fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
+        replaceSidecar: (m) => forageStorage.realStorage.savePluginStorageReplace(m),
+    })
+    if (plan.warn) console.error('[pluginStorage]', plan.warn)
+    setPluginStorageSidecarWriteEnabled(plan.enableSidecar)
+    if (plan.pcs !== null) decodedDb.pluginCustomStorage = plan.pcs
+    resyncPluginStorageBaseline(plan.baseline)
+    if (plan.markMigration) markPluginStorageMigration()
 }
 
 export async function loadData() {
