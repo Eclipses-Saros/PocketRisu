@@ -912,6 +912,21 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
 
 let importInProgress = false;
 
+// A backup import/restore replaces the WHOLE store (clears every prefix + reinstalls in one
+// synchronous transaction). CAS-less mutators (assets, pluginStorage, unconditional /api/write)
+// cannot detect that replacement, so accepting one mid-import would be a lie: a successful
+// import silently supersedes it. Refuse every mutation while an import is in progress with 503
+// so the client retries and rebases against the imported state. database.bin's /api/patch also
+// carries hash-CAS, but we refuse it too for one uniform, auditable rule. Call right after the
+// auth/session checks, before any mutation.
+function rejectDuringImport(res) {
+    if (importInProgress) {
+        res.status(503).json({ error: 'a backup import/restore is in progress — retry after it completes' });
+        return true;
+    }
+    return false;
+}
+
 // ── Cloudflare Quick Tunnel ─────────────────────────────────────────────────
 const TUNNEL_DISABLED = process.env.RISU_TUNNEL_DISABLED === 'true';
 let tunnelProcess = null;
@@ -2268,53 +2283,36 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     await flushPendingDb();
     createBackupAndRotate();
 
-    // Per-batch SYNCHRONOUS flush — never hold a transaction open across the stream's
-    // `await`s. better-sqlite3 is synchronous + single-connection: a `BEGIN` held across
-    // `for await` lets any concurrent handler write JOIN the import's transaction (ACKed
-    // to its client, then erased when the import commits/rolls back — the ACK is a lie),
-    // and a connection-global `synchronous = OFF` weakens every other handler's durability
-    // for the whole import. Instead we buffer entries and flush each batch inside ONE
-    // synchronous transaction (no `await` inside → the event loop can't run mid-flush →
-    // nothing can join it), using the EXISTING chunk-aware kvSet so database.bin still
-    // chunks. Between flushes NO transaction is open, so a concurrent write commits
-    // independently. Whole-import atomicity is a NON-GOAL (the prior code was already
-    // non-atomic: it committed every BATCH_SIZE entries); a crash between flushes leaves a
-    // partial import, exactly as before.
-    let pendingBatch = []; // [{ storageKey, value }]
-    let liveCleared = false;
-    function clearLivePrefixesOnce() {
-        if (liveCleared) return;
-        kvDelPrefix('assets/');
-        kvDelPrefix('inlay/');
-        kvDelPrefix('inlay_thumb/');
-        kvDelPrefix('inlay_meta/');
-        kvDelPrefix('inlay_info/');
-        kvDelPrefix('coldstorage/');
-        // Composer drafts are session/device-local and not carried in the backup;
-        // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
-        kvDelPrefix('drafts/');
-        // Same reasoning as clearExistingData (save-folder import path): wipe stale
-        // remote payloads from the prior user before this backup's contents land.
-        // .bin backups never carry REMOTE blocks today, so the migration won't
-        // resolveRemote on them — but keeping the two import paths consistent
-        // avoids a contamination regression if that ever changes (upstream sync,
-        // plugin-generated buffers, etc.).
-        kvDelPrefix('remotes/');
-        // Allow remote-block migration to re-evaluate against the new database.bin.
-        // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
-        // format only — but a fresh import is a clear "data changed" signal.)
-        kvDel(REMOTE_MIGRATION_MARKER_KEY);
-        clearEntities();
-        liveCleared = true;
-    }
-    // Flush the accumulated KV entries in ONE synchronous transaction. The FIRST flush also
-    // performs the destructive prefix clears + entity wipe (before its writes), so the clear
-    // and its first writes land as one atomic unit — no reader ever sees a "cleared but not
-    // yet written" state.
-    const applyBatch = sqliteDb.transaction((recs) => {
-        clearLivePrefixesOnce();
-        for (const rec of recs) kvSet(rec.storageKey, rec.value);
+    // STAGE the streamed entries, then INSTALL them in ONE synchronous transaction after the
+    // stream completes. Two invariants:
+    //   1. Never hold a transaction across the stream's `await`s. better-sqlite3 is synchronous
+    //      + single-connection, so a `BEGIN` held across `for await` lets a concurrent handler
+    //      write JOIN the import's transaction (ACK-then-erase). We stage in short synchronous
+    //      batches with nothing open between them.
+    //   2. The whole install is ATOMIC: the destructive clears, the DB image, and the per-key
+    //      plugin store all land in one transaction, so a malformed/short backup rolls back to
+    //      the prior state with NO new-DB/old-pcs split (never a new DB paired with the prior
+    //      account's plugin rows), and a concurrent write can never be erased by a half-applied
+    //      import. Concurrent writes are additionally refused up front (importInProgress) — see
+    //      the mutator guards — since a CAS-less write (assets/pcs) cannot detect the replace.
+    // Small KV (assets/coldstorage) stages to a DISK-BACKED table — NOT a temp_store=MEMORY temp
+    // table, which would balloon RAM on a large backup. database.bin is held OUT of the table
+    // (kvSet chunks ONLY that key, so a raw staging row would hit the BLOB bind limit chunkStore
+    // removes); it is the last stream entry in practice, so it is held briefly and written
+    // chunk-aware in the install.
+    sqliteDb.exec('CREATE TABLE IF NOT EXISTS import_staging (k TEXT PRIMARY KEY, v BLOB)');
+    sqliteDb.exec('DELETE FROM import_staging');
+    const stageInsert = sqliteDb.prepare('INSERT OR REPLACE INTO import_staging (k, v) VALUES (?, ?)');
+    // Copy every staged row → live kv in ONE insert-select. Staged values are all small
+    // non-DB_BLOB_KEY entries (never chunked), so this equals a kvSet per key — but as a single
+    // statement it avoids the better-sqlite3 "database is busy" error you would hit iterating a
+    // SELECT while issuing kvSet writes on the same connection, and never loads them into RAM.
+    const stageCopyToKv = sqliteDb.prepare('INSERT OR REPLACE INTO kv (key, value, updated_at) SELECT k, v, ? FROM import_staging');
+    const stageBatch = sqliteDb.transaction((recs) => {
+        for (const r of recs) stageInsert.run(r.storageKey, r.value);
     });
+    let pendingBatch = []; // small KV awaiting a staging flush: [{ storageKey, value }]
+    let dbBlobValue = null; // database.bin held out of the staging table (chunk-aware kvSet at install)
 
     try {
         for await (const chunk of dataSource) {
@@ -2409,22 +2407,25 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     sawPcsEntry = true;
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
-                    const storageValue = storageKey.startsWith('coldstorage/')
-                        ? encodeColdStorageCanonicalBuffer(
-                            parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
-                        )
-                        : data;
-                    pendingBatch.push({ storageKey, value: storageValue });
                     if (storageKey === 'database/database.bin') {
+                        // Hold OUT of the staging table (see §1a: kvSet chunks only this key).
+                        // Copied so it does not retain the whole parse buffer until the install.
+                        dbBlobValue = Buffer.from(data);
                         hasDatabase = true;
                     } else {
+                        const storageValue = storageKey.startsWith('coldstorage/')
+                            ? encodeColdStorageCanonicalBuffer(
+                                parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
+                            )
+                            : data;
+                        pendingBatch.push({ storageKey, value: storageValue });
                         assetsRestored += 1;
-                    }
-                    // Flush when the batch is full, or as soon as database.bin is queued so
-                    // the large (chunked) blob is not held resident alongside a backlog.
-                    if (storageKey === 'database/database.bin' || pendingBatch.length >= BATCH_SIZE) {
-                        applyBatch(pendingBatch);
-                        pendingBatch = [];
+                        // Stage in short synchronous batches; nothing is held open across the
+                        // stream's `await` between batches.
+                        if (pendingBatch.length >= BATCH_SIZE) {
+                            stageBatch(pendingBatch);
+                            pendingBatch = [];
+                        }
                     }
                 }
             });
@@ -2460,34 +2461,57 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 writeStagingSidecarSync(id, info);
             }
         }
-        // Final apply: any remaining buffered entries + the pluginCustomStorage reconcile,
-        // in ONE synchronous transaction (no `await` inside → the event loop can't run and
-        // nothing can join it). Reconcile pcs here so the DB image and the per-key store land
-        // together (never DB-new paired with the prior account's rows). ALWAYS clear the live
-        // pcs prefix first: a legacy/upstream backup carries pcs INLINE in database.bin and
-        // has NO pluginStorage.risudat, so clearing resets the store to legacy — the imported
-        // inline is then authoritative, not shadowed by the prior account's initialized rows.
-        // A present entry reconciles the exact saved map; it is validated BEFORE this
-        // destructive apply (malformed → throw → this transaction rolls back, never coerced to
-        // {}/wipe). reconcileReplace nests as a SAVEPOINT inside this transaction.
-        const applyFinal = sqliteDb.transaction((recs) => {
-            clearLivePrefixesOnce();
-            for (const rec of recs) kvSet(rec.storageKey, rec.value);
-            kvDelPrefix('pluginStorage/');
+        // Flush any tail of staged small KV (no tx held across an await), then INSTALL the whole
+        // import in ONE synchronous transaction (no `await` inside → the event loop can't run,
+        // nothing can join it). Order inside the transaction:
+        //   1. Validate the pcs blob FIRST — before any destructive write — so a malformed blob
+        //      throws and rolls the WHOLE install back (prior DB + prior pcs intact, never
+        //      coerced to {}/wipe, never a new-DB/old-pcs split).
+        //   2. Clear the live prefixes + entities.
+        //   3. Copy staged small KV → live, then write database.bin (chunk-aware).
+        //   4. ALWAYS clear the live pcs prefix, then reconcile. Clearing resets a legacy/upstream
+        //      backup (pcs INLINE in database.bin, no pluginStorage.risudat) to legacy so the
+        //      imported inline is authoritative, not shadowed by the prior account's rows.
+        // The DB image and the per-key plugin store commit together — never a new DB paired with
+        // the prior account's plugin rows. reconcileReplace nests as a SAVEPOINT here.
+        if (pendingBatch.length) { stageBatch(pendingBatch); pendingBatch = []; }
+        const applyInstall = sqliteDb.transaction(() => {
+            let decodedPcs = null;
             if (sawPcsEntry) {
-                const decodedPcs = JSON.parse((capturedPcsBlob || Buffer.alloc(0)).toString('utf8')); // JSON blob (lossless nested keys)
+                decodedPcs = JSON.parse((capturedPcsBlob || Buffer.alloc(0)).toString('utf8')); // JSON blob (lossless nested keys)
                 if (!decodedPcs || typeof decodedPcs !== 'object' || !Object.hasOwn(decodedPcs, 'pluginCustomStorage')) {
                     throw new Error('pluginStorage.risudat present but missing pluginCustomStorage — failing closed');
                 }
+            }
+            kvDelPrefix('assets/');
+            kvDelPrefix('inlay/');
+            kvDelPrefix('inlay_thumb/');
+            kvDelPrefix('inlay_meta/');
+            kvDelPrefix('inlay_info/');
+            kvDelPrefix('coldstorage/');
+            // Composer drafts are session/device-local and not carried in the backup;
+            // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
+            kvDelPrefix('drafts/');
+            // Same reasoning as clearExistingData: wipe stale remote payloads from the prior
+            // user before this backup's contents land, keeping the import paths consistent.
+            kvDelPrefix('remotes/');
+            // Allow remote-block migration to re-evaluate against the new database.bin.
+            kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            clearEntities();
+            // Copy staged small KV → live (single insert-select), then the DB blob chunk-aware.
+            stageCopyToKv.run(Date.now());
+            kvSet('database/database.bin', dbBlobValue);
+            kvDelPrefix('pluginStorage/');
+            if (sawPcsEntry) {
                 pluginStoragePerKeyStore.reconcileReplace(decodedPcs.pluginCustomStorage);
             }
         });
-        applyFinal(pendingBatch);
-        pendingBatch = [];
+        applyInstall();
+        sqliteDb.exec('DELETE FROM import_staging');
     } catch (error) {
-        // No outer transaction to roll back — each applyBatch/applyFinal is its own
-        // synchronous transaction that better-sqlite3 auto-rolls-back if its callback throws.
-        // Already-committed earlier flushes intentionally survive (non-atomic import, above).
+        // The install is one synchronous transaction that better-sqlite3 auto-rolls-back if its
+        // callback throws, so the prior DB + prior pcs survive intact as a consistent pair.
+        try { sqliteDb.exec('DELETE FROM import_staging'); } catch (_) {}
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         await fs.rm(backupInlayDir, { recursive: true, force: true }).catch(() => {});
         throw error;
@@ -3495,6 +3519,7 @@ app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
+    if (rejectDuringImport(res)) return;
     const filePath = req.headers['file-path'];
     if (!filePath) {
         res.status(400).send({ error:'File path required' });
@@ -3627,6 +3652,7 @@ app.post('/api/write', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return;
     const filePath = req.headers['file-path'];
     const fileContent = req.body;
     if (!filePath || !fileContent) {
@@ -3749,6 +3775,7 @@ app.post('/api/write', async (req, res, next) => {
 
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return;
     try {
         await queueStorageOperation(async () => {
             await flushPendingDb();
@@ -3772,6 +3799,7 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return;
     const filePath = req.headers['file-path'];
     const patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
@@ -4004,6 +4032,7 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
 app.post('/api/assets/bulk-write', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return;
     try {
         const entries = req.body; // {key: string, value: base64}[]
         if(!Array.isArray(entries)){
@@ -4768,6 +4797,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return;
     try {
         await queueStorageOperation(async () => {
             const chaId = req.params.chaId;
@@ -4865,15 +4895,10 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 app.post('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
-    // NOTE: there is deliberately NO `importInProgress` guard here (there used to be a
-    // two-point one — commit 8721f577 "2f"). It was needed only because the backup importer
-    // held a transaction OPEN across async stream reads, so a pcs write accepted mid-import
-    // joined that transaction and was erased when it committed/rolled back. The importer now
-    // flushes in per-batch SYNCHRONOUS transactions (importBackupFromSource), never holding
-    // one across an `await`, so a pcs write during an import commits independently — it
-    // survives if the import fails, or is legitimately superseded when a successful restore
-    // rewrites the whole pluginStorage/ prefix. That matches how /api/write treats
-    // database.bin during an import (no guard), so pcs is no longer stricter than the DB.
+    // pcs has NO per-write CAS, so an import replacing the whole pluginStorage/ prefix would
+    // silently supersede a write accepted here. Refuse up front (fast path); re-checked below
+    // right before the store mutation to close the check-then-import TOCTOU.
+    if (rejectDuringImport(res)) return;
     try {
         await queueStorageOperation(async () => {
             let body;
@@ -4901,6 +4926,10 @@ app.post('/api/plugin-storage', async (req, res, next) => {
             let payload;
             try { payload = JSON.parse(body.json); }
             catch { return res.status(400).json({ error: 'plugin-storage json is not valid JSON' }); }
+            // TOCTOU re-check: an import may have started while we awaited/decoded above. The
+            // store mutators below are synchronous (no await before them), so if the flag is
+            // clear now the write commits before any import install can run; if set, refuse.
+            if (rejectDuringImport(res)) return;
             try {
                 if (t === 'delta') {
                     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -5853,6 +5882,7 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
 app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
+    if (rejectDuringImport(res)) return; // a snapshot restore also replaces the whole store — never overlap a backup import
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!key.startsWith(DB_BACKUP_PREFIX)) {

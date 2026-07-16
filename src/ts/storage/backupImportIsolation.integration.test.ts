@@ -195,60 +195,80 @@ describe('backup import — transaction isolation (real server)', () => {
         expect(await getPerKey()).toEqual({ k: 'RTA', other: 'keep' })
     }, 30000)
 
-    // THE REGRESSION. A write that lands while the import's transaction is open must be
-    // honored truthfully: if it returns 200 its effect must survive. Under the defect it
-    // joins the import's open BEGIN and is erased by the import's ROLLBACK — a lie.
-    it('CONCURRENCY: a write ACKed 200 during an import is NOT erased by the import rollback', async () => {
-        // pre-import committed baseline for the canary
+    // TRUTHFUL CONCURRENCY (exclusion). A CAS-less write has no way to detect that the
+    // whole store is being replaced under it, so a 200 during an import would be a lie:
+    // a successful import silently supersedes it, and a failed partial import can erase it.
+    // The truthful contract is MUTUAL EXCLUSION — a write during an in-flight import is
+    // REJECTED (503) so the client retries and rebases against the imported state. This
+    // FAILS today (the importer does not serialize against mutators, so the write returns
+    // 200) and passes once every mutator refuses while importInProgress.
+    it('EXCLUSION: an /api/write during an in-flight import is rejected 503 (not a silent 200)', async () => {
         expect(await writeCanary('before')).toBe(200)
         expect(await readCanary()).toBe('before')
 
         const { req, done } = openStreamingImport()
-        // Feed one complete asset entry so the importer enters its stream loop and clears
-        // prefixes / opens its transaction, then parks awaiting more body.
-        req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
-        await delay(300) // let the server process the chunk and park at `for await` (BEGIN open)
-
-        // Fire a concurrent write and WAIT for its truthful-looking 200 BEFORE ending the
-        // stream. This guarantees the write's synchronous kvSet executes while the import's
-        // transaction is open.
-        const canaryStatus = await writeCanary('after')
-        expect(canaryStatus).toBe(200) // the server told the client the write succeeded
-
-        // End the stream with NO database.risudat → importBackupFromSource throws
-        // ("Backup does not contain database.risudat") → ROLLBACK.
-        req.end()
-        const result = await done
-        expect(result.status).not.toBe(200) // the import itself failed, as designed
-
-        // Truthful ACK: the 200'd write must still be observable. Under the defect it was
-        // rolled back with the import and this reads 'before' (silent loss) → test FAILS
-        // pre-refactor. After stage->sync-apply the write commits independently → 'after'.
-        expect(await readCanary()).toBe('after')
+        try {
+            // Feed one complete asset entry so the importer enters its stream loop;
+            // importInProgress is set at handler entry, so it is already true here.
+            req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
+            await delay(300) // let the server park mid-stream with importInProgress = true
+            // The write must be REFUSED, not accepted-then-superseded/erased.
+            expect(await writeCanary('after')).toBe(503)
+        } finally {
+            // ALWAYS end the stream, even if an assertion above threw — otherwise the import
+            // stays parked with importInProgress=true and poisons later tests (409s / false pass).
+            try { req.end() } catch {}
+            await done.catch(() => {})
+        }
+        // The prior value is intact: the refused write never applied, and the failed import
+        // (no database.risudat) rolled back without touching testonly/.
+        expect(await readCanary()).toBe('before')
     }, 30000)
 
-    // The pcs write-during-import guard ("2f", commit 8721f577) was removed once the
-    // importer stopped holding a tx across the stream. This pins the post-removal contract:
-    // a pcs write during an import is ACCEPTED (not 503-rejected) and TRUTHFUL — if the
-    // import fails it survives (commits independently), never ACK-then-erased. Mirrors the
-    // database.bin CONCURRENCY test; proves pcs is no longer stricter than the DB.
-    it('CONCURRENCY(pcs): a plugin-storage write ACKed during a failing import survives', async () => {
+    // Same contract for pcs (which has NO CAS at all). A pcs write during an import must be
+    // 503-refused, not silently accepted. This is the case my earlier item-5 removal of the
+    // "2f" guard broke: without exclusion a pcs delta returns 200 and is then wiped by a
+    // successful import's pluginStorage/ reconcile — a silent supersede the client can't see.
+    it('EXCLUSION(pcs): a plugin-storage write during an in-flight import is rejected 503', async () => {
         await replacePerKey({ p: 'before' }) // initialize the store (a legacy store rejects deltas)
         expect((await getPerKey()).p).toBe('before')
 
         const { req, done } = openStreamingImport()
-        req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
-        await delay(300) // import parks mid-stream
+        try {
+            req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
+            await delay(300) // import parks mid-stream, importInProgress = true
+            // Refused, not accepted. Under the removed guard this returned 200 (silent supersede).
+            expect(await psDelta({ p: 'DURING' }, [])).toBe(503)
+        } finally {
+            try { req.end() } catch {}
+            await done.catch(() => {})
+        }
+        expect((await getPerKey()).p).toBe('before') // unchanged — the write was refused
+    }, 30000)
 
-        // Guard removed → accepted (200), not 503. Under the old guard this was rejected.
-        expect(await psDelta({ p: 'DURING' }, [])).toBe(200)
+    // ATOMICITY of the DB/PCS pair. The original importer reconciled pcs in the SAME
+    // transaction as database.bin, so a malformed pcs blob threw before COMMIT and left the
+    // prior DB + prior pcs intact (never new-DB paired with the prior account's plugin rows).
+    // The per-batch refactor committed database.bin first and validated pcs later, so a
+    // malformed pcs after a valid DB left new-DB + old-pcs — cross-account contamination.
+    // This FAILS today (customCSS becomes the new value) and passes once the apply validates
+    // pcs BEFORE any destructive write and commits db.bin + pcs together.
+    it('ATOMICITY(pair): malformed pcs after a valid DB leaves prior database.bin + pcs intact', async () => {
+        expect(await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'PRIOR-DB' })).toBe(200)
+        expect(await replacePerKey({ survivor: 'prior-pcs' })).toBe(200)
 
-        req.end() // no database.risudat → import fails (applyFinal, which clears pcs, never runs)
-        const result = await done
-        expect(result.status).not.toBe(200)
+        // Valid database.risudat FOLLOWED by a malformed pluginStorage.risudat.
+        const validDb = enc({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'NEW-DB' })
+        const badPcs = Buffer.from('{ this is not valid json', 'utf8')
+        const backup = Buffer.concat([
+            encodeBackupEntry('database.risudat', validDb),
+            encodeBackupEntry('pluginStorage.risudat', badPcs),
+        ])
+        expect(await importBackup(backup)).not.toBe(200) // import fails on the malformed pcs
 
-        // Truthful: the pcs write committed independently and survives the import's failure.
-        expect((await getPerKey()).p).toBe('DURING')
+        // Atomic: neither the DB nor the pcs moved — no new-DB/old-pcs split.
+        expect((await readDb()).customCSS).toBe('PRIOR-DB')
+        expect(await getPerKey()).toEqual({ survivor: 'prior-pcs' })
     }, 30000)
 
     it('ATOMICITY: a failed import leaves the prior database.bin + pcs fully intact', async () => {
