@@ -391,6 +391,23 @@ function createPluginStoragePerKeyStore(kv) {
         return { state: 'legacy', ...detail };
     }
 
+    // Single decision for every lifecycle EXPORT (nodeonly backup entry, upstream
+    // re-inline): how must an export treat the per-key store? Classifies the STORE
+    // (classify(null) — no DB decode). Returns:
+    //   'reinline'    — initialized: rows are authoritative; the export MUST pull them
+    //                   (an out-of-band DB carries no inline pcs).
+    //   'passthrough' — clean legacy: inline pcs already rides database.bin; ship as-is.
+    //   THROWS        — ambiguous (rows without a mode / flat rows) or corrupt: there are
+    //                   rows the inline DB does NOT carry, so shipping it as-is would
+    //                   SILENTLY DROP them. Abort (a failed export is recoverable; silent
+    //                   memory loss is not).
+    function exportDisposition() {
+        const { state, reason } = classify(null);
+        if (state === 'initialized') return 'reinline';
+        if (state === 'legacy') return 'passthrough';
+        throw new Error(`pluginStorage export aborted: store is ${state}${reason ? ` (${reason})` : ''} — refusing to export a DB that would silently drop out-of-band plugin memory`);
+    }
+
     // ---- One-time layout migration ------------------------------------------
     // Move every flat pre-namespace value row (pluginStorage/<enc>.bin, no nested
     // '/') down to pluginStorage/data/<enc>.bin. INCLUDES the empty key and a key
@@ -458,8 +475,34 @@ function createPluginStoragePerKeyStore(kv) {
         writeKey, readKey, removeKey, writeMany, replaceAll, reconcileReplace, applyDelta,
         loader, listKeys, hasLegacyFlatRows, readAllRaw, readAll,
         readMode, modeState, isInitialized, initializeMode, initializeFromMap,
-        classify, migrateLegacyLayout, inTransaction,
+        classify, exportDisposition, migrateLegacyLayout, inTransaction,
     };
+}
+
+// Key-order-insensitive structural equality for JSON-representable values. Used to
+// verify a lossy target encode (msgpack) did NOT rename/drop a key or value versus the
+// authoritative JSON source. Sensitive to key IDENTITY (a renamed "__proto__" or a
+// replaced lone-surrogate key makes the key sets differ) and to value changes.
+function deepEqualJSON(a, b) {
+    if (a === b) return true;
+    if (a === null || b === null) return a === b;
+    const ta = typeof a, tb = typeof b;
+    if (ta !== tb) return false;
+    if (ta !== 'object') return a === b; // primitives (JSON has no NaN/±Inf)
+    const aArr = Array.isArray(a), bArr = Array.isArray(b);
+    if (aArr !== bArr) return false;
+    if (aArr) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (!deepEqualJSON(a[i], b[i])) return false;
+        return true;
+    }
+    const ak = Object.keys(a), bk = Object.keys(b);
+    if (ak.length !== bk.length) return false;
+    for (const k of ak) {
+        if (!Object.hasOwn(b, k)) return false; // key renamed/dropped by the codec
+        if (!deepEqualJSON(a[k], b[k])) return false;
+    }
+    return true;
 }
 
 module.exports = {
@@ -469,4 +512,5 @@ module.exports = {
     PLUGIN_STORAGE_MODE_KEY,
     PLUGIN_STORAGE_MODE_VERSION,
     kvKeyFor,
+    deepEqualJSON,
 };

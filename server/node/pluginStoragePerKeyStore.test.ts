@@ -202,19 +202,20 @@ describe('pluginStoragePerKeyStore — per-key server store (B inc 4, b3)', () =
         expect(() => createPluginStoragePerKeyStore({})).toThrow(/kv/i)
     })
 
-    // C6b export/import: the backup carries one reassembled blob
-    // (encodeRisuSaveLegacy({pluginCustomStorage: readAll})); import decodes it and
-    // fans it back out via replaceAll. Prove the whole round-trip is lossless.
-    it('export blob → import replaceAll round-trips the whole per-key map (backup path)', async () => {
+    // Backup export/import: the real backup entry is a JSON blob
+    // (JSON.stringify({pluginCustomStorage: readAll})); import parses it and reconciles
+    // it back out. Prove the whole round-trip is lossless with the JSON contract (msgpack
+    // is NOT used for this blob — it would rename nested "__proto__"/surrogate keys).
+    it('export blob → import reconcileReplace round-trips the whole per-key map (backup path, JSON)', async () => {
         const src = createPluginStoragePerKeyStore(fakeKv())
         src.initializeFromMap({ ...KEYS })          // out-of-band source
-        // export: reassemble → encode
-        const blob = Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: await src.readAll() }))
+        // export: reassemble → JSON-encode (the real pluginStorageBackupEntry format)
+        const blob = Buffer.from(JSON.stringify({ pluginCustomStorage: await src.readAll() }), 'utf8')
         // import into a store with a stale legacy row that must be cleared. Import is
         // an explicit RECOVERY → reconcileReplace (overwrites whatever state is live).
         const dst = createPluginStoragePerKeyStore(fakeKv())
         dst.writeKey('stale-should-be-removed', 'old')
-        const decoded = await decodeRisuSave(new Uint8Array(blob))
+        const decoded = JSON.parse(blob.toString('utf8'))
         dst.reconcileReplace(decoded.pluginCustomStorage)
         expect(await dst.readAll()).toEqual(KEYS)
         expect(await dst.readKey('stale-should-be-removed')).toBeUndefined() // wholesale replace
@@ -514,6 +515,116 @@ describe('pluginStoragePerKeyStore — reconciliation classifier (SSOT step 1e)'
         s.initializeFromMap({ a: '1' })
         // even an EMPTY {} field means a writer bypassed the SSOT
         expect(s.classify({ characters: [], pluginCustomStorage: {} }).state).toBe('ambiguous')
+    })
+})
+
+// SSOT 2e (codex R11 finding 2): every lifecycle EXPORT (nodeonly backup entry,
+// upstream re-inline) must abort — never silently ship a DB missing rows — for any
+// store state other than clean-legacy or initialized. exportDisposition is the single
+// gate both sites use.
+describe('pluginStoragePerKeyStore — exportDisposition (SSOT 2e, no silent drop on export)', () => {
+    it('clean legacy (no sentinel, no rows) → passthrough (inline rides the DB)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        expect(s.exportDisposition()).toBe('passthrough')
+    })
+
+    it('initialized → reinline (rows are authoritative, export must pull them)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.initializeFromMap({ ...KEYS })
+        expect(s.exportDisposition()).toBe('reinline')
+    })
+
+    it('initialized-EMPTY → reinline ({} still gets an entry so a restore clears stale rows)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.initializeFromMap({})
+        expect(s.exportDisposition()).toBe('reinline')
+    })
+
+    it('AMBIGUOUS (rows without a mode) → THROWS (would silently drop the rows)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.writeKey('a', '1') // rows, but initializeMode never ran
+        expect(() => s.exportDisposition()).toThrow(/ambiguous|silently drop|refusing/i)
+    })
+
+    it('AMBIGUOUS (un-migrated flat legacy rows) → THROWS', () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        kv.m.set(`pluginStorage/${encodeURIComponent('legacyKey')}.bin`, Buffer.from(JSON.stringify('v')))
+        expect(() => s.exportDisposition()).toThrow(/ambiguous|flat|silently drop|refusing/i)
+    })
+
+    it('CORRUPT sentinel → THROWS', () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        kv.m.set('pluginStorage/control/mode.json', Buffer.from('garbage{', 'utf8'))
+        expect(() => s.exportDisposition()).toThrow(/corrupt|silently drop|refusing/i)
+    })
+})
+
+// SSOT 2e (codex R11 finding 4): the upstream export re-encodes the re-inlined map to
+// msgpack (the target format), which can rename exotic keys the local JSON store holds
+// losslessly. deepEqualJSON is the round-trip guard that aborts such an export.
+describe('pluginStoragePerKeyStore — deepEqualJSON (lossless re-inline guard)', () => {
+    const { deepEqualJSON } = perKey as any
+    it('equal for identical nested maps regardless of key ORDER', () => {
+        expect(deepEqualJSON({ a: 1, b: { c: 2, d: 3 } }, { b: { d: 3, c: 2 }, a: 1 })).toBe(true)
+    })
+    it('detects a RENAMED key (the msgpack "__proto__" failure mode)', () => {
+        // JSON.parse makes "__proto__" an OWN enumerable key (a literal would set the
+        // prototype instead). This is exactly the key msgpack renames on re-encode.
+        const withProto = JSON.parse('{"__proto__":"v"}')
+        expect(Object.keys(withProto)).toEqual(['__proto__']) // sanity: own key, not proto
+        expect(deepEqualJSON(withProto, { renamed: 'v' })).toBe(false)
+        expect(deepEqualJSON(withProto, JSON.parse('{"__proto__":"v"}'))).toBe(true)
+    })
+    it('detects a DROPPED key', () => {
+        expect(deepEqualJSON({ a: 1, b: 2 }, { a: 1 })).toBe(false)
+    })
+    it('detects a changed VALUE and a changed type', () => {
+        expect(deepEqualJSON({ a: 1 }, { a: 2 })).toBe(false)
+        expect(deepEqualJSON({ a: [1, 2] }, { a: [1, 2, 3] })).toBe(false)
+        expect(deepEqualJSON({ a: '1' }, { a: 1 })).toBe(false)
+        expect(deepEqualJSON({ a: {} }, { a: [] })).toBe(false)
+    })
+    it('handles null / primitives at the top level', () => {
+        expect(deepEqualJSON(null, null)).toBe(true)
+        expect(deepEqualJSON(null, {})).toBe(false)
+        expect(deepEqualJSON('x', 'x')).toBe(true)
+    })
+})
+
+// SSOT 2e (codex R11 findings 1 & 3): backup import ALWAYS clears pluginStorage/ then,
+// if the backup carried a pcs entry, reconciles the exact saved map — all inside the
+// restore transaction. Model that sequence at the store level (the server wraps the
+// same two ops in the DB-restore BEGIN/COMMIT).
+describe('pluginStoragePerKeyStore — backup import clear+reconcile (SSOT 2e)', () => {
+    const clearPrefix = (kv: any) => { for (const k of [...kv.m.keys()].filter((x: string) => x.startsWith('pluginStorage/'))) kv.m.delete(k) }
+
+    it('legacy/upstream backup (NO pcs entry): clearing resets a prior initialized store to legacy (imported inline wins)', () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        s.initializeFromMap({ ...KEYS })          // prior account: initialized rows + sentinel
+        expect(s.classify({ characters: [] }).state).toBe('initialized')
+        clearPrefix(kv)                            // import of an inline-only backup: no reconcile
+        // now legacy — a GET/readAll no longer shadows the imported inline pcs with stale rows
+        expect(s.classify({ characters: [], pluginCustomStorage: { imported: '1' } }).state).toBe('legacy')
+        expect(s.listKeys()).toEqual([])
+        expect(s.modeState()).toBe('legacy')
+    })
+
+    it('backup WITH a pcs entry: clear+reconcile replaces prior rows exactly (even over an ambiguous prior state)', async () => {
+        const kv = fakeKv()
+        const s = createPluginStoragePerKeyStore(kv)
+        s.initializeFromMap({ old: 'gone' })
+        // simulate an ambiguous prior state: a stray flat legacy row alongside the sentinel
+        kv.m.set(`pluginStorage/${encodeURIComponent('strayFlat')}.bin`, Buffer.from(JSON.stringify('x')))
+        expect(s.hasLegacyFlatRows()).toBe(true)
+        // import: clear removes the flat row + sentinel, so reconcileReplace lands clean
+        clearPrefix(kv)
+        s.reconcileReplace({ ...KEYS })
+        expect(await s.readAll()).toEqual(KEYS)
+        expect(await s.readKey('old')).toBeUndefined()
+        expect(s.hasLegacyFlatRows()).toBe(false)
     })
 })
 
