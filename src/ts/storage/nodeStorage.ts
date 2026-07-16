@@ -714,6 +714,23 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageReplace error: ${da.status}`)
     }
 
+    // Legacy→initialized migration CAS. 'initialized' = we won (200, store now holds `values`);
+    // 'already' = the store was already initialized (409) — a racing device won or our own
+    // earlier init committed but its response was lost, so the caller fetches the authoritative
+    // map instead of overwriting. Any other non-2xx / network error throws (indeterminate →
+    // the caller retries idempotently or blocks boot). This is the ONLY idempotent write in the
+    // boot path; the store's initializeFromMap is the atomic CAS on the mode sentinel.
+    async savePluginStorageInitialize(values: Record<string, any>): Promise<'initialized' | 'already'> {
+        const snapshot = canonicalStorageMap(values, 'savePluginStorageInitialize')
+        const encoded = encodeRisuSaveLegacy({ type: 'initialize', json: JSON.stringify(snapshot) })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
+        })
+        if (da.status === 409) return 'already'
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageInitialize error: ${da.status}`)
+        return 'initialized'
+    }
+
     async fetchPluginStorageSidecar(): Promise<any | null> {
         const da = await this.authFetch('/api/plugin-storage')
         if (da.status === 404) return null                                   // legacy — no rows

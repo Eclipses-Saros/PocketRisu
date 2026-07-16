@@ -104,12 +104,12 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
     // planPcsBoot itself issues a REPLACE (a legacy store rejects deltas), so a pre-b3
     // account with inline pcs actually initializes — the path the old integration test
     // bypassed by pre-calling replace. Runs FIRST so it sees the fresh legacy state.
-    it('CLIENT MIGRATION e2e: fresh legacy (404) → planPcsBoot replaces inline → initialized (200)', async () => {
+    it('CLIENT MIGRATION e2e: fresh legacy (404) → planPcsBoot CAS-initializes inline → initialized (200); re-init is 409', async () => {
         if (!booted) return
         const rawGet = () => fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() }).then((r) => r.status)
         expect(await rawGet()).toBe(404)                 // fresh store = legacy → 404 (NOT initialized-empty)
 
-        // real client boot closures, mirroring nodeStorage.fetch/saveReplace, hitting the live server
+        // real client boot closures, mirroring nodeStorage, hitting the live server.
         const fetchSidecar = async (): Promise<Record<string, any> | null> => {
             const r = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
             if (r.status === 404) return null            // legacy — never an empty map
@@ -117,13 +117,16 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
             const d = JSON.parse(await r.text())
             return d && typeof d === 'object' ? (d.pluginCustomStorage ?? null) : null
         }
-        const replaceSidecar = async (m: Record<string, any>) => {
-            const s = await replacePerKey(m)
-            if (s !== 200) throw new Error(`replace ${s}`)
+        // CAS initialize: 200 → 'initialized', 409 → 'already', else throw. This is the migration op.
+        const initializeSidecar = async (m: Record<string, any>): Promise<'initialized' | 'already'> => {
+            const s = await psPost({ type: 'initialize', json: JSON.stringify(m) })
+            if (s === 409) return 'already'
+            if (s !== 200) throw new Error(`initialize ${s}`)
+            return 'initialized'
         }
 
-        // a pre-b3 legacy DB carries pcs INLINE; an opted-in device migrates it
-        const plan = await planPcsBoot({ localOptIn: true, inlineObj: { seed: JSON.stringify({ v: 1 }) }, inlineFieldPresent: true, fetchSidecar, replaceSidecar })
+        // a pre-b3 legacy DB carries pcs INLINE; an opted-in device migrates it via CAS initialize
+        const plan = await planPcsBoot({ localOptIn: true, inlineObj: { seed: JSON.stringify({ v: 1 }) }, inlineFieldPresent: true, fetchSidecar, initializeSidecar })
         expect(plan.enableSidecar).toBe(true)
         expect(plan.markMigration).toBe(true)            // schedule the inline-strip full write
         expect(plan.pcs).toEqual({ seed: JSON.stringify({ v: 1 }) })
@@ -132,7 +135,12 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         expect(await rawGet()).toBe(200)                 // initialized → 200 (NOT 404)
         expect(await getPerKey()).toEqual({ seed: JSON.stringify({ v: 1 }) })
 
-        // a steady-state DELTA is now accepted (it was rejected while legacy) — the migration point
+        // CAS: a SECOND initialize (racing device / retried lost-response) is rejected 409 — it does
+        // NOT clobber the initialized store. The client would then fetch + adopt the authoritative map.
+        expect(await initializeSidecar({ other: 'device' })).toBe('already')
+        expect(await getPerKey()).toEqual({ seed: JSON.stringify({ v: 1 }) }) // unchanged — no clobber
+
+        // a steady-state DELTA is accepted (it was rejected while legacy) — the migration point
         expect(await psDelta({ seed2: 'v2' }, [])).toBe(200)
         expect((await getPerKey()).seed2).toBe('v2')
     })

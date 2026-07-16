@@ -182,11 +182,17 @@ function createPluginStoragePerKeyStore(kv) {
     // transaction. Refuses if a mode sentinel already exists, if data rows already
     // exist, or if un-migrated flat rows are present — a store with pre-existing rows
     // must be reconciled with replaceAll, not blessed into initialized (codex).
+    // This is the migration CAS: it initializes ONLY if the store is still legacy (no mode,
+    // no rows, no flat rows). The "already initialized / has rows" refusals are tagged
+    // ALREADY_INITIALIZED so a caller (the migration endpoint) can distinguish a lost CAS
+    // (another device won — fetch the authoritative map) from a genuine fail-closed state
+    // (flat rows). The check + writes are one transaction, so it is atomic under a race.
     function initializeFromMap(map) {
         const snap = asPlainMap(map, 'initializeFromMap'); // one enumeration → immutable snapshot
+        const already = (msg) => { const e = new Error(msg); e.code = 'PLUGIN_STORAGE_ALREADY_INITIALIZED'; return e; };
         inTransaction(() => {
-            if (readMode() !== null) throw new Error('pluginStorage: initializeFromMap on a store that already has a mode sentinel');
-            if ((listKeys() || []).length > 0) throw new Error('pluginStorage: initializeFromMap with pre-existing data rows — use reconcileReplace with the complete map');
+            if (readMode() !== null) throw already('pluginStorage: initializeFromMap on a store that already has a mode sentinel');
+            if ((listKeys() || []).length > 0) throw already('pluginStorage: initializeFromMap with pre-existing data rows — use reconcileReplace with the complete map');
             if (hasLegacyFlatRows()) throw new Error('pluginStorage: initializeFromMap with un-migrated flat rows present — failing closed');
             for (const k of Object.keys(snap)) writeKey(k, snap[k]);
             writeMode({ version: PLUGIN_STORAGE_MODE_VERSION, state: 'initialized' });

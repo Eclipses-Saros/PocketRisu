@@ -845,6 +845,19 @@ describe('pluginStoragePerKeyStore — readAll fail-closed (SSOT step 1b/HIGH)',
         await expect(s.readAll()).rejects.toThrow(/flat|failing closed/i)
     })
 
+    it('initializeFromMap is a CAS: tags ALREADY_INITIALIZED when a mode/rows already exist (R18 migration)', () => {
+        const s = createPluginStoragePerKeyStore(fakeKv())
+        s.initializeFromMap({ a: '1' })                         // first init wins
+        // a second initialize (racing device / retried lost-response) must be refused with the
+        // ALREADY_INITIALIZED code so the migration endpoint returns 409 (client fetches + adopts)
+        let err: any
+        try { s.initializeFromMap({ b: '2' }) } catch (e) { err = e }
+        expect(err).toBeTruthy()
+        expect(err.code).toBe('PLUGIN_STORAGE_ALREADY_INITIALIZED')
+        // and it did NOT clobber the first init
+        return expect(s.readAll()).resolves.toEqual({ a: '1' })
+    })
+
     it('noncanonical row alias → readAll throws (row-authority; never silently shorts, F6)', async () => {
         const kv = fakeKv()
         const s = createPluginStoragePerKeyStore(kv)

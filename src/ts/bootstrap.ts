@@ -83,7 +83,7 @@ async function loadPluginStorageInto(decodedDb: any): Promise<void> {
             inlineObj,
             inlineFieldPresent,
             fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
-            replaceSidecar: (m) => forageStorage.realStorage.savePluginStorageReplace(m),
+            initializeSidecar: (m) => forageStorage.realStorage.savePluginStorageInitialize(m),
         })
         if (plan.warn) console.error('[pluginStorage]', plan.warn)
         setPluginStorageSidecarWriteEnabled(plan.enableSidecar)

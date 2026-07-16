@@ -4892,8 +4892,8 @@ app.post('/api/plugin-storage', async (req, res, next) => {
             // JSON.stringify is the only read of its live object (no TOCTOU). The store
             // is the single validation point; a tagged bad-payload error maps to 400.
             const t = body.type;
-            if (t !== 'delta' && t !== 'replace' && t !== 'reconcile') {
-                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
+            if (t !== 'delta' && t !== 'replace' && t !== 'reconcile' && t !== 'initialize') {
+                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile" | "initialize"' });
             }
             if (typeof body.json !== 'string') {
                 return res.status(400).json({ error: 'plugin-storage envelope requires a json string field' });
@@ -4909,8 +4909,23 @@ app.post('/api/plugin-storage', async (req, res, next) => {
                     pluginStoragePerKeyStore.applyDelta({ changed: payload.changed, removed: payload.removed });
                 } else if (t === 'replace') {
                     pluginStoragePerKeyStore.replaceAll(payload);
-                } else {
+                } else if (t === 'reconcile') {
                     pluginStoragePerKeyStore.reconcileReplace(payload);
+                } else { // 'initialize' — legacy→initialized migration CAS (idempotent, race-safe).
+                    // initializeFromMap commits ONLY if still legacy; if another device (or this
+                    // client's own committed-but-response-lost initialize) already initialized, it
+                    // throws ALREADY_INITIALIZED → 409 so the client fetches the authoritative map
+                    // instead of clobbering it. A retry after a network error is thus definitive:
+                    // it either initializes (200) or observes the prior init (409). Never 200 for
+                    // an overwrite of an already-initialized store.
+                    try {
+                        pluginStoragePerKeyStore.initializeFromMap(payload);
+                    } catch (e) {
+                        if (e && e.code === 'PLUGIN_STORAGE_ALREADY_INITIALIZED') {
+                            return res.status(409).json({ error: 'pluginStorage already initialized' });
+                        }
+                        throw e; // BAD_PAYLOAD → 400 below; flat-rows/other → 500 (fail closed)
+                    }
                 }
             } catch (e) {
                 if (e && e.code === 'PLUGIN_STORAGE_BAD_PAYLOAD') {

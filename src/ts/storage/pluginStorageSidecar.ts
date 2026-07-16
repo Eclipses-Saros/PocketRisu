@@ -59,14 +59,26 @@ export interface PcsBootPlan {
     warn?: string                             // set on fail-closed paths (bootstrap logs it)
 }
 
+// initializeSidecar performs ONE CAS-initialize attempt against the server:
+//   'initialized' — the store was legacy and is now initialized with the sent map (200).
+//   'already'     — the store was ALREADY initialized (409): another device won, OR this
+//                   client's own earlier initialize committed but its response was lost.
+//   throws        — network error / 500 (flat-rows/corrupt/other): indeterminate → retry/block.
+export type PcsInitResult = 'initialized' | 'already'
+
+// Bounded idempotent retries for the migration initialize. Each attempt is one network round
+// trip, so this spaces naturally; a committed-but-lost-response init is observed as 'already'
+// on the next attempt, making the outcome DEFINITIVE (never a blind write-mode guess).
+const PCS_MIGRATE_ATTEMPTS = 3
+
 export async function planPcsBoot(args: {
     localOptIn: boolean
     inlineObj: Record<string, any>
     inlineFieldPresent: boolean      // did the decoded DB actually carry a pluginCustomStorage field?
     fetchSidecar: () => Promise<Record<string, any> | null>
-    replaceSidecar: (map: Record<string, any>) => Promise<void>
+    initializeSidecar: (map: Record<string, any>) => Promise<PcsInitResult>
 }): Promise<PcsBootPlan> {
-    const { localOptIn, inlineObj, inlineFieldPresent, fetchSidecar, replaceSidecar } = args
+    const { localOptIn, inlineObj, inlineFieldPresent, fetchSidecar, initializeSidecar } = args
     // Probe the account mode. A probe FAILURE (500 / network / malformed 2xx) means the mode is
     // UNKNOWN — we must NOT boot into a state that lets plugins read a false-empty and write it
     // (an initialized account would then discard this session's inline edits). So fetchSidecar
@@ -85,27 +97,36 @@ export async function planPcsBoot(args: {
         // Not opted in: stay legacy, inline authoritative (byte-identical to pre-b3).
         return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false }
     }
-    // Opted-in device MIGRATES: replace-first (a legacy store rejects deltas).
-    try {
-        await replaceSidecar(inlineObj)
-    } catch (e) {
-        // A rejected replace is AMBIGUOUS: the server commits the store BEFORE sending its
-        // response, so a lost response/network error after commit looks identical to "never
-        // committed". Treating it as "still legacy" would boot legacy + edit inline, then the
-        // next boot's 200 wins and this session's inline edits vanish. RE-PROBE to disambiguate:
-        //   initialized → it DID commit (this replace or a racing device) → adopt the rows.
-        //   404         → confirmed not committed → safe legacy fallback, retry next boot.
-        //   throw       → still unknown → propagate (block boot). Never guess a write mode.
-        const reprobe = await fetchSidecar()
-        if (reprobe !== null) {
-            return { enableSidecar: true, pcs: reprobe, baseline: reprobe, markMigration: inlineFieldPresent }
+    // Opted-in device MIGRATES via an idempotent, race-safe CAS INITIALIZE (initialize-if-legacy),
+    // NOT an unconditional replace. This is the one place the boot path needs idempotency: the
+    // legacy→initialized transition is the only ambiguous write (a lost response after the server
+    // commits is indistinguishable from "never committed"). The CAS makes a retry DEFINITIVE and
+    // never clobbers a racing device's already-initialized store.
+    let lastErr: unknown
+    for (let attempt = 1; attempt <= PCS_MIGRATE_ATTEMPTS; attempt++) {
+        let result: PcsInitResult
+        try {
+            result = await initializeSidecar(inlineObj)
+        } catch (e) {
+            lastErr = e // network/500 — retry: a committed init surfaces as 'already' next attempt
+            continue
         }
-        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `migration replace failed; re-probe confirms legacy — staying legacy this session: ${e}` }
+        if (result === 'initialized') {
+            // We won the CAS: the server now holds exactly inlineObj. Strip the inline block.
+            return { enableSidecar: true, pcs: inlineObj, baseline: inlineObj, markMigration: inlineFieldPresent }
+        }
+        // 'already' — the store is initialized (a racing device, or our own committed-but-lost
+        // init). ADOPT the authoritative map rather than overwriting it (no clobber, no loss).
+        const authoritative = await fetchSidecar() // throws → propagate (block boot on unknown)
+        if (authoritative === null) {
+            lastErr = new Error('initialize reported already-initialized but re-fetch is legacy (inconsistent)')
+            continue // extremely rare; retry converges or blocks
+        }
+        return { enableSidecar: true, pcs: authoritative, baseline: authoritative, markMigration: inlineFieldPresent }
     }
-    // Replace acked: server now holds exactly inlineObj as rows. Adopt the sidecar, seed the
-    // baseline, and full-write to strip the inline block from database.bin — but only if the
-    // DB actually carried one (a fresh account with no inline field has nothing to strip).
-    return { enableSidecar: true, pcs: inlineObj, baseline: inlineObj, markMigration: inlineFieldPresent }
+    // Exhausted: the mode stayed indeterminate. FAIL CLOSED — block boot (retry) rather than
+    // guess a write mode. Never boot legacy over a possibly-initialized account.
+    throw new Error(`pluginStorage: migration initialize did not reach a definitive state after ${PCS_MIGRATE_ATTEMPTS} attempts (blocking boot): ${lastErr}`)
 }
 
 // Layout discriminator for the directory marker. v2 = PER-KEY store (one KV entry
