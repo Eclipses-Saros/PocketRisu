@@ -42,21 +42,20 @@ function cyrb53Bytes(bytes: Uint8Array, seed: number): number {
 }
 
 const _fpEnc = new TextEncoder()
-function fingerprint(value: any): string {
-    let json: string | undefined
-    try { json = JSON.stringify(value) }
-    catch (e) {
-        // Cyclic / BigInt / other non-JSON-encodable: the actual JSON send would throw
-        // too, so a change here surfaces loudly at save time. Distinct sentinel so it
-        // never silently equals a real encoded value.
-        return `!json:${typeof value}:${(e as any)?.message ?? ''}`
-    }
-    // JSON.stringify(undefined | function | symbol) === undefined — not representable as
-    // a stored value; a stable sentinel keeps the baseline consistent (the wire omits
-    // such a key, so it is effectively "absent" and this never equals a real value).
+// Fingerprint a CANONICAL JSON string (the exact bytes sent/stored). `json === undefined`
+// means the value was not JSON-representable (undefined/function/symbol) — a stable sentinel
+// keeps the baseline consistent (such a key is treated as ABSENT by computeDelta).
+function fingerprintJson(json: string | undefined): string {
     if (json === undefined) return '!undef'
     const bytes = _fpEnc.encode(json)
     return `${bytes.length}:${cyrb53Bytes(bytes, 0x9e3779b9)}:${cyrb53Bytes(bytes, 0x85ebca6b)}`
+}
+function fingerprint(value: any): string {
+    // Used to seed the baseline from a server/inline map (already plain JSON values).
+    let json: string | undefined
+    try { json = JSON.stringify(value) }
+    catch (e) { return `!json:${typeof value}:${(e as any)?.message ?? ''}` } // cyclic/BigInt → loud-distinct
+    return fingerprintJson(json)
 }
 
 // The live pcs container MUST be a plain object before we diff it. A Map/Date/typed-
@@ -75,16 +74,6 @@ function assertPlainPcsContainer(current: unknown): void {
     }
 }
 
-// Snapshot a value so the delta captures it AT compute time. A plugin can mutate an
-// object value while the POST is in flight; without this, baseline advancement would
-// fingerprint the newer object although the server received the earlier one. Strings/
-// primitives are immutable so are returned as-is (no clone, no OOM). A non-cloneable
-// object is returned as-is (rare; the send would msgpack it or fail loudly anyway).
-function snapshotValue(value: any): any {
-    if (value === null || typeof value !== 'object') return value
-    try { return structuredClone(value) } catch { return value }
-}
-
 export function seedPluginStorageBaseline(map: Record<string, any> | null | undefined): PluginStorageBaseline {
     const b: PluginStorageBaseline = new Map()
     if (map && typeof map === 'object') for (const k of Object.keys(map)) b.set(k, fingerprint(map[k]))
@@ -95,6 +84,13 @@ export function seedPluginStorageBaseline(map: Record<string, any> | null | unde
 // removed = baseline keys absent from the current map. `changed` uses a null
 // prototype so a key literally named "__proto__" is stored as an own entry, not
 // swallowed by the prototype setter.
+//
+// Each changed value is serialized to JSON EXACTLY ONCE here; that one string is both the
+// fingerprint source AND the snapshot stored in `changed[k]` (as JSON.parse of it — a fresh
+// PLAIN object, never the live $state proxy). So: (a) a plugin mutating the live value while
+// the POST is in flight cannot change what was captured (no live reference retained — the
+// R16 live-proxy race); (b) the fingerprint equals the exact bytes the wire sends and the row
+// stores, so the baseline advances to precisely what the server received.
 export function computePluginStorageDelta(
     current: Record<string, any> | null | undefined,
     baseline: PluginStorageBaseline,
@@ -104,8 +100,19 @@ export function computePluginStorageDelta(
     const changed: Record<string, any> = Object.create(null)
     const seen = new Set<string>()
     for (const k of Object.keys(cur)) {
+        let json: string | undefined
+        try { json = JSON.stringify(cur[k]) }
+        catch (e) { throw new Error(`pluginCustomStorage: value for key "${k}" is not JSON-encodable (${(e as any)?.message ?? 'cyclic'}) — aborting save to avoid a divergent baseline`) }
+        if (json === undefined) {
+            // undefined/function/symbol value = no JSON-representable value. Treat the key as
+            // ABSENT (JSON semantics + what the wire would omit): do NOT mark it seen, so if the
+            // baseline had it the removed-loop deletes it; if it was never synced it is ignored.
+            // Never record it as synced-present (the old '!undef' fingerprint did, diverging).
+            continue
+        }
         seen.add(k)
-        if (baseline.get(k) !== fingerprint(cur[k])) changed[k] = snapshotValue(cur[k])
+        const fp = fingerprintJson(json)
+        if (baseline.get(k) !== fp) changed[k] = JSON.parse(json) // stable plain snapshot from the fingerprinted bytes
     }
     const removed: string[] = []
     for (const k of baseline.keys()) if (!seen.has(k)) removed.push(k)

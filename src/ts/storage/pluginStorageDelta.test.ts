@@ -128,4 +128,36 @@ describe('pluginStorageDelta — per-key delta without a resident copy (C3)', ()
         obj.n = 999 // plugin mutates the live value after we computed the delta
         expect(d.changed.k.n).toBe(1) // delta holds the compute-time snapshot
     })
+
+    it('decouples the snapshot from a LIVE PROXY value + still detects the later mutation (R16 F2)', () => {
+        // Mirrors the $state proxy case where structuredClone would fail and the old code
+        // retained the live reference. The JSON snapshot must hold the compute-time value,
+        // and the baseline must advance to the SENT value so a later mutation is NOT lost.
+        const target: any = { n: 1 }
+        const proxy = new Proxy(target, {})
+        const base = seedPluginStorageBaseline({ k: { n: 0 } })
+        const d = computePluginStorageDelta({ k: proxy }, base)
+        expect(Object.getPrototypeOf(d.changed.k)).toBe(Object.prototype) // plain snapshot, not the proxy
+        target.n = 999                                   // plugin mutates the live value after compute
+        expect(d.changed.k.n).toBe(1)                    // snapshot unaffected (value 1 is what was sent)
+        advancePluginStorageBaseline(base, d)            // baseline advances to the SENT value (1)
+        const d2 = computePluginStorageDelta({ k: proxy }, base) // proxy now reads 999
+        expect(d2.changed.k.n).toBe(999)                 // the later mutation IS detected — not silently lost
+    })
+
+    it('a top-level value that JSON.stringifies to undefined is treated as ABSENT (removed if it was synced)', () => {
+        const base = seedPluginStorageBaseline({ keep: 'a', gone: 'b' })
+        // gone := undefined (a plugin cleared it to a non-JSON value) → removed; a brand-new
+        // undefined key is simply ignored (never sent, never recorded as synced-present)
+        const d = computePluginStorageDelta({ keep: 'a', gone: undefined, fresh: undefined } as any, base)
+        expect('gone' in d.changed).toBe(false)
+        expect('fresh' in d.changed).toBe(false)
+        expect(d.removed).toEqual(['gone'])
+        expect('keep' in d.changed).toBe(false)          // unchanged
+    })
+
+    it('a cyclic value throws loudly (never a divergent baseline)', () => {
+        const cyclic: any = {}; cyclic.self = cyclic
+        expect(() => computePluginStorageDelta({ k: cyclic }, new Map())).toThrow(/not JSON-encodable|aborting/i)
+    })
 })
