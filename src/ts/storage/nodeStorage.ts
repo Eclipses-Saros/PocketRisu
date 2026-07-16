@@ -716,11 +716,18 @@ export class NodeStorage{
 
     async fetchPluginStorageSidecar(): Promise<any | null> {
         const da = await this.authFetch('/api/plugin-storage')
-        if (da.status === 404) return null
-        if (da.status < 200 || da.status >= 300) throw new Error(`fetchPluginStorageSidecar error: ${da.status}`)
-        // GET returns the map as a JSON string (lossless for nested keys).
+        if (da.status === 404) return null                                   // legacy — no rows
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchPluginStorageSidecar error: ${da.status}`) // 500/etc → fail closed
+        // GET returns the map as a JSON string (lossless for nested keys). A 2xx is
+        // INITIALIZED and MUST carry a pluginCustomStorage object (even {}); a malformed body
+        // must THROW (fail closed), NOT map to null — that would be read as legacy(404) and
+        // resurrect stale inline over the authoritative store.
         const decoded = JSON.parse(await da.text())
-        return decoded && typeof decoded === 'object' ? (decoded.pluginCustomStorage ?? null) : null
+        const pcs = decoded && typeof decoded === 'object' ? decoded.pluginCustomStorage : undefined
+        if (!pcs || typeof pcs !== 'object' || Array.isArray(pcs)) {
+            throw new Error('fetchPluginStorageSidecar: malformed 200 response (missing pluginCustomStorage object)')
+        }
+        return pcs
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────

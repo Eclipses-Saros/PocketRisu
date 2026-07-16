@@ -1163,7 +1163,11 @@ export async function saveDb() {
         }
 
         const toSave = takeTrackedChanges()
-        if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
+        // A pending pcs migration MUST produce a save even with no ordinary tracked change:
+        // it is the only thing that strips the legacy inline block from the server DB (a full
+        // write). Without this, an idle post-migration session never strips it and the store
+        // stays ambiguous (initialized rows + a dangling inline field).
+        if (!hasTrackedChanges(toSave) && !options?.forceFullWrite && !pluginStorageMigrateFullWrite) {
             return
         }
 
@@ -1208,7 +1212,10 @@ export async function saveDb() {
 
     let savetrys = 0
     while (true) {
-        if (!changed) {
+        // A pending pcs migration must drive a save even in an otherwise-idle session, so it
+        // is picked up here alongside ordinary changes — it is the only thing that strips the
+        // legacy inline block from the server DB (triggerSave → forceFullWrite via the flag).
+        if (!changed && !pluginStorageMigrateFullWrite) {
             await sleep(200)
             continue
         }

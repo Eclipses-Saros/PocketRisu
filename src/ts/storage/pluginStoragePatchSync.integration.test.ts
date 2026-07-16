@@ -123,7 +123,7 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         }
 
         // a pre-b3 legacy DB carries pcs INLINE; an opted-in device migrates it
-        const plan = await planPcsBoot({ localOptIn: true, inlineObj: { seed: JSON.stringify({ v: 1 }) }, fetchSidecar, replaceSidecar })
+        const plan = await planPcsBoot({ localOptIn: true, inlineObj: { seed: JSON.stringify({ v: 1 }) }, inlineFieldPresent: true, fetchSidecar, replaceSidecar })
         expect(plan.enableSidecar).toBe(true)
         expect(plan.markMigration).toBe(true)            // schedule the inline-strip full write
         expect(plan.pcs).toEqual({ seed: JSON.stringify({ v: 1 }) })

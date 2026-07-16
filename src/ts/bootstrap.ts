@@ -57,15 +57,30 @@ async function loadPluginStorageInto(decodedDb: any): Promise<void> {
         resyncPluginStorageBaseline(decodedDb?.pluginCustomStorage)
         return
     }
-    const inlineObj: Record<string, any> =
-        (decodedDb?.pluginCustomStorage && typeof decodedDb.pluginCustomStorage === 'object' && !Array.isArray(decodedDb.pluginCustomStorage))
-            ? decodedDb.pluginCustomStorage : {}
+    // Whether the decoded DB carries a pcs field at all (drives the inline-strip migration —
+    // keyed on PRESENCE so an empty {} inline field is still stripped, not left dangling).
+    const inlineFieldPresent = !!decodedDb && typeof decodedDb === 'object' && Object.hasOwn(decodedDb, 'pluginCustomStorage')
+    const rawInline = inlineFieldPresent ? (decodedDb as any).pluginCustomStorage : undefined
+    // Only null/undefined normalize to {} (legitimately empty). A NON-plain legacy pcs
+    // (array / string / number / Map / instance) must NOT be silently coerced to {} — that
+    // would migrate an empty map over real data (a wipe). Fail closed.
+    let inlineObj: Record<string, any>
+    if (rawInline === null || rawInline === undefined) {
+        inlineObj = {}
+    } else if (typeof rawInline === 'object' && !Array.isArray(rawInline) &&
+               (Object.getPrototypeOf(rawInline) === Object.prototype || Object.getPrototypeOf(rawInline) === null)) {
+        inlineObj = rawInline
+    } else {
+        throw new Error('[pluginStorage] legacy pluginCustomStorage is not a plain object — refusing to migrate (fail closed, no wipe)')
+    }
 
-    // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate); this is
-    // the thin applier of its plan.
+    // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate). A probe
+    // failure THROWS out of here to BLOCK boot (fail closed — never boot into an initialized
+    // account read as empty). This is the thin applier of its plan.
     const plan = await planPcsBoot({
         localOptIn: isPluginStorageSidecarWriteEnabled(),
         inlineObj,
+        inlineFieldPresent,
         fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
         replaceSidecar: (m) => forageStorage.realStorage.savePluginStorageReplace(m),
     })

@@ -62,36 +62,42 @@ export interface PcsBootPlan {
 export async function planPcsBoot(args: {
     localOptIn: boolean
     inlineObj: Record<string, any>
+    inlineFieldPresent: boolean      // did the decoded DB actually carry a pluginCustomStorage field?
     fetchSidecar: () => Promise<Record<string, any> | null>
     replaceSidecar: (map: Record<string, any>) => Promise<void>
 }): Promise<PcsBootPlan> {
-    const { localOptIn, inlineObj, fetchSidecar, replaceSidecar } = args
-    let fetched: Record<string, any> | null
-    try {
-        fetched = await fetchSidecar()
-    } catch (e) {
-        // FAIL CLOSED: mode unknown → disable sidecar (send nothing), keep decoded inline.
-        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `account-mode probe failed — sidecar writes disabled this session (fail closed): ${e}` }
-    }
+    const { localOptIn, inlineObj, inlineFieldPresent, fetchSidecar, replaceSidecar } = args
+    // Probe the account mode. A probe FAILURE (500 / network / malformed 2xx) means the mode is
+    // UNKNOWN — we must NOT boot into a state that lets plugins read a false-empty and write it
+    // (an initialized account would then discard this session's inline edits). So fetchSidecar
+    // THROWS on failure and we let it propagate to BLOCK boot (the caller surfaces the error;
+    // the user retries). This is the correct fail-closed: never pick a write mode blind.
+    const fetched = await fetchSidecar()
     if (fetched !== null) {
-        // INITIALIZED (authoritative, even {}). Adopt the sidecar regardless of local flag.
-        // Strip any stale inline block still riding this DB via a full write.
-        return { enableSidecar: true, pcs: fetched, baseline: fetched, markMigration: Object.keys(inlineObj).length > 0 }
+        // INITIALIZED (authoritative, even {}). Adopt the sidecar regardless of the local flag.
+        // Schedule the inline-strip full write whenever the DB still CARRIES a pcs field (even
+        // an empty {} one) — keyed on field PRESENCE, not key count, so an empty inline field is
+        // not left dangling (it would make classify() ambiguous).
+        return { enableSidecar: true, pcs: fetched, baseline: fetched, markMigration: inlineFieldPresent }
     }
     // LEGACY (404).
     if (!localOptIn) {
         // Not opted in: stay legacy, inline authoritative (byte-identical to pre-b3).
         return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false }
     }
-    // Opted-in device MIGRATES: replace-first (delta is rejected on a legacy store).
+    // Opted-in device MIGRATES: replace-first (a legacy store rejects deltas). A replace FAILURE
+    // is safe to fall back from — the account is still legacy (the replace didn't take), so
+    // inline stays authoritative and we retry next boot. (Unlike a probe failure, the mode is
+    // KNOWN here: legacy. So this is NOT a blind write-mode choice.)
     try {
         await replaceSidecar(inlineObj)
     } catch (e) {
         return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `legacy→initialized migration (replace) failed — staying legacy this session (fail closed): ${e}` }
     }
     // Replace acked: server now holds exactly inlineObj as rows. Adopt the sidecar, seed the
-    // baseline, and full-write to strip the inline block from database.bin.
-    return { enableSidecar: true, pcs: inlineObj, baseline: inlineObj, markMigration: true }
+    // baseline, and full-write to strip the inline block from database.bin — but only if the
+    // DB actually carried one (a fresh account with no inline field has nothing to strip).
+    return { enableSidecar: true, pcs: inlineObj, baseline: inlineObj, markMigration: inlineFieldPresent }
 }
 
 // Layout discriminator for the directory marker. v2 = PER-KEY store (one KV entry
