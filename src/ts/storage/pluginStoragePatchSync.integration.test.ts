@@ -96,6 +96,19 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
         expect(booted).toBe(true)
     })
 
+    // SSOT step 2: GET is DISCRIMINATED by the mode sentinel. A fresh (legacy) store
+    // returns 404 (client uses inline); once out-of-band, GET returns 200 even when
+    // empty — so the client can tell "legacy" from "out-of-band but empty". Runs
+    // before any replace so it observes the fresh legacy state.
+    it('GET discriminates legacy (404) from initialized-empty (200)', async () => {
+        if (!booted) return
+        const rawGet = () => fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() }).then((r) => r.status)
+        expect(await rawGet()).toBe(404)                 // fresh store = legacy → 404
+        expect(await replacePerKey({})).toBe(200)        // establish out-of-band, empty
+        expect(await rawGet()).toBe(200)                 // initialized-empty → 200 (NOT 404)
+        expect(await getPerKey()).toEqual({})            // and it decodes to an empty map
+    })
+
     it('per-key delta round-trips through the real server (POST changed → GET)', async () => {
         if (!booted) return
         expect(await replacePerKey({ 'vector_rag:shard:0': JSON.stringify({ v: 1 }), 'hayaku.v1.durable.a': 'x' })).toBe(200)
@@ -174,5 +187,16 @@ describe('pluginCustomStorage b3 — out-of-band per-key, REAL server', () => {
     it('malformed envelope (no type) is rejected 400 (no bare-map guessing)', async () => {
         if (!booted) return
         expect(await psPost({ changed: { A: 'x' } })).toBe(400)   // looks like a delta but no discriminator
+    })
+
+    it('replace with a non-object values is rejected 400 (never coerced to {} → no silent wipe)', async () => {
+        if (!booted) return
+        await replacePerKey({ survivor: 'keep-me' })                       // seed real memory
+        expect(await psPost({ type: 'replace', values: 'bad' })).toBe(400) // malformed → refused
+        expect(await psPost({ type: 'replace' })).toBe(400)               // missing values → refused
+        // a TYPED object survives the msgpack codec (Date has zero enumerable keys);
+        // accepting it would wipe every row. Must be refused, not coerced.
+        expect(await psPost({ type: 'replace', values: new Date() })).toBe(400)
+        expect((await getPerKey()).survivor).toBe('keep-me')              // memory intact (not wiped)
     })
 })

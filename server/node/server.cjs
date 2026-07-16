@@ -33,7 +33,7 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks, hydratePluginCustomStorageServer, assertPluginStorageResolved, PLUGIN_STORAGE_SIDECAR_MARKER } = require('./utils.cjs');
 const { createPluginStorageSidecarStore, PLUGIN_STORAGE_SIDECAR_KEY } = require('./pluginStorageStore.cjs');
-const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.cjs');
+const { createPluginStoragePerKeyStore, isPlainMap: isPlainStorageMap } = require('./pluginStoragePerKeyStore.cjs');
 // Server home for the pluginCustomStorage sidecar. b3 layout: each plugin key is
 // its own KV entry under pluginStorage/, so a write touches only that key and
 // concurrent writes to DIFFERENT keys never collide (mirrors the per-chat model).
@@ -43,7 +43,7 @@ const { createPluginStoragePerKeyStore } = require('./pluginStoragePerKeyStore.c
 //   backup-entry transient + snapshot pairing until inc2b retargets those; the
 //   live read/write path (hydrate + endpoints) uses the per-key store below.
 const pluginStorageSidecarStore = createPluginStorageSidecarStore({ get: kvGet, set: kvSet, del: kvDel });
-const pluginStoragePerKeyStore = createPluginStoragePerKeyStore({ get: kvGet, set: kvSet, del: kvDel, listPrefix: kvList });
+const pluginStoragePerKeyStore = createPluginStoragePerKeyStore({ get: kvGet, set: kvSet, del: kvDel, listPrefix: kvList, transaction: (fn) => sqliteDb.transaction(fn)() });
 
 // Backstop: never persist a database.bin whose pluginCustomStorage marker lists a
 // key that is NOT in the per-key store — a dangling marker reads back fail-closed
@@ -2477,13 +2477,17 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     // b3: an imported pluginStorage.risudat lands at the single-blob transient key
     // (resolveBackupStorageKey). Fan it out to the per-key store (the live layout),
-    // then drop the transient. Import replaces plugin memory wholesale → replaceAll.
+    // then drop the transient. Import is an explicit RECOVERY → reconcileReplace
+    // (authoritatively overwrites whatever state is live). NEVER coerce a malformed
+    // payload to {} (that would wipe plugin memory on a bad backup) — fail closed.
     try {
         const pcsBlob = kvGet(PLUGIN_STORAGE_SIDECAR_KEY);
         if (pcsBlob && pcsBlob.length > 0) {
             const decodedPcs = await decodeRisuSave(pcsBlob);
-            const map = decodedPcs && typeof decodedPcs === 'object' ? (decodedPcs.pluginCustomStorage ?? {}) : {};
-            pluginStoragePerKeyStore.replaceAll(map);
+            if (!decodedPcs || typeof decodedPcs !== 'object' || !Object.hasOwn(decodedPcs, 'pluginCustomStorage')) {
+                throw new Error('pluginStorage.risudat present but missing pluginCustomStorage — failing closed');
+            }
+            pluginStoragePerKeyStore.reconcileReplace(decodedPcs.pluginCustomStorage);
             kvDel(PLUGIN_STORAGE_SIDECAR_KEY);
         }
     } catch (e) {
@@ -4846,9 +4850,24 @@ app.post('/api/plugin-storage', async (req, res, next) => {
             if (body.type === 'delta') {
                 pluginStoragePerKeyStore.applyDelta({ changed: body.changed, removed: body.removed });
             } else if (body.type === 'replace') {
-                pluginStoragePerKeyStore.replaceAll(body.values ?? {});
+                // values MUST be a PLAIN object map — never coerce a malformed/typed
+                // payload (string, array, Date, Uint8Array, …) to {} (a typed object has
+                // zero enumerable keys → would silently wipe the store on a bad request).
+                if (!isPlainStorageMap(body.values)) {
+                    return res.status(400).json({ error: 'plugin-storage replace requires values: a plain object map' });
+                }
+                pluginStoragePerKeyStore.replaceAll(body.values);
+            } else if (body.type === 'reconcile') {
+                // EXPLICIT recovery/activation: authoritatively overwrite whatever state
+                // is live with the caller's complete map. Used by versioned activation
+                // when the full inline map is known authoritative (and by a migrated
+                // pre-sentinel account to establish 'initialized'). Same strict payload rule.
+                if (!isPlainStorageMap(body.values)) {
+                    return res.status(400).json({ error: 'plugin-storage reconcile requires values: a plain object map' });
+                }
+                pluginStoragePerKeyStore.reconcileReplace(body.values);
             } else {
-                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace"' });
+                return res.status(400).json({ error: 'plugin-storage envelope requires type: "delta" | "replace" | "reconcile"' });
             }
             res.json({ success: true });
         });
@@ -4857,17 +4876,35 @@ app.post('/api/plugin-storage', async (req, res, next) => {
     }
 });
 
-// GET /api/plugin-storage — return the full pluginCustomStorage map for the client
-// loader, reassembled from the per-key entries. 404 when no entries exist, so the
-// client keeps the "no sidecar" (fail-closed) signal it relies on.
+// GET /api/plugin-storage — return the full pluginCustomStorage map, reassembled
+// from the per-key rows. DISCRIMINATED by the mode sentinel so the client can tell
+// "this account is legacy inline" (404) from "this account is out-of-band, possibly
+// empty" (200 with {}). Failures fail closed (500) — NEVER a silent empty:
+//   legacy + no rows       → 404 (client uses inline; no out-of-band store)
+//   legacy + rows present  → 500 (ambiguous partial-migration; never serve as authoritative)
+//   corrupt sentinel       → 500
+//   initialized            → 200, encoded map (even when empty {})
 app.get('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const pcs = await pluginStoragePerKeyStore.readAll();
-        if (!pcs || Object.keys(pcs).length === 0) {
-            res.status(404).json({ error: 'No plugin-storage sidecar' });
+        const st = pluginStoragePerKeyStore.modeState();
+        if (st === 'corrupt') {
+            res.status(500).json({ error: 'plugin-storage mode sentinel corrupt' });
             return;
         }
+        if (st === 'legacy') {
+            const rowCount = (pluginStoragePerKeyStore.listKeys() || []).length;
+            // legacy + data rows OR un-migrated flat rows = ambiguous → fail closed
+            // (never a 404 that the client reads as "no out-of-band memory").
+            if (rowCount > 0 || pluginStoragePerKeyStore.hasLegacyFlatRows()) {
+                res.status(500).json({ error: 'plugin-storage ambiguous: rows present without an initialized mode' });
+                return;
+            }
+            res.status(404).json({ error: 'No plugin-storage sidecar (legacy inline)' });
+            return;
+        }
+        // initialized — readAll fails closed on any corrupt/flat/short state
+        const pcs = await pluginStoragePerKeyStore.readAll();
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(Buffer.from(encodeRisuSaveLegacy({ pluginCustomStorage: pcs })));
     } catch (error) {
@@ -5155,17 +5192,23 @@ const DB_SIDECAR_BACKUP_PREFIX = 'database/pluginStorage-dbbackup-';
 const sidecarSnapshotKeyFor = (dbSnapshotKey) =>
     DB_SIDECAR_BACKUP_PREFIX + String(dbSnapshotKey).slice(DB_BACKUP_PREFIX.length);
 
-// b3 per-key snapshot: pair every live pluginStorage/<k> entry with a DB snapshot
-// under a per-snapshot prefix (raw KV copies — sync, exact, no decode). A DB
-// snapshot restore then brings the plugin memory back to its state AT that
-// snapshot, exactly like the paired-sidecar model did for the single blob.
+// b3 per-key snapshot: pair every live pluginStorage/* entry with a DB snapshot
+// under a per-snapshot prefix (raw KV copies — sync, exact, no decode). The prefix
+// is the SSOT ROOT (`pluginStorage/`), so a snapshot captures BOTH the data/ rows
+// AND the control/mode.json sentinel as one unit — restore brings the whole
+// out-of-band state back together. Each copy loop runs inside ONE SQLite
+// transaction so a crash mid-copy can never leave a PARTIAL row set: with rows as
+// the authority, a partial snapshot/restore would otherwise read back as an
+// authoritative short map (silent loss). All-or-nothing.
 const PLUGIN_STORAGE_PERKEY_PREFIX = 'pluginStorage/';
 const sidecarSnapshotPrefixFor = (dbSnapshotKey) => `${sidecarSnapshotKeyFor(dbSnapshotKey)}/`;
 function snapshotPluginStorageForDb(dbSnapshotKey) {
     const dst = sidecarSnapshotPrefixFor(dbSnapshotKey);
-    for (const k of kvList(PLUGIN_STORAGE_PERKEY_PREFIX)) {
-        kvCopyValue(k, dst + k.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length));
-    }
+    sqliteDb.transaction(() => {
+        for (const k of kvList(PLUGIN_STORAGE_PERKEY_PREFIX)) {
+            kvCopyValue(k, dst + k.slice(PLUGIN_STORAGE_PERKEY_PREFIX.length));
+        }
+    })();
 }
 function dropPluginStorageSnapshotForDb(dbSnapshotKey) {
     kvDelPrefix(sidecarSnapshotPrefixFor(dbSnapshotKey));
@@ -5175,8 +5218,10 @@ function restorePluginStorageSnapshotForDb(dbSnapshotKey) {
     const src = sidecarSnapshotPrefixFor(dbSnapshotKey);
     const snap = kvList(src);
     if (snap.length === 0) return false; // no paired snapshot (legacy/flag-off DB) — leave live as-is
-    kvDelPrefix(PLUGIN_STORAGE_PERKEY_PREFIX); // clear current per-key state, then restore the snapshot's
-    for (const k of snap) kvCopyValue(k, PLUGIN_STORAGE_PERKEY_PREFIX + k.slice(src.length));
+    sqliteDb.transaction(() => {
+        kvDelPrefix(PLUGIN_STORAGE_PERKEY_PREFIX); // clear current per-key state, then restore the snapshot's
+        for (const k of snap) kvCopyValue(k, PLUGIN_STORAGE_PERKEY_PREFIX + k.slice(src.length));
+    })();
     return true;
 }
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
@@ -6475,6 +6520,18 @@ async function startServer() {
     try {
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
+        // SSOT: fold any pre-namespace flat pluginStorage rows into the data/ layout
+        // BEFORE any reader/consumer or the HTTP listener runs — otherwise the
+        // prefix switch would make historical flat rows invisible. No-op when clean;
+        // a genuine migration conflict THROWS and blocks boot, the correct
+        // fail-closed behavior (never start serving with rows we would silently ignore).
+        try {
+            const psMig = pluginStoragePerKeyStore.migrateLegacyLayout();
+            if (psMig.migrated > 0) logger.info(`[Server] pluginStorage: migrated ${psMig.migrated} legacy flat row(s) into the data/ layout.`);
+        } catch (e) {
+            logger.error(`[Server] pluginStorage legacy-layout migration failed — refusing to start: ${e && e.message}`);
+            throw e;
+        }
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
         let server;
