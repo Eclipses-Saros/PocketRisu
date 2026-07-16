@@ -179,23 +179,34 @@ pcs-specific data-loss classes were closed and independently verified.
       queued install, SUPERSEDE is truthful. Full suites green (isolation 7 / storage 208 /
       compat 53 / server 129).
 
-## 6. Deferred to the dedicated infra session — filesystem-store + resource class
+## 6. Filesystem-store + resource class — proportionate fixes (done) + one deferred
 
-These are orthogonal to the concurrency fix (they stem from "in-place mutation of the live
-store" + "the filesystem inlay dir is a second store with no serializer"), pre-date this work,
-and are scoped out on purpose:
+Orthogonal to the concurrency fix (these stem from "the filesystem inlay dir is a second store
+with no serializer" + resource use), pre-date this work. Addressed **proportionately** to their
+severity (all are low-probability; (4)'s worst case is recoverable missing-images, not chat loss)
+rather than with a full off-side/generation-pointer rewrite (huge blast radius — no connection
+reopen path, ~21 instance-bound prepared statements; ruled out):
 
-- **Validate-before-destroy for the `database.bin` blob.** Only `decodeDatabaseWithPersistentChatIds`
-  fully reads its headerless multi-part format, and that also migrates/writes — so a corrupt DB
-  blob is still installed then discovered. Needs a read-only validating decode (or the off-side
-  build below).
-- **SQLite ↔ filesystem (inlay dir) cross-store atomicity.** The install commits SQLite, then
-  renames the inlay dir; a rename failure leaves new DB + old/missing inlays. No 2-phase commit.
-- **`/api/inlays/compress` vs the inlay swap** — a filesystem read-modify-write straddling the
-  swap can write old media into the imported account's dir. Same FS-store class.
-- **`import_staging` disk amplification** (~asset-size freed pages until VACUUM) and the
-  **`database.bin` in-memory hold** during the stream (unbounded import size).
-
-The design that dissolves this whole class: **build the new store OFF-side (separate DB file +
-inlay dir) and atomically SWAP it in** (rename + connection reopen, or a generation pointer),
-rather than mutating the live store in place. That is the infra session's charter.
+- **[x] Validate-before-destroy for `database.bin`.** A read-only `decodeRisuSave` of the staged
+  blob runs BEFORE the destructive install (commit `1b3e72c5`); a corrupt blob aborts with the
+  prior store intact. The cold-storage migration still runs on the installed blob afterward.
+- **[x] `/api/inlays/compress` vs the inlay swap.** Compress now participates in the same
+  import-vs-import mutual exclusion (`importInProgress`): refused 409 while an import runs, and it
+  sets the flag for its own duration so an import refuses to start under it. No swap can race it.
+- **[x] SQLite ↔ filesystem (inlay dir) crash atomicity — proportionate.** The DB install is one
+  SQLite transaction and the inlay swap has an in-process rollback; the remaining gap was a hard
+  CRASH mid-swap. `recoverCrashedInlayImport()` runs at boot: if the scratch dirs are present it
+  restores the pre-import inlays (if the live dir vanished) and clears the scratch, so inlays are
+  never lost outright and nothing leaks. Residual: a new-DB/old-inlays generation mismatch after
+  such a crash shows as missing images, recoverable by re-import — an accepted low-severity
+  tradeoff. Full cross-store atomicity (a generation pointer stored in SQLite, flipped atomically
+  with the DB) is the only way to eliminate the mismatch, and is DEFERRED as not worth its blast
+  radius for this severity.
+- **[x] `import_staging` disk amplification — accepted.** The staged rows are DELETEd after the
+  install (success + catch); freed pages return to the SQLite freelist and are reused, so this is
+  a transient high-water file size, not unbounded growth. No code change.
+- **[ ] `database.bin` in-memory hold (deferred).** The install-time chunking (`chunkStore.putValue`
+  → `cdcSplit`) needs the whole blob in memory, so temp-file staging wouldn't help — the real fix
+  is a STREAMING chunker (chunk from a file/stream), a `chunkStore` API change out of scope here.
+  The proportionate guard against adversarial huge imports is a `RISU_BACKUP_IMPORT_MAX_BYTES`
+  default (a policy decision — a too-low default breaks large legitimate backups), not code.

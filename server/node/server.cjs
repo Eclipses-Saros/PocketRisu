@@ -895,6 +895,11 @@ if (existsSync(instanceIdPath)) {
 
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
+// Backup-import scratch dirs (shared by importBackupFromSource and the boot-time crash
+// reconciliation): the import stages the new inlays here, then swaps them into inlayDir with
+// the prior inlays parked in the backup dir. A crash mid-swap leaves one or both behind.
+const inlayImportStagingDir = path.join(savePath, 'inlays_import_staging')
+const inlayImportBackupDir = path.join(savePath, 'inlays_import_backup')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
@@ -1097,6 +1102,29 @@ function getInlaySidecarPath(id) {
 
 async function ensureInlayDir() {
     await fs.mkdir(inlayDir, { recursive: true });
+}
+
+// Boot-time reconciliation of a backup import that crashed mid inlay-swap. The DB install is one
+// SQLite transaction and the inlay swap has an in-process rollback, so a clean rename FAILURE is
+// already handled; this covers a hard CRASH that left the scratch dirs behind. Best-effort and
+// idempotent: ensure inlayDir exists (prefer the pre-import backup if the live dir vanished mid-
+// swap, so inlays are never entirely lost), then clear the scratch dirs so they can't leak or be
+// mistaken for a fresh import. A residual DB↔inlay generation mismatch (new DB + restored old
+// inlays) shows as missing images and is recoverable by re-importing — an accepted low-severity
+// tradeoff (DEFECT.md §6); full cross-store atomicity would need the deferred generation-pointer.
+async function recoverCrashedInlayImport() {
+    const hasStaging = existsSync(inlayImportStagingDir);
+    const hasBackup = existsSync(inlayImportBackupDir);
+    if (!hasStaging && !hasBackup) return; // no crashed import
+    logger.warn('[Server] Detected leftover inlay import scratch dirs from a prior crash — reconciling.');
+    if (!existsSync(inlayDir) && hasBackup) {
+        // Crash between "inlays → backup" and "staging → inlays": the live dir is gone. Restore the
+        // pre-import inlays so nothing is lost outright.
+        try { await fs.rename(inlayImportBackupDir, inlayDir); }
+        catch (e) { logger.error('[Server] inlay backup restore failed:', e?.message || e); }
+    }
+    await fs.rm(inlayImportStagingDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(inlayImportBackupDir, { recursive: true, force: true }).catch(() => {});
 }
 
 function ensureInlayDirSync() {
@@ -2236,8 +2264,8 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     const explicitSidecarMap = new Map();
     const legacyInlayInfoMap = new Map();
 
-    const stagingDir = path.join(savePath, 'inlays_import_staging');
-    const backupInlayDir = path.join(savePath, 'inlays_import_backup');
+    const stagingDir = inlayImportStagingDir;
+    const backupInlayDir = inlayImportBackupDir;
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.rm(backupInlayDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
@@ -6036,6 +6064,16 @@ const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
 
 app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
     if (!checkActiveSession(req, res)) return;
+    // Compress read-modify-writes inlay FILES; a backup import atomically swaps the whole inlay
+    // dir. Run them mutually exclusively via the same flag as import-vs-import: refuse compress
+    // while an import is in progress (before the SSE headers), AND mark compress in progress so a
+    // concurrent import refuses to start under it — otherwise the import's dir swap could race
+    // compress and write pre-import media into the imported account's dir.
+    if (importInProgress) {
+        res.status(409).json({ error: 'a backup import/restore is in progress — retry compression after it completes' });
+        return;
+    }
+    importInProgress = true;
     const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
 
     res.writeHead(200, {
@@ -6101,6 +6139,8 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
         send({ type: 'done', total, compressed, skipped, totalSaved });
     } catch (err) {
         send({ type: 'error', message: err?.message || 'Unknown error' });
+    } finally {
+        importInProgress = false;
     }
 
     res.end();
@@ -6643,6 +6683,7 @@ async function getHttpsOptions() {
 
 async function startServer() {
     try {
+        await recoverCrashedInlayImport();
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
         // SSOT: fold any pre-namespace flat pluginStorage rows into the data/ layout

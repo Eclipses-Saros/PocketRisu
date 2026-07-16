@@ -271,6 +271,30 @@ describe('backup import — transaction isolation (real server)', () => {
         expect((await getPerKey()).k).toBe('IMPORTED') // install (queued after the write) superseded it
     }, 30000)
 
+    // (3) /api/inlays/compress read-modify-writes inlay FILES; it must not run during an import's
+    // inlay-dir swap. It participates in the same import-vs-import mutual exclusion (importInProgress),
+    // so it is refused 409 while an import is in flight (and, symmetrically, an import refuses to start
+    // while a compress is running — the compress path sets the same flag for its duration).
+    it('EXCLUSION(compress): /api/inlays/compress is refused 409 during an in-flight import', async () => {
+        // compress uses the session-cookie middleware; establish a session with the JWT first.
+        const sres = await fetch(`${BASE}/api/session`, { method: 'POST', headers: authHeaders() })
+        const cookie = (sres.headers.get('set-cookie') || '').split(';')[0]
+        expect(cookie).toMatch(/^risu-session=/)
+
+        const { req, done } = openStreamingImport()
+        try {
+            req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
+            await delay(300) // importInProgress = true
+            const r = await fetch(`${BASE}/api/inlays/compress`, {
+                method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ quality: 80 }),
+            })
+            expect(r.status).toBe(409)
+        } finally {
+            try { req.end() } catch {}
+            await done.catch(() => {})
+        }
+    }, 30000)
+
     // ATOMICITY of the DB/PCS pair. The original importer reconciled pcs in the SAME
     // transaction as database.bin, so a malformed pcs blob threw before COMMIT and left the
     // prior DB + prior pcs intact (never new-DB paired with the prior account's plugin rows).
