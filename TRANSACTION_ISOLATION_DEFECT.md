@@ -205,8 +205,14 @@ reopen path, ~21 instance-bound prepared statements; ruled out):
 - **[x] `import_staging` disk amplification — accepted.** The staged rows are DELETEd after the
   install (success + catch); freed pages return to the SQLite freelist and are reused, so this is
   a transient high-water file size, not unbounded growth. No code change.
-- **[ ] `database.bin` in-memory hold (deferred).** The install-time chunking (`chunkStore.putValue`
-  → `cdcSplit`) needs the whole blob in memory, so temp-file staging wouldn't help — the real fix
-  is a STREAMING chunker (chunk from a file/stream), a `chunkStore` API change out of scope here.
-  The proportionate guard against adversarial huge imports is a `RISU_BACKUP_IMPORT_MAX_BYTES`
-  default (a policy decision — a too-low default breaks large legitimate backups), not code.
+- **[x] `database.bin` in-memory hold — bounded by a sanity ceiling.** The install-time chunking
+  (`chunkStore.putValue` → `cdcSplit`) needs the whole blob in memory, so temp-file staging wouldn't
+  help — a tight per-blob guarantee needs a STREAMING chunker (a `chunkStore` API change, still
+  deferred). But the blob is chat TEXT + marker (inlay images are separate files that stream to disk
+  staging, and disk is preflighted), so a real one is small; only a pathological/corrupt backup makes
+  it huge. `RISU_BACKUP_IMPORT_MAX_BYTES` now DEFAULTS to a generous **50 GB** sanity ceiling
+  (matching `SNAPSHOT_LIMIT_MAX_BYTES`) instead of unbounded — far above any realistic backup (per a
+  web check: RisuAI backups grow with chats/assets but there is no published size; hard tech limits
+  are ~512MB/blob in better-sqlite3, ~2GB/Node Buffer), env-overridable, `0` disables it. Removes the
+  "literally unbounded" property with zero realistic regression. A streaming chunker for a tight
+  per-blob memory bound remains the only genuinely-deferred piece of this class.

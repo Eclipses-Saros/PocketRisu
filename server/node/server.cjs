@@ -902,7 +902,14 @@ const inlayImportStagingDir = path.join(savePath, 'inlays_import_staging')
 const inlayImportBackupDir = path.join(savePath, 'inlays_import_backup')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
-const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
+// A backup import streams assets to disk staging (disk is preflighted via BACKUP_DISK_HEADROOM),
+// but holds database.bin in a JS Buffer at install time. That blob is chat TEXT + marker (inlay
+// images are separate files), so a real one is small; only a pathological/corrupt backup could
+// make it huge. Rather than leave the import size literally unbounded, default to a generous
+// SANITY CEILING matching the app's own max-size convention (SNAPSHOT_LIMIT_MAX_BYTES = 50 GB) —
+// far above any realistic backup (no regression), env-overridable, and `0` disables the cap.
+// (A tight per-blob memory guarantee would need a streaming chunker — DEFECT.md §6 item 6.)
+const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? String(50 * 1024 * 1024 * 1024));
 const BACKUP_ENTRY_NAME_MAX_BYTES = 1024;
 // Minimum free disk space headroom multiplier: require 2× the backup size to be free
 const BACKUP_DISK_HEADROOM = 2;

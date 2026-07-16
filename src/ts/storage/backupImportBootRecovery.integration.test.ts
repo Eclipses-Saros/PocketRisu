@@ -52,7 +52,7 @@ afterEach(async () => {
 })
 
 // Pre-seed a save dir, boot a real server (recovery runs before the listener), return the save dir.
-async function bootWithSeed(seed: (saveDir: string) => void): Promise<string> {
+async function bootWithSeed(seed: (saveDir: string) => void, extraEnv: Record<string, string> = {}): Promise<string> {
     dir = mkdtempSync(nodePath.join(tmpdir(), 'prisu-bootrec-'))
     const saveDir = nodePath.join(dir, 'save')
     mkdirSync(saveDir, { recursive: true })
@@ -60,7 +60,7 @@ async function bootWithSeed(seed: (saveDir: string) => void): Promise<string> {
     seed(saveDir)
     srv = spawn('node', [SERVER_CJS], {
         cwd: dir,
-        env: { ...process.env, PORT: String(PORT), RISU_TUNNEL_DISABLED: 'true', RISU_UPDATE_CHECK: 'false', POCKETRISU_BACKUP_INTERVAL_MS: '0' },
+        env: { ...process.env, PORT: String(PORT), RISU_TUNNEL_DISABLED: 'true', RISU_UPDATE_CHECK: 'false', POCKETRISU_BACKUP_INTERVAL_MS: '0', ...extraEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
     })
     const TOKEN = forgeToken()
@@ -116,5 +116,28 @@ describe('backup import — boot recovery of a crashed inlay swap (real server)'
         const files = readdirSync(nodePath.join(saveDir, 'inlays'))
         expect(files).toContain('new.png')
         expect(files).not.toContain('old.png') // did not clobber with the redundant backup
+    }, 30000)
+})
+
+// The import size cap (RISU_BACKUP_IMPORT_MAX_BYTES) bounds the whole import so a pathological
+// backup can't drive unbounded memory/disk. It defaults to a generous 50 GB sanity ceiling and is
+// env-overridable. This pins that the cap is actually wired: a backup exceeding it is rejected 413.
+describe('backup import — size cap (RISU_BACKUP_IMPORT_MAX_BYTES)', () => {
+    function backupEntry(name: string, data: Buffer): Buffer {
+        const n = Buffer.from(name, 'utf-8')
+        const nl = Buffer.alloc(4); nl.writeUInt32LE(n.length, 0)
+        const dl = Buffer.alloc(4); dl.writeUInt32LE(data.length, 0)
+        return Buffer.concat([nl, n, dl, data])
+    }
+    it('rejects a backup that exceeds the configured cap (413)', async () => {
+        await bootWithSeed(() => {}, { RISU_BACKUP_IMPORT_MAX_BYTES: '200' }) // 200-byte cap
+        const TOKEN = forgeToken()
+        const oversize = backupEntry('some-asset', Buffer.alloc(1024, 0x41)) // > 200 bytes
+        const r = await fetch(`${BASE}/api/backup/import`, {
+            method: 'POST',
+            headers: { 'risu-auth': TOKEN, 'content-type': 'application/octet-stream' },
+            body: oversize,
+        })
+        expect(r.status).toBe(413)
     }, 30000)
 })
