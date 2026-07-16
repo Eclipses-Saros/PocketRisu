@@ -1,8 +1,17 @@
 # PocketRisu — core transaction-isolation fix PLAN
 
+> ⚠️ **SUPERSEDED — historical.** The concurrency class was FIXED, but NOT by the per-batch
+> approach this plan describes. The shipped root fix is **"the import is a queue operation"**:
+> stage off-live → validate → run the whole destructive install as ONE `queueStorageOperation`,
+> so it serializes structurally against every mutator (all of which use the queue). See
+> [TRANSACTION_ISOLATION_DEFECT.md](TRANSACTION_ISOLATION_DEFECT.md) **§3 (shipped design)** and
+> **§6 (the filesystem-store + resource class still deferred to the infra session)**. The
+> per-batch design + `importInProgress` guards below were tried and rejected (symptom-level;
+> codex found real P1s). This file is kept only for the diagnosis context in §1 and the test
+> plan; do not implement §2's per-batch design.
+
 Companion to [TRANSACTION_ISOLATION_DEFECT.md](TRANSACTION_ISOLATION_DEFECT.md) (the diagnosis).
-This is the executable plan for a **separate session**. Self-contained; a fresh session can
-follow it. Chosen approach: **never hold a DB transaction open across async I/O** — flush the
+Original (superseded) approach: **never hold a DB transaction open across async I/O** — flush the
 streamed import in per-batch SYNCHRONOUS transactions using the EXISTING chunk-aware `kvSet`.
 (An earlier draft proposed a raw-BLOB staging table for whole-import atomicity; that
 reintroduces the BLOB bind limit chunkStore removes — see §1a. Atomicity is a non-goal, §2.3.)

@@ -3895,11 +3895,16 @@ app.post('/api/patch', async (req, res, next) => {
             }
             dbCache[filePath] = snapshot;
 
-            // Schedule save to KV (debounced) — merge full chats back for database.bin
+            // Schedule save to KV (debounced) — merge full chats back for database.bin.
+            // The persist runs THROUGH the storage queue so it serializes with a backup
+            // import's install: a stale dbCache flush can no longer fire during the install
+            // and overwrite the just-restored database.bin (it either runs before the install,
+            // which then supersedes it, or after — by which point invalidateDbCache has cleared
+            // dbCache and persistDbCacheWithChats no-ops).
             if (saveTimers[filePath]) {
                 clearTimeout(saveTimers[filePath]);
             }
-            saveTimers[filePath] = setTimeout(async () => {
+            saveTimers[filePath] = setTimeout(() => { queueStorageOperation(async () => {
                 try {
                     if (decodedKey === 'database/database.bin') {
                         await persistDbCacheWithChats(filePath, decodedKey);
@@ -3930,7 +3935,7 @@ app.post('/api/patch', async (req, res, next) => {
                 } finally {
                     delete saveTimers[filePath];
                 }
-            }, SAVE_INTERVAL);
+            }); }, SAVE_INTERVAL);
 
             // Update ETag after successful patch (based on stripped version)
             if (decodedKey === 'database/database.bin') {
@@ -4832,7 +4837,9 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             if (saveTimers[DB_HEX_KEY]) {
                 clearTimeout(saveTimers[DB_HEX_KEY]);
             }
-            saveTimers[DB_HEX_KEY] = setTimeout(async () => {
+            // Persist THROUGH the storage queue so it serializes with a backup import's
+            // install (a stale flush can't fire mid-install and overwrite the restored DB).
+            saveTimers[DB_HEX_KEY] = setTimeout(() => { queueStorageOperation(async () => {
                 try {
                     // If dbCache has stripped DB, persist with merged chats
                     if (dbCache[DB_HEX_KEY]) {
@@ -4874,7 +4881,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 } finally {
                     delete saveTimers[DB_HEX_KEY];
                 }
-            }, SAVE_INTERVAL);
+            }); }, SAVE_INTERVAL);
 
             res.json({ success: true });
         });

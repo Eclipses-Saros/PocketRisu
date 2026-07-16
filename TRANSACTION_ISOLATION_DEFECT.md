@@ -1,15 +1,23 @@
 # PocketRisu — Core transaction-isolation defect (handoff for a separate session)
 
-**Status:** identified, NOT fixed. Deferred to its own session (this is app-wide core
-infrastructure, orthogonal to the pluginCustomStorage SSOT work that produced this note).
+**Status:** CONCURRENCY class FIXED (commits `473dfba6` + the debounced-timer follow-up).
+A separate, orthogonal **filesystem-store + resource** class remains deferred to its own
+session (see §6). Independently reviewed (codex) across the redesign.
 **Date:** 2026-07-16
-**Chosen fix direction:** never hold a tx open across async I/O — **per-batch SYNCHRONOUS
-flush** using the existing chunk-aware `kvSet`. See below (§3) and
-[TRANSACTION_ISOLATION_FIX_PLAN.md](TRANSACTION_ISOLATION_FIX_PLAN.md) §1a/§2 for the
-executable plan. (An earlier draft said "stage → single synchronous apply"; that was dropped
-— a raw staging table reintroduces the BLOB bind limit `chunkStore` removes. §3 updated.)
+**Root cause:** the backup import bypassed `queueStorageOperation` — the app's single-writer
+serializer that every other mutator runs through. Every concurrency symptom (ACK-then-erase,
+DB/pcs split, timer-defeats-restore) traced to "the import is not a queue operation."
+**Chosen fix direction (shipped):** make the import a well-behaved member of the queue.
+Stream + stage OFF the live store; validate; then run the WHOLE destructive install as ONE
+`queueStorageOperation` (clears + staged copy + `database.bin` + pcs reconcile in one
+synchronous transaction, then inlay swap + cold-storage migration). Because every KV mutator
+(now incl. `/api/assets/bulk-write` and the debounced `/api/patch` + `/api/chat-content`
+persist timers) also goes through the queue, the install is serialized against all of them
+structurally — no per-endpoint guard, no flag TOCTOU. This REPLACED an earlier per-batch +
+per-mutator-`importInProgress`-guard attempt, which was symptom-level (guard sprinkle with
+entry-only TOCTOU + missed mutators); see the git history / §3.
 **Flag state:** the pluginCustomStorage write-enable flag is independent of this; this
-defect predates the per-key store and affects `database.bin`, chats, characters, assets,
+defect predates the per-key store and affected `database.bin`, chats, characters, assets,
 and pluginStorage identically.
 
 This document is self-contained: a fresh session with no prior context can act on it.
@@ -96,44 +104,44 @@ All of these are **core data** (not plugin-specific):
 
 ---
 
-## 3. Chosen fix — per-batch SYNCHRONOUS flush (root: remove the mechanism)
+## 3. Chosen fix (shipped) — the import is a queue operation
 
-Restructure `importBackupFromSource` (and audit any other tx-across-async) to **never hold
-a transaction open across async I/O**:
+The root cause is **not** "a tx held across async I/O" per se — that was one symptom. The
+root is that the import **bypassed `queueStorageOperation`**, the app's single-writer
+serializer. The fix makes the import a well-behaved member of that queue:
 
-1. **Stream phase (NO transaction open across an `await`).** Do not `BEGIN` before the
-   stream. Buffer the streamed KV entries in memory and flush each batch inside ONE
-   synchronous `sqliteDb.transaction(recs => { for (r) kvSet(r.key, r.value) })` — using the
-   EXISTING chunk-aware `kvSet` so `database.bin` still chunks (a raw staging table would
-   reintroduce the BLOB bind limit — see FIX_PLAN §1a). Between flushes NO transaction is
-   open, so a concurrent write commits independently. Remove the connection-global
-   `synchronous = OFF`. The FIRST flush also runs the prefix clears + `clearEntities` before
-   its writes, so clear+first-writes land atomically.
-2. **Final apply (one synchronous transaction, NO `await` inside).** Flush the remaining
-   batch and `pluginStorage` clear + `reconcileReplace` in one synchronous transaction.
-   Being synchronous, it never yields the event loop, so no concurrent write can join it.
-3. Inlay dir swap + cold-storage migration + WAL checkpoint stay after the apply, as today.
+1. **Stream + stage OFF the live store.** No `BEGIN`, no live write during the stream. Small
+   KV (assets/coldstorage) → a disk-backed `import_staging` table (NOT a `temp_store=MEMORY`
+   temp table → no OOM); `database.bin` held in a JS var (kvSet chunks only that key, so a raw
+   staging row would hit the BLOB bind limit `chunkStore` removes); pcs blob captured; inlays
+   staged to files as before.
+2. **Validate before destroy.** The pcs blob is parsed + shape-checked BEFORE anything
+   destructive (fail closed). (Validating the `database.bin` blob is deferred — §6.)
+3. **Install as ONE `queueStorageOperation`.** A single synchronous `sqliteDb.transaction`
+   (prefix clears + `clearEntities` + staged→live copy + `database.bin` + `pluginStorage/`
+   clear + `reconcileReplace` — the DB image and the per-key store commit together), then the
+   inlay dir swap, then the cold-storage migration, all inside that one queue op.
 
-**Atomicity is a NON-GOAL** (the prior code already committed every `BATCH_SIZE`): a crash
-between flushes leaves a partial import, exactly as before. The defect being fixed is
-interleaving + durability, not atomicity. Whole-import atomicity would need chunk-aware
-staging (out of scope — FIX_PLAN §2.3).
+Why this is the root fix: because EVERY KV mutator runs through `queueStorageOperation`
+(`/api/write`, `/api/patch`, `/api/remove`, `/api/plugin-storage`, `/api/chat-content`, and —
+made so by this work — `/api/assets/bulk-write` and the debounced `/api/patch` + `/api/chat-
+content` persist timers), the install is serialized against all of them **structurally**. A
+concurrent write can never be erased mid-flight: it either completed before the install (a
+succeeding import then legitimately supersedes it — ordinary last-op-wins) or runs after it
+(on the imported state). No per-endpoint `importInProgress` guard, no flag TOCTOU, no missed-
+mutator class. `synchronous = OFF` is gone (durable NORMAL throughout).
 
-Effect: the interleaving mechanism disappears for **all** namespaces at once; the global
-pragma toggle is gone; broken structures 1, 2, 5 dissolve (4 = atomicity is an accepted
-non-goal). Endpoint-level `importInProgress` guards and the pluginStorage-specific import
-guard (see §4) become unnecessary.
+**What this dissolves:** broken structures 1, 2, 5 (interleave/durability/savepoint) AND the
+DB/pcs split AND the debounced-timer-defeats-restore race — all as the single "import joins
+the queue" property.
 
-Cost/risk: backup import is complex and critical (streaming, batching, inlay staging, cold
-storage). **Wrap it in regression/e2e tests that pin current import behavior FIRST**, then
-restructure, then confirm green + an independent review.
-
-### Alternative considered (rejected as the primary fix): Option A (coordinate around it)
-Extend `importInProgress` to every mutator (two-point check, as done for
-`/api/plugin-storage`) and to the debounced timers; scope `synchronous = OFF` down; return
-503 during import and handle it on the client. Lower risk, but leaves the violated
-principle in place and adds many touch points + client 503 handling. Kept only as a
-fallback if B's rewrite proves too risky.
+### Rejected earlier attempts (kept for the record)
+- **Per-mutator `importInProgress` 503 guard on every endpoint** (an earlier commit): symptom-
+  level. Needed a guard on each mutator, had an entry-only TOCTOU, and missed mutators
+  (`/api/inlays/compress`, the debounced timers). Replaced by queue serialization.
+- **Per-batch synchronous flush with atomicity as a non-goal**: fixed the tx-across-await but
+  left real P1s (a concurrent write to a cleared namespace lost on a failed import; a new-DB/
+  old-pcs split on malformed pcs). Superseded by the atomic queued install above.
 
 ---
 
@@ -155,16 +163,39 @@ pcs-specific data-loss classes were closed and independently verified.
 
 ---
 
-## 5. Quick checklist for the fix session
+## 5. Checklist — CONCURRENCY class (done)
 
-- [x] Add regression/e2e tests pinning current backup import behavior
-      (`src/ts/storage/backupImportIsolation.integration.test.ts`: round-trip; atomicity;
-      concurrent write ACKed 200 not erased by rollback — proven RED pre-fix, GREEN post-fix).
-- [x] Restructure `importBackupFromSource`: per-batch SYNCHRONOUS flush (no tx across `await`).
-- [x] Remove connection-global `synchronous = OFF` (each flush runs at NORMAL, durable).
-- [ ] Audit debounced timer writes (`saveTimers`) and `/api/remove` for consistency with
-      the new model.
-- [ ] Re-check every `sqliteDb.transaction()` site is only ever entered outside an import.
-- [ ] Remove now-redundant guards (pcs "2f" import guard; any endpoint `importInProgress`
-      checks that B makes unnecessary).
-- [ ] Independent review + full test suite green.
+- [x] Regression/e2e tests (`src/ts/storage/backupImportIsolation.integration.test.ts`):
+      round-trip; write + pcs-delta ACKed during a FAILING import SURVIVE (no erase, no 503);
+      a SUCCEEDING import atomically SUPERSEDES a concurrent write; malformed pcs → prior
+      DB+pcs intact. RED pre-fix, GREEN post-fix.
+- [x] Restructure `importBackupFromSource`: stage off-live → validate → ONE queued atomic
+      install (no tx across `await`; `synchronous = OFF` removed → durable NORMAL).
+- [x] Route the remaining unqueued KV mutators through the queue: `/api/assets/bulk-write`
+      and the debounced `/api/patch` + `/api/chat-content` persist timers.
+- [x] Removed the pcs "2f" `importInProgress` guard and the per-mutator guard sprinkle
+      (queue serialization replaces them); `importInProgress` now only 409s a second import.
+- [x] Independent review (codex, 3 rounds): confirmed serialization holds, no deadlock in the
+      queued install, SUPERSEDE is truthful. Full suites green (isolation 7 / storage 208 /
+      compat 53 / server 129).
+
+## 6. Deferred to the dedicated infra session — filesystem-store + resource class
+
+These are orthogonal to the concurrency fix (they stem from "in-place mutation of the live
+store" + "the filesystem inlay dir is a second store with no serializer"), pre-date this work,
+and are scoped out on purpose:
+
+- **Validate-before-destroy for the `database.bin` blob.** Only `decodeDatabaseWithPersistentChatIds`
+  fully reads its headerless multi-part format, and that also migrates/writes — so a corrupt DB
+  blob is still installed then discovered. Needs a read-only validating decode (or the off-side
+  build below).
+- **SQLite ↔ filesystem (inlay dir) cross-store atomicity.** The install commits SQLite, then
+  renames the inlay dir; a rename failure leaves new DB + old/missing inlays. No 2-phase commit.
+- **`/api/inlays/compress` vs the inlay swap** — a filesystem read-modify-write straddling the
+  swap can write old media into the imported account's dir. Same FS-store class.
+- **`import_staging` disk amplification** (~asset-size freed pages until VACUUM) and the
+  **`database.bin` in-memory hold** during the stream (unbounded import size).
+
+The design that dissolves this whole class: **build the new store OFF-side (separate DB file +
+inlay dir) and atomically SWAP it in** (rename + connection reopen, or a generation pointer),
+rather than mutating the live store in place. That is the infra session's charter.
