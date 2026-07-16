@@ -177,6 +177,21 @@ describe('backup import — transaction isolation (real server)', () => {
         expect(booted).toBe(true)
     })
 
+    // (a) validate-before-destroy for the DB blob: the staged database.bin is structurally
+    // decoded BEFORE the destructive install, so a corrupt blob aborts with the prior store
+    // intact — never destroy-then-discover-corrupt.
+    it('ATOMICITY(db): a malformed database.bin leaves the prior database.bin + pcs intact', async () => {
+        expect(await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'PRIOR-DB' })).toBe(200)
+        expect(await replacePerKey({ survivor: 'prior-pcs' })).toBe(200)
+
+        // database.risudat that is not a decodable risu blob → validation throws before install.
+        const backup = encodeBackupEntry('database.risudat', Buffer.from('not a valid risu database blob at all', 'utf8'))
+        expect(await importBackup(backup)).not.toBe(200)
+
+        expect((await readDb()).customCSS).toBe('PRIOR-DB')
+        expect(await getPerKey()).toEqual({ survivor: 'prior-pcs' })
+    }, 30000)
+
     it('ROUND-TRIP: export → mutate → import restores database.bin + pcs (baseline)', async () => {
         // seed a known state
         expect(await writeDb({ formatversion: 4, characters: [], botPresets: [], modules: [], plugins: [], customCSS: 'ROUND-TRIP-A' })).toBe(200)

@@ -2455,12 +2455,13 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         // Flush any tail of staged small KV (no tx held across an await).
         if (pendingBatch.length) { stageBatch(pendingBatch); pendingBatch = []; }
 
-        // Validate the pcs blob BEFORE any destructive op so a malformed blob aborts with the
-        // prior store fully intact (fail closed; never coerced to {}/wipe, never a new-DB/old-pcs
-        // split). NOTE: database.bin is NOT pre-validated here — the only decoder that fully reads
-        // its (headerless, multi-part) format is decodeDatabaseWithPersistentChatIds, which also
-        // migrates/writes, so validate-before-destroy for the DB blob belongs with the filesystem-
-        // atomicity rework (deferred infra session), not this concurrency fix.
+        // VALIDATE the staged image BEFORE any destructive op, so a malformed backup aborts with
+        // the prior store fully intact (never destroy-then-discover-corrupt):
+        //   - pcs blob: parse + shape check, fail closed (never coerced to {}/wipe).
+        //   - database.bin: a structural decode. decodeRisuSave throws on a corrupt/undecodable
+        //     blob, so a bad DB never reaches the install that would already have cleared the old
+        //     store. (This is a READ-ONLY validation; the cold-storage migration still runs on the
+        //     installed blob inside the queue op below.)
         let decodedPcs = null;
         if (sawPcsEntry) {
             decodedPcs = JSON.parse((capturedPcsBlob || Buffer.alloc(0)).toString('utf8')); // JSON blob (lossless nested keys)
@@ -2468,6 +2469,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 throw new Error('pluginStorage.risudat present but missing pluginCustomStorage — failing closed');
             }
         }
+        await decodeRisuSave(dbBlobValue); // structural validation only; throws → abort, store untouched
 
         // INSTALL as ONE storage-queue operation. queueStorageOperation is the app's single-writer
         // serializer (every mutator runs through it), so making the whole destructive install a
