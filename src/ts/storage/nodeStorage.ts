@@ -691,12 +691,22 @@ export class NodeStorage{
 
     // Send ONLY changed/removed keys — the concurrency-safe steady-state path.
     async savePluginStorageDelta(delta: { changed: Record<string, any>; removed: string[] }): Promise<void> {
-        // canonicalize the changed map + validate removed keys BEFORE encoding, so a
-        // Proxy/typed/codec-unsafe key can never reach the wire and collapse the map.
+        // Canonicalize changed + materialize removed into fresh structures in ONE pass
+        // each, BEFORE encoding, and encode ONLY those copies — so a stateful/Proxy
+        // input cannot present different contents to validation vs the encoder, and a
+        // codec-unsafe key can never reach the wire.
         const changed = canonicalStorageMap(delta?.changed ?? {}, 'savePluginStorageDelta')
-        const removed = Array.isArray(delta?.removed) ? delta.removed : []
+        const removed: string[] = []
+        const rawRemoved = delta?.removed
+        if (rawRemoved !== undefined && rawRemoved !== null) {
+            if (!Array.isArray(rawRemoved)) throw new Error('savePluginStorageDelta: removed must be an array')
+            for (const k of rawRemoved) {
+                if (typeof k !== 'string' || !isCodecSafeStorageKey(k)) throw new Error(`savePluginStorageDelta: removed key "${String(k)}" is invalid or codec-unsafe`)
+                removed.push(k)
+            }
+        }
         for (const k of removed) {
-            if (!isCodecSafeStorageKey(k)) throw new Error(`savePluginStorageDelta: removed key "${k}" is codec-unsafe`)
+            if (Object.hasOwn(changed, k)) throw new Error(`savePluginStorageDelta: key "${k}" appears in both changed and removed`)
         }
         const encoded = encodeRisuSaveLegacy({ type: 'delta', changed, removed })
         const da = await this.authFetch('/api/plugin-storage', {
