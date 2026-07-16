@@ -3,7 +3,7 @@ import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
-import { isPluginStorageSidecarWriteEnabled, buildPluginStorageDirectory, PLUGIN_STORAGE_SIDECAR_MARKER } from "./pluginStorageSidecar";
+import { isPluginStorageSidecarWriteEnabled } from "./pluginStorageSidecar";
 
 const packr = new Packr({
     useRecords:false
