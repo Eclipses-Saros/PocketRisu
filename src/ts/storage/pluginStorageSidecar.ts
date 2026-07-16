@@ -85,14 +85,22 @@ export async function planPcsBoot(args: {
         // Not opted in: stay legacy, inline authoritative (byte-identical to pre-b3).
         return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false }
     }
-    // Opted-in device MIGRATES: replace-first (a legacy store rejects deltas). A replace FAILURE
-    // is safe to fall back from — the account is still legacy (the replace didn't take), so
-    // inline stays authoritative and we retry next boot. (Unlike a probe failure, the mode is
-    // KNOWN here: legacy. So this is NOT a blind write-mode choice.)
+    // Opted-in device MIGRATES: replace-first (a legacy store rejects deltas).
     try {
         await replaceSidecar(inlineObj)
     } catch (e) {
-        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `legacy→initialized migration (replace) failed — staying legacy this session (fail closed): ${e}` }
+        // A rejected replace is AMBIGUOUS: the server commits the store BEFORE sending its
+        // response, so a lost response/network error after commit looks identical to "never
+        // committed". Treating it as "still legacy" would boot legacy + edit inline, then the
+        // next boot's 200 wins and this session's inline edits vanish. RE-PROBE to disambiguate:
+        //   initialized → it DID commit (this replace or a racing device) → adopt the rows.
+        //   404         → confirmed not committed → safe legacy fallback, retry next boot.
+        //   throw       → still unknown → propagate (block boot). Never guess a write mode.
+        const reprobe = await fetchSidecar()
+        if (reprobe !== null) {
+            return { enableSidecar: true, pcs: reprobe, baseline: reprobe, markMigration: inlineFieldPresent }
+        }
+        return { enableSidecar: false, pcs: null, baseline: inlineObj, markMigration: false, warn: `migration replace failed; re-probe confirms legacy — staying legacy this session: ${e}` }
     }
     // Replace acked: server now holds exactly inlineObj as rows. Adopt the sidecar, seed the
     // baseline, and full-write to strip the inline block from database.bin — but only if the

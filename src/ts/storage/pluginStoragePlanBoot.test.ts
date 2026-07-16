@@ -69,16 +69,42 @@ describe('planPcsBoot — boot reconciliation (F1/F2/F3, R16)', () => {
         expect(replaceSidecar).not.toHaveBeenCalled()   // never write on unknown mode
     })
 
-    it('MIGRATION replace FAILS (mode KNOWN legacy) → FAIL CLOSED: stay legacy this session, no throw', async () => {
+    it('MIGRATION replace FAILS, re-probe confirms 404 → FAIL CLOSED: stay legacy, no throw (R17)', async () => {
+        let calls = 0
         const plan = await planPcsBoot(base({
             localOptIn: true, inlineObj: INLINE, inlineFieldPresent: true,
-            fetchSidecar: async () => null,                 // legacy — mode known
+            fetchSidecar: async () => { calls++; return null },  // probe → null; re-probe → null (still legacy)
             replaceSidecar: async () => { throw new Error('network') },
         }))
+        expect(calls).toBe(2)                    // probed, then RE-probed after the replace error
         expect(plan.enableSidecar).toBe(false)   // did NOT half-migrate
         expect(plan.pcs).toBeNull()
         expect(plan.markMigration).toBe(false)
-        expect(plan.warn).toMatch(/migration.*failed|fail closed/i)
+        expect(plan.warn).toMatch(/re-probe confirms legacy|migration.*failed/i)
+    })
+
+    it('MIGRATION replace fails but COMMITTED (response lost); re-probe shows 200 → ADOPT sidecar, no loss (R17)', async () => {
+        // The server commits before responding; a lost response looks like a failed replace.
+        // Re-probe reveals the store IS initialized → adopt it instead of booting legacy.
+        let calls = 0
+        const rows = { a: '1', b: '2' }
+        const plan = await planPcsBoot(base({
+            localOptIn: true, inlineObj: INLINE, inlineFieldPresent: true,
+            fetchSidecar: async () => { calls++; return calls === 1 ? null : rows }, // 404 then (post-commit) 200
+            replaceSidecar: async () => { throw new Error('response lost after commit') },
+        }))
+        expect(plan.enableSidecar).toBe(true)    // adopted the (committed) sidecar
+        expect(plan.pcs).toBe(rows)
+        expect(plan.baseline).toBe(rows)
+    })
+
+    it('MIGRATION replace fails and re-probe is UNKNOWN (throws) → propagate (block boot) (R17)', async () => {
+        let calls = 0
+        await expect(planPcsBoot(base({
+            localOptIn: true, inlineObj: INLINE, inlineFieldPresent: true,
+            fetchSidecar: async () => { calls++; if (calls === 1) return null; throw new Error('500 on re-probe') },
+            replaceSidecar: async () => { throw new Error('network') },
+        }))).rejects.toThrow(/500 on re-probe/)
     })
 
     it('fresh account (legacy 404, no inline field) + opted-in → replace({}) initializes an empty store', async () => {

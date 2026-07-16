@@ -57,38 +57,46 @@ async function loadPluginStorageInto(decodedDb: any): Promise<void> {
         resyncPluginStorageBaseline(decodedDb?.pluginCustomStorage)
         return
     }
-    // Whether the decoded DB carries a pcs field at all (drives the inline-strip migration —
-    // keyed on PRESENCE so an empty {} inline field is still stripped, not left dangling).
-    const inlineFieldPresent = !!decodedDb && typeof decodedDb === 'object' && Object.hasOwn(decodedDb, 'pluginCustomStorage')
-    const rawInline = inlineFieldPresent ? (decodedDb as any).pluginCustomStorage : undefined
-    // Only null/undefined normalize to {} (legitimately empty). A NON-plain legacy pcs
-    // (array / string / number / Map / instance) must NOT be silently coerced to {} — that
-    // would migrate an empty map over real data (a wipe). Fail closed.
-    let inlineObj: Record<string, any>
-    if (rawInline === null || rawInline === undefined) {
-        inlineObj = {}
-    } else if (typeof rawInline === 'object' && !Array.isArray(rawInline) &&
-               (Object.getPrototypeOf(rawInline) === Object.prototype || Object.getPrototypeOf(rawInline) === null)) {
-        inlineObj = rawInline
-    } else {
-        throw new Error('[pluginStorage] legacy pluginCustomStorage is not a plain object — refusing to migrate (fail closed, no wipe)')
-    }
+    try {
+        // Whether the decoded DB carries a pcs field at all (drives the inline-strip migration —
+        // keyed on PRESENCE so an empty {} inline field is still stripped, not left dangling).
+        const inlineFieldPresent = !!decodedDb && typeof decodedDb === 'object' && Object.hasOwn(decodedDb, 'pluginCustomStorage')
+        const rawInline = inlineFieldPresent ? (decodedDb as any).pluginCustomStorage : undefined
+        // Only null/undefined normalize to {} (legitimately empty). A NON-plain legacy pcs
+        // (array / string / number / Map / instance) must NOT be silently coerced to {} — that
+        // would migrate an empty map over real data (a wipe). Fail closed.
+        let inlineObj: Record<string, any>
+        if (rawInline === null || rawInline === undefined) {
+            inlineObj = {}
+        } else if (typeof rawInline === 'object' && !Array.isArray(rawInline) &&
+                   (Object.getPrototypeOf(rawInline) === Object.prototype || Object.getPrototypeOf(rawInline) === null)) {
+            inlineObj = rawInline
+        } else {
+            throw new Error('[pluginStorage] legacy pluginCustomStorage is not a plain object — refusing to migrate (fail closed, no wipe)')
+        }
 
-    // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate). A probe
-    // failure THROWS out of here to BLOCK boot (fail closed — never boot into an initialized
-    // account read as empty). This is the thin applier of its plan.
-    const plan = await planPcsBoot({
-        localOptIn: isPluginStorageSidecarWriteEnabled(),
-        inlineObj,
-        inlineFieldPresent,
-        fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
-        replaceSidecar: (m) => forageStorage.realStorage.savePluginStorageReplace(m),
-    })
-    if (plan.warn) console.error('[pluginStorage]', plan.warn)
-    setPluginStorageSidecarWriteEnabled(plan.enableSidecar)
-    if (plan.pcs !== null) decodedDb.pluginCustomStorage = plan.pcs
-    resyncPluginStorageBaseline(plan.baseline)
-    if (plan.markMigration) markPluginStorageMigration()
+        // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate). A probe
+        // failure THROWS out of here to BLOCK boot (fail closed — never boot into an initialized
+        // account read as empty). This is the thin applier of its plan.
+        const plan = await planPcsBoot({
+            localOptIn: isPluginStorageSidecarWriteEnabled(),
+            inlineObj,
+            inlineFieldPresent,
+            fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
+            replaceSidecar: (m) => forageStorage.realStorage.savePluginStorageReplace(m),
+        })
+        if (plan.warn) console.error('[pluginStorage]', plan.warn)
+        setPluginStorageSidecarWriteEnabled(plan.enableSidecar)
+        if (plan.pcs !== null) decodedDb.pluginCustomStorage = plan.pcs
+        resyncPluginStorageBaseline(plan.baseline)
+        if (plan.markMigration) markPluginStorageMigration()
+    } catch (e: any) {
+        // A pcs mode/probe/validation failure is NOT save-file corruption. Tag it so the
+        // DB-decode backup-recovery path RE-THROWS (blocks boot + retry) instead of recovering
+        // an OLDER backup — recovering could migrate stale data over the current DB (R17).
+        if (e && typeof e === 'object') e.isPluginStorageBootError = true
+        throw e
+    }
 }
 
 export async function loadData() {
@@ -129,6 +137,9 @@ export async function loadData() {
                     console.log(decoded)
                     setDatabase(decoded)
                 } catch (error) {
+                    // A pcs mode/probe/validation failure is NOT save-file corruption: block
+                    // boot (retry) rather than recovering an OLDER backup over the current DB.
+                    if ((error as any)?.isPluginStorageBootError) throw error
                     console.error(error)
                     const backups = await getDbBackups()
                     let backupLoaded = false
@@ -142,7 +153,10 @@ export async function loadData() {
                             setDatabase(backupDecoded)
                             backupLoaded = true
                             break
-                        } catch (error) { }
+                        } catch (error) {
+                            // A pcs boot failure must not silently skip to an older backup either.
+                            if ((error as any)?.isPluginStorageBootError) throw error
+                        }
                     }
                     if (!backupLoaded) {
                         throw "Forage: Your save file is corrupted"
