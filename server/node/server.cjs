@@ -4858,16 +4858,15 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 app.post('/api/plugin-storage', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
-    // A backup import/restore rewrites the whole pluginStorage/ prefix inside a single
-    // transaction it holds OPEN across async stream reads. A write accepted during that
-    // window executes as a savepoint inside the import's transaction, gets ACKed, then is
-    // erased by the import's unconditional prefix clear before that transaction commits —
-    // a success the client can't keep. Refuse up front (fast path); re-checked below,
-    // right before the store mutation, to close the check-then-import TOCTOU.
-    if (importInProgress) {
-        res.status(503).json({ error: 'plugin-storage write rejected: a backup import/restore is in progress — retry after it completes' });
-        return;
-    }
+    // NOTE: there is deliberately NO `importInProgress` guard here (there used to be a
+    // two-point one — commit 8721f577 "2f"). It was needed only because the backup importer
+    // held a transaction OPEN across async stream reads, so a pcs write accepted mid-import
+    // joined that transaction and was erased when it committed/rolled back. The importer now
+    // flushes in per-batch SYNCHRONOUS transactions (importBackupFromSource), never holding
+    // one across an `await`, so a pcs write during an import commits independently — it
+    // survives if the import fails, or is legitimately superseded when a successful restore
+    // rewrites the whole pluginStorage/ prefix. That matches how /api/write treats
+    // database.bin during an import (no guard), so pcs is no longer stricter than the DB.
     try {
         await queueStorageOperation(async () => {
             let body;
@@ -4895,15 +4894,6 @@ app.post('/api/plugin-storage', async (req, res, next) => {
             let payload;
             try { payload = JSON.parse(body.json); }
             catch { return res.status(400).json({ error: 'plugin-storage json is not valid JSON' }); }
-            // TOCTOU re-check: an import may have started (and opened its transaction)
-            // after the handler-entry check, while we awaited/decoded the payload above.
-            // From HERE to the store mutation there is NO await — the mutators are
-            // synchronous — so if the flag is clear now, this write commits before any
-            // import BEGIN can open (that needs the next tick); if it is set, refuse rather
-            // than write into (and be erased by) the import's open transaction.
-            if (importInProgress) {
-                return res.status(503).json({ error: 'plugin-storage write rejected: a backup import/restore is in progress — retry after it completes' });
-            }
             try {
                 if (t === 'delta') {
                     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {

@@ -112,6 +112,7 @@ const psPost = (env: any) => fetch(`${BASE}/api/plugin-storage`, {
     method: 'POST', headers: authHeaders({ 'content-type': 'application/octet-stream' }), body: enc(env),
 }).then((r) => r.status)
 const replacePerKey = (values: Record<string, any>) => psPost({ type: 'replace', json: JSON.stringify(values) })
+const psDelta = (changed: Record<string, any>, removed: string[] = []) => psPost({ type: 'delta', json: JSON.stringify({ changed, removed }) })
 async function getPerKey(): Promise<Record<string, any>> {
     const r = await fetch(`${BASE}/api/plugin-storage`, { headers: authHeaders() })
     if (r.status === 404) return {}
@@ -224,6 +225,30 @@ describe('backup import — transaction isolation (real server)', () => {
         // rolled back with the import and this reads 'before' (silent loss) → test FAILS
         // pre-refactor. After stage->sync-apply the write commits independently → 'after'.
         expect(await readCanary()).toBe('after')
+    }, 30000)
+
+    // The pcs write-during-import guard ("2f", commit 8721f577) was removed once the
+    // importer stopped holding a tx across the stream. This pins the post-removal contract:
+    // a pcs write during an import is ACCEPTED (not 503-rejected) and TRUTHFUL — if the
+    // import fails it survives (commits independently), never ACK-then-erased. Mirrors the
+    // database.bin CONCURRENCY test; proves pcs is no longer stricter than the DB.
+    it('CONCURRENCY(pcs): a plugin-storage write ACKed during a failing import survives', async () => {
+        await replacePerKey({ p: 'before' }) // initialize the store (a legacy store rejects deltas)
+        expect((await getPerKey()).p).toBe('before')
+
+        const { req, done } = openStreamingImport()
+        req.write(encodeBackupEntry('some-asset', Buffer.from('asset-bytes')))
+        await delay(300) // import parks mid-stream
+
+        // Guard removed → accepted (200), not 503. Under the old guard this was rejected.
+        expect(await psDelta({ p: 'DURING' }, [])).toBe(200)
+
+        req.end() // no database.risudat → import fails (applyFinal, which clears pcs, never runs)
+        const result = await done
+        expect(result.status).not.toBe(200)
+
+        // Truthful: the pcs write committed independently and survives the import's failure.
+        expect((await getPerKey()).p).toBe('DURING')
     }, 30000)
 
     it('ATOMICITY: a failed import leaves the prior database.bin + pcs fully intact', async () => {
