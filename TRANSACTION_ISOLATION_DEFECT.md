@@ -3,7 +3,11 @@
 **Status:** identified, NOT fixed. Deferred to its own session (this is app-wide core
 infrastructure, orthogonal to the pluginCustomStorage SSOT work that produced this note).
 **Date:** 2026-07-16
-**Chosen fix direction:** Option **B** (stage → single synchronous apply). See below.
+**Chosen fix direction:** never hold a tx open across async I/O — **per-batch SYNCHRONOUS
+flush** using the existing chunk-aware `kvSet`. See below (§3) and
+[TRANSACTION_ISOLATION_FIX_PLAN.md](TRANSACTION_ISOLATION_FIX_PLAN.md) §1a/§2 for the
+executable plan. (An earlier draft said "stage → single synchronous apply"; that was dropped
+— a raw staging table reintroduces the BLOB bind limit `chunkStore` removes. §3 updated.)
 **Flag state:** the pluginCustomStorage write-enable flag is independent of this; this
 defect predates the per-key store and affects `database.bin`, chats, characters, assets,
 and pluginStorage identically.
@@ -92,28 +96,33 @@ All of these are **core data** (not plugin-specific):
 
 ---
 
-## 3. Chosen fix — Option B (root: remove the mechanism)
+## 3. Chosen fix — per-batch SYNCHRONOUS flush (root: remove the mechanism)
 
 Restructure `importBackupFromSource` (and audit any other tx-across-async) to **never hold
 a transaction open across async I/O**:
 
-1. **Stream phase (NO open transaction).** Do not `BEGIN` before the stream. Accumulate the
-   streamed KV entries into a **staging** structure — a temp table
-   (`CREATE TEMP TABLE import_staging(key, value)`, written in short synchronous batches) or
-   temp files. (Inlay files already use a staging dir + atomic rename at the end — extend
-   that pattern to KV entries.) Remove the connection-global `synchronous = OFF` from this
-   phase.
-2. **Apply phase (single synchronous transaction, NO `await` inside).**
-   `sqliteDb.transaction(() => { clear prefixes; copy staging → live; pluginStorage clear +
-   reconcile; })()`. Being synchronous, it never yields the event loop, so no concurrent
-   write can join it.
-3. Inlay dir swap + cold-storage migration + WAL checkpoint stay after the transaction, as
-   today.
+1. **Stream phase (NO transaction open across an `await`).** Do not `BEGIN` before the
+   stream. Buffer the streamed KV entries in memory and flush each batch inside ONE
+   synchronous `sqliteDb.transaction(recs => { for (r) kvSet(r.key, r.value) })` — using the
+   EXISTING chunk-aware `kvSet` so `database.bin` still chunks (a raw staging table would
+   reintroduce the BLOB bind limit — see FIX_PLAN §1a). Between flushes NO transaction is
+   open, so a concurrent write commits independently. Remove the connection-global
+   `synchronous = OFF`. The FIRST flush also runs the prefix clears + `clearEntities` before
+   its writes, so clear+first-writes land atomically.
+2. **Final apply (one synchronous transaction, NO `await` inside).** Flush the remaining
+   batch and `pluginStorage` clear + `reconcileReplace` in one synchronous transaction.
+   Being synchronous, it never yields the event loop, so no concurrent write can join it.
+3. Inlay dir swap + cold-storage migration + WAL checkpoint stay after the apply, as today.
+
+**Atomicity is a NON-GOAL** (the prior code already committed every `BATCH_SIZE`): a crash
+between flushes leaves a partial import, exactly as before. The defect being fixed is
+interleaving + durability, not atomicity. Whole-import atomicity would need chunk-aware
+staging (out of scope — FIX_PLAN §2.3).
 
 Effect: the interleaving mechanism disappears for **all** namespaces at once; the global
-pragma toggle is gone; broken structures 1, 2, 4, 5 dissolve. Endpoint-level
-`importInProgress` guards, the pluginStorage-specific import guard (see §4), and a client
-503 lifecycle-conflict path become unnecessary.
+pragma toggle is gone; broken structures 1, 2, 5 dissolve (4 = atomicity is an accepted
+non-goal). Endpoint-level `importInProgress` guards and the pluginStorage-specific import
+guard (see §4) become unnecessary.
 
 Cost/risk: backup import is complex and critical (streaming, batching, inlay staging, cold
 storage). **Wrap it in regression/e2e tests that pin current import behavior FIRST**, then
@@ -148,11 +157,11 @@ pcs-specific data-loss classes were closed and independently verified.
 
 ## 5. Quick checklist for the fix session
 
-- [ ] Add regression/e2e tests pinning current backup import + server-restore behavior
-      (round-trip a backup; assert all namespaces restored; assert a concurrent write is
-      not silently swallowed).
-- [ ] Restructure `importBackupFromSource`: stage (no tx) → single synchronous apply.
-- [ ] Remove connection-global `synchronous = OFF`; if needed, scope it to the sync apply.
+- [x] Add regression/e2e tests pinning current backup import behavior
+      (`src/ts/storage/backupImportIsolation.integration.test.ts`: round-trip; atomicity;
+      concurrent write ACKed 200 not erased by rollback — proven RED pre-fix, GREEN post-fix).
+- [x] Restructure `importBackupFromSource`: per-batch SYNCHRONOUS flush (no tx across `await`).
+- [x] Remove connection-global `synchronous = OFF` (each flush runs at NORMAL, durable).
 - [ ] Audit debounced timer writes (`saveTimers`) and `/api/remove` for consistency with
       the new model.
 - [ ] Re-check every `sqliteDb.transaction()` site is only ever entered outside an import.
