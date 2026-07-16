@@ -37,6 +37,38 @@ export interface PatchItemResult {
     chatGuardRejected?: boolean
 }
 
+// A key is codec-safe iff it survives the msgpack save codec UNCHANGED. The codec
+// rewrites "__proto__" and replaces lone surrogates with U+FFFD — either silently
+// collapses a map key on the wire. Reject fail-closed rather than send a payload the
+// server would decode into a shorter map (and then delete the "vanished" row).
+function isCodecSafeStorageKey(k: string): boolean {
+    if (typeof k !== 'string') return false
+    if (k === '__proto__') return false
+    if (typeof (k as any).isWellFormed === 'function') return (k as any).isWellFormed()
+    return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(k)
+}
+
+// Build a CANONICAL snapshot of an untrusted map in ONE enumeration, BEFORE encoding:
+// a plain object with only enumerable string DATA keys, all codec-safe; copy each
+// descriptor value once into a fresh null-proto object. Encoding then uses ONLY this
+// snapshot — never the original — so a stateful Proxy (different keys on a second
+// enumeration), a Map/typed object (serializes to {}), or a codec-unsafe key cannot
+// slip through and produce a destructive shorter/empty replace.
+function canonicalStorageMap(x: any, label: string): Record<string, any> {
+    if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error(`${label}: values must be a plain string-keyed object map`)
+    const proto = Object.getPrototypeOf(x)
+    if (proto !== Object.prototype && proto !== null) throw new Error(`${label}: values must be a plain string-keyed object map`)
+    const out: Record<string, any> = Object.create(null)
+    for (const k of Reflect.ownKeys(x)) {
+        if (typeof k !== 'string') throw new Error(`${label}: non-string key`)
+        const d = Object.getOwnPropertyDescriptor(x, k)
+        if (!d || !d.enumerable || !('value' in d)) throw new Error(`${label}: key is not an enumerable data property`)
+        if (!isCodecSafeStorageKey(k)) throw new Error(`${label}: key "${k}" is codec-unsafe (__proto__ or lone surrogate)`)
+        out[k] = d.value
+    }
+    return out
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -659,7 +691,14 @@ export class NodeStorage{
 
     // Send ONLY changed/removed keys — the concurrency-safe steady-state path.
     async savePluginStorageDelta(delta: { changed: Record<string, any>; removed: string[] }): Promise<void> {
-        const encoded = encodeRisuSaveLegacy({ type: 'delta', changed: delta.changed ?? {}, removed: delta.removed ?? [] })
+        // canonicalize the changed map + validate removed keys BEFORE encoding, so a
+        // Proxy/typed/codec-unsafe key can never reach the wire and collapse the map.
+        const changed = canonicalStorageMap(delta?.changed ?? {}, 'savePluginStorageDelta')
+        const removed = Array.isArray(delta?.removed) ? delta.removed : []
+        for (const k of removed) {
+            if (!isCodecSafeStorageKey(k)) throw new Error(`savePluginStorageDelta: removed key "${k}" is codec-unsafe`)
+        }
+        const encoded = encodeRisuSaveLegacy({ type: 'delta', changed, removed })
         const da = await this.authFetch('/api/plugin-storage', {
             method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
         })
@@ -669,7 +708,12 @@ export class NodeStorage{
     // Replace the whole map (write EVERY given key, delete stale). Used to seed /
     // reconcile, not the hot path (concurrent full replaces still last-write-wins).
     async savePluginStorageReplace(values: Record<string, any>): Promise<void> {
-        const encoded = encodeRisuSaveLegacy({ type: 'replace', values: values ?? {} })
+        // canonicalize BEFORE encoding: a full replace of {} WIPES the store, and the
+        // codec erases the type of a Map/typed object to a plain {} (server can't tell
+        // it from a legit empty map), so the client is the only place that can catch a
+        // Map/Proxy/typed/codec-unsafe payload. Encode ONLY the snapshot.
+        const snapshot = canonicalStorageMap(values, 'savePluginStorageReplace')
+        const encoded = encodeRisuSaveLegacy({ type: 'replace', values: snapshot })
         const da = await this.authFetch('/api/plugin-storage', {
             method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
         })
