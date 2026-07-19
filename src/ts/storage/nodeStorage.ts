@@ -37,6 +37,28 @@ export interface PatchItemResult {
     chatGuardRejected?: boolean
 }
 
+// pluginCustomStorage is arbitrary-key JSON data, sent to the server as a JSON STRING
+// (never msgpack object keys) — lossless for keys/values at any depth. Snapshot the
+// live map in ONE enumeration into a fresh null-proto object and JSON.stringify THAT
+// (never the original), so a stateful Proxy can't differ between validation and
+// serialization. Reject a non-plain-object (Map/Date/typed/array/primitive → would
+// coerce to {} and wipe on a full replace) and symbol/non-enumerable/accessor keys
+// (they drop through JSON and could silently shrink the map). No codec-safe-key check
+// is needed — JSON handles keys losslessly.
+function canonicalStorageMap(x: any, label: string): Record<string, any> {
+    if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error(`${label}: values must be a plain object map`)
+    const proto = Object.getPrototypeOf(x)
+    if (proto !== Object.prototype && proto !== null) throw new Error(`${label}: values must be a plain object map`)
+    const out: Record<string, any> = Object.create(null)
+    for (const k of Reflect.ownKeys(x)) {
+        if (typeof k !== 'string') throw new Error(`${label}: symbol key not allowed`)
+        const d = Object.getOwnPropertyDescriptor(x, k)
+        if (!d || !d.enumerable || !('value' in d)) throw new Error(`${label}: key "${k}" is not an enumerable data property`)
+        out[k] = d.value
+    }
+    return out
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -649,6 +671,80 @@ export class NodeStorage{
             body: encoded,
         })
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+    }
+
+    // ── pluginCustomStorage per-key sidecar (b3) ────────────────────────────────
+    // Writes use a discriminated envelope so a plugin key named "changed"/"removed"/
+    // "values" can never be mis-parsed. Delta = only the keys this save touched
+    // (concurrency-safe: per-key on the server); replace = the whole map (seed /
+    // reconcile). GET returns the full reassembled map for load-time hydration.
+
+    // Send ONLY changed/removed keys — the concurrency-safe steady-state path. The
+    // data travels as a JSON string in the envelope (never msgpack object keys), so
+    // JSON.stringify is a single read of the live changed map and is lossless for its
+    // keys/values at any depth.
+    async savePluginStorageDelta(delta: { changed: Record<string, any>; removed: string[] }): Promise<void> {
+        const changed = canonicalStorageMap(delta?.changed ?? {}, 'savePluginStorageDelta')
+        const removed: string[] = []
+        const rawRemoved = delta?.removed
+        if (rawRemoved !== undefined && rawRemoved !== null) {
+            if (!Array.isArray(rawRemoved)) throw new Error('savePluginStorageDelta: removed must be an array')
+            for (const k of rawRemoved) {
+                if (typeof k !== 'string') throw new Error(`savePluginStorageDelta: removed key "${String(k)}" must be a string`)
+                removed.push(k)
+            }
+        }
+        const encoded = encodeRisuSaveLegacy({ type: 'delta', json: JSON.stringify({ changed, removed }) })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
+        })
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageDelta error: ${da.status}`)
+    }
+
+    // Replace the whole map (write EVERY given key, delete stale). Used to seed /
+    // reconcile, not the hot path (concurrent full replaces still last-write-wins). The
+    // map travels as a JSON string; JSON.stringify is the single read of `values` (no
+    // TOCTOU) and a Map/typed/array/primitive is rejected first (would wipe the store).
+    async savePluginStorageReplace(values: Record<string, any>): Promise<void> {
+        const snapshot = canonicalStorageMap(values, 'savePluginStorageReplace')
+        const encoded = encodeRisuSaveLegacy({ type: 'replace', json: JSON.stringify(snapshot) })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
+        })
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageReplace error: ${da.status}`)
+    }
+
+    // Legacy→initialized migration CAS. 'initialized' = we won (200, store now holds `values`);
+    // 'already' = the store was already initialized (409) — a racing device won or our own
+    // earlier init committed but its response was lost, so the caller fetches the authoritative
+    // map instead of overwriting. Any other non-2xx / network error throws (indeterminate →
+    // the caller retries idempotently or blocks boot). This is the ONLY idempotent write in the
+    // boot path; the store's initializeFromMap is the atomic CAS on the mode sentinel.
+    async savePluginStorageInitialize(values: Record<string, any>): Promise<'initialized' | 'already'> {
+        const snapshot = canonicalStorageMap(values, 'savePluginStorageInitialize')
+        const encoded = encodeRisuSaveLegacy({ type: 'initialize', json: JSON.stringify(snapshot) })
+        const da = await this.authFetch('/api/plugin-storage', {
+            method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encoded,
+        })
+        if (da.status === 409) return 'already'
+        if (da.status < 200 || da.status >= 300) throw new Error(`savePluginStorageInitialize error: ${da.status}`)
+        return 'initialized'
+    }
+
+    async fetchPluginStorageSidecar(): Promise<any | null> {
+        const da = await this.authFetch('/api/plugin-storage')
+        if (da.status === 404) return null                                   // legacy — no rows
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchPluginStorageSidecar error: ${da.status}`) // 500/etc → fail closed
+        // GET returns the map as a JSON string (lossless for nested keys). A 2xx is
+        // INITIALIZED and MUST carry a pluginCustomStorage object (even {}); a malformed body
+        // must THROW (fail closed), NOT map to null — that would be read as legacy(404) and
+        // resurrect stale inline over the authoritative store.
+        const decoded = JSON.parse(await da.text())
+        const pcs = decoded && typeof decoded === 'object' ? decoded.pluginCustomStorage : undefined
+        if (!pcs || typeof pcs !== 'object' || Array.isArray(pcs)) {
+            throw new Error('fetchPluginStorageSidecar: malformed 200 response (missing pluginCustomStorage object)')
+        }
+        return pcs
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────

@@ -15,6 +15,8 @@ import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEnc
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
+import { isPluginStorageSidecarWriteEnabled } from "./storage/pluginStorageSidecar";
+import { seedPluginStorageBaseline, computePluginStorageDelta, advancePluginStorageBaseline, pluginStorageDeltaIsEmpty, type PluginStorageBaseline } from "./storage/pluginStorageDelta";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -43,6 +45,23 @@ interface fetchLog {
 }
 
 let fetchLog: fetchLog[] = []
+
+// Per-key fingerprint baseline for the pluginCustomStorage sidecar sync (b3/C3).
+// Tracks what the server's per-key store already has, so each save sends only the
+// keys it changed. Re-seeded whenever pluginCustomStorage is (re)established from
+// the server: load/hydrate, full-write re-init, and 409 rebase. A fingerprint map
+// (key -> hash), never a resident copy of the values.
+let pluginStorageSyncBaseline: PluginStorageBaseline = new Map()
+export function resyncPluginStorageBaseline(map: Record<string, any> | null | undefined): void {
+    pluginStorageSyncBaseline = seedPluginStorageBaseline(map)
+}
+// One-time migration flag: a pre-b3 DB carries pluginCustomStorage INLINE in
+// database.bin. A patch can't remove it (the b3 patcher just excludes pcs), so the
+// first save must be a FULL WRITE — the encoder omits pcs, replacing the server DB
+// without the inline block. bootstrap sets this when it loads a legacy inline DB;
+// the save's delta populates the per-key store first (value-before-strip).
+let pluginStorageMigrateFullWrite = false
+export function markPluginStorageMigration(): void { pluginStorageMigrateFullWrite = true }
 
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
     if (typeof (dat) === 'string') {
@@ -733,7 +752,15 @@ export async function saveDb() {
             if (toSave.modules) {
                 mergedDb.modules = safeStructuredClone(localDb.modules)
             }
-            if (toSave.pluginCustomStorage) {
+            if (toSave.pluginCustomStorage && isPluginStorageSidecarWriteEnabled()) {
+                // b3: pcs is out-of-band per-key — it never rode database.bin, so this
+                // database.bin conflict has NOTHING to do with it. Its values were
+                // already synced per-key (the delta POST runs before the write that
+                // 409'd, and per-key writes don't clobber across keys). Just PRESERVE
+                // the local in-memory map (what plugins are using); the retry save
+                // re-sends any pending delta. No fetch, no marker, no merge.
+                ;(mergedDb as any).pluginCustomStorage = safeStructuredClone(localDb.pluginCustomStorage ?? {})
+            } else if (toSave.pluginCustomStorage) {
                 const serverPS = (mergedDb.pluginCustomStorage ?? {}) as Record<string, any>
                 const localPS = (localDb.pluginCustomStorage ?? {}) as Record<string, any>
                 if (pluginStorageBaseline) {
@@ -814,6 +841,9 @@ export async function saveDb() {
             skipBroadcast?: boolean
         }
     ): Promise<'saved' | 'retry' | 'noop'> {
+        // A pending pcs migration forces a full write (only way to strip a legacy
+        // inline pluginCustomStorage block from the server DB).
+        const forceFullWrite = !!(options?.forceFullWrite || pluginStorageMigrateFullWrite)
         if (gotChannel) {
             // Data is saved in another tab.
             await sleep(1000)
@@ -850,6 +880,32 @@ export async function saveDb() {
             throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
         }
 
+        // ── pluginCustomStorage per-key sidecar (new layout only; flag OFF default) ──
+        // Send the changed keys BEFORE encoding/writing database.bin, so the values
+        // are durable before the marker DB that references them. Only the keys this
+        // save touched travel (a delta vs the per-key fingerprint baseline), so two
+        // tabs editing DIFFERENT keys never clobber. If the send fails, throw —
+        // never persist a marker DB whose values didn't land (fail-closed / lost
+        // memory). Advance the baseline only after the server acked, so a retry
+        // re-sends the same delta idempotently. Inert while the flag is off.
+        if (isPluginStorageSidecarWriteEnabled() && toSave.pluginCustomStorage) {
+            const delta = computePluginStorageDelta(db.pluginCustomStorage as any, pluginStorageSyncBaseline)
+            if (!pluginStorageDeltaIsEmpty(delta)) {
+                try {
+                    // pcs is out-of-band per-key (not in database.bin). Send the
+                    // changed values AND the removed keys: with no directory marker,
+                    // the per-key store is the sole source of truth, so a removal must
+                    // actually delete the entry (else it would reappear on the next
+                    // full read). No marker means no dangling-marker / fail-closed
+                    // hazard from an interrupted delete.
+                    await forageStorage.realStorage.savePluginStorageDelta({ changed: delta.changed, removed: delta.removed })
+                } catch (e) {
+                    throw new Error(`Failed to save pluginCustomStorage delta (aborting save to avoid losing plugin memory): ${e}`)
+                }
+                advancePluginStorageBaseline(pluginStorageSyncBaseline, delta)
+            }
+        }
+
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
         await encoder.set(db, safeStructuredClone(toSave))
         const encoded = encoder.encode()
@@ -869,7 +925,7 @@ export async function saveDb() {
             ? safeStructuredClone(patcher.getSyncedRootKey('pluginCustomStorage') ?? {})
             : null
 
-        if (supportsPatchSync && !options?.forceFullWrite) {
+        if (supportsPatchSync && !forceFullWrite) {
             const patchData = await patcher.set(db, safeStructuredClone(toSave))
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
@@ -1047,10 +1103,21 @@ export async function saveDb() {
                     console.error('[Save] Server rejected patch — chat-internal field ops detected server-side')
                     showChatGuardToastThrottled('server')
                 }
+                // PURE hash/etag conflict (a concurrent tab moved the DB on): REBASE
+                // now. Do NOT fall through to the full write below — patchItem already
+                // advanced the cached etag to the server's, so a full write would
+                // SUCCEED and clobber the concurrent change (e.g. drop a key another
+                // tab just added from the authoritative marker). Rebase merges instead.
+                else if (!saved && patchResult.etag) {
+                    console.warn('[Save] Patch hash/etag conflict — rebasing on latest server DB (no stale full-write)')
+                    await rebaseTrackedLocalChangesOnLatestServerDb(patchResult.etag ?? null, db, toSave, pluginStorageBaseline)
+                    await sleep(Math.min(500 * (savetrys + 1), 3000))
+                    return 'retry'
+                }
             }
         }
         if (!saved) {
-            if (supportsPatchSync && !options?.forceFullWrite) {
+            if (supportsPatchSync && !forceFullWrite) {
                 console.warn('[Save] Patch conflict, falling through to full write...')
             }
             try {
@@ -1072,6 +1139,9 @@ export async function saveDb() {
                 const decodedDb = await decodeRisuSave(dbData)
                 await patcher.init(decodedDb)
             }
+            // A pcs migration full-write just stripped the legacy inline block from
+            // the server DB; the per-key store was populated by the delta above.
+            pluginStorageMigrateFullWrite = false
         }
 
         updateKnownChatsAfterSuccessfulSave(db, toSave)
@@ -1093,7 +1163,11 @@ export async function saveDb() {
         }
 
         const toSave = takeTrackedChanges()
-        if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
+        // A pending pcs migration MUST produce a save even with no ordinary tracked change:
+        // it is the only thing that strips the legacy inline block from the server DB (a full
+        // write). Without this, an idle post-migration session never strips it and the store
+        // stays ambiguous (initialized rows + a dangling inline field).
+        if (!hasTrackedChanges(toSave) && !options?.forceFullWrite && !pluginStorageMigrateFullWrite) {
             return
         }
 
@@ -1138,7 +1212,10 @@ export async function saveDb() {
 
     let savetrys = 0
     while (true) {
-        if (!changed) {
+        // A pending pcs migration must drive a save even in an otherwise-idle session, so it
+        // is picked up here alongside ordinary changes — it is the only thing that strips the
+        // legacy inline block from the server DB (triggerSave → forceFullWrite via the flag).
+        if (!changed && !pluginStorageMigrateFullWrite) {
             await sleep(200)
             continue
         }

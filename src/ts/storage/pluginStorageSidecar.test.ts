@@ -1,4 +1,4 @@
-import { describe, test, expect, vi } from 'vitest'
+import { describe, test, it, expect, vi, afterEach } from 'vitest'
 
 // B step 1+2 — pluginCustomStorage sidecar SAFETY + inert dual-read wiring.
 // Proves, before any writer produces the new layout: (1) moving pluginCustomStorage
@@ -10,11 +10,14 @@ vi.mock('./database.svelte', () => ({}))
 vi.mock('./chatStorage', () => ({ chatToStub: (c: any) => c }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
-const { encodeRisuSaveLegacy, decodeRisuSave } = await import('./risuSave')
+const { encodeRisuSaveLegacy, decodeRisuSave, RisuSaveEncoder } = await import('./risuSave')
 const {
     resolvePluginCustomStorage,
+    resolvePluginCustomStorageByDirectory,
     hydratePluginCustomStorage,
     PLUGIN_STORAGE_SIDECAR_MARKER,
+    isPluginStorageSidecarWriteEnabled,
+    setPluginStorageSidecarWriteEnabled,
 } = await import('./pluginStorageSidecar')
 
 function makePluginStorage(): Record<string, string> {
@@ -81,6 +84,40 @@ describe('resolvePluginCustomStorage — directory-marker-aware contract', () =>
     })
 })
 
+describe('RisuSaveEncoder write-enable flag (B inc 3d-i) — default OFF is byte-identical', () => {
+    const makeDb = (): any => ({
+        formatversion: 4, characters: [], botPresets: [{ id: 'p', name: 'preset' }],
+        modules: [], plugins: [], pluginCustomStorage: makePluginStorage(),
+    })
+
+    afterEach(() => setPluginStorageSidecarWriteEnabled(false))
+
+    it('flag defaults OFF', () => {
+        expect(isPluginStorageSidecarWriteEnabled()).toBe(false)
+    })
+
+    it('flag OFF: encode→decode embeds pluginCustomStorage inline, NO marker (today’s layout)', async () => {
+        const db = makeDb()
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        expect(JSON.stringify(back.pluginCustomStorage)).toBe(JSON.stringify(db.pluginCustomStorage))
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
+    })
+
+    it('flag ON: encode writes NO pluginStorage block — pcs is fully out-of-band', async () => {
+        const db = makeDb()
+        setPluginStorageSidecarWriteEnabled(true)
+        const enc = new RisuSaveEncoder()
+        await enc.init(clone(db))
+        const back = await decodeRisuSave(new Uint8Array(enc.encode()!))
+        // neither inline pluginCustomStorage nor any directory marker rides database.bin;
+        // the values live per-key on the server and load via the /api/plugin-storage GET.
+        expect(back.pluginCustomStorage).toBeUndefined()
+        expect(PLUGIN_STORAGE_SIDECAR_MARKER in back).toBe(false)
+    })
+})
+
 describe('hydratePluginCustomStorage — inert today (pass-through), armed for the new layout', () => {
     test('legacy DB (no marker): pass-through, pluginCustomStorage identical, no marker introduced', async () => {
         const db = makeDb()
@@ -101,7 +138,41 @@ describe('hydratePluginCustomStorage — inert today (pass-through), armed for t
         // Proves the dormant new-layout branch is SAFE: if a marker ever appears
         // before increment 3 wires the real loader, boot refuses rather than
         // silently dropping plugin memory.
-        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { keys: ['k1'] } }
+        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { version: 2, keys: ['k1'] } }
         await expect(hydratePluginCustomStorage(db)).rejects.toThrow(/fail closed/i)
+    })
+})
+
+// B2: the marker's key list is the authoritative allowlist on read.
+describe('resolvePluginCustomStorageByDirectory — marker is the allowlist (B2)', () => {
+    it('returns EXACTLY the marker keys, dropping orphans in the fetched payload', () => {
+        const dir = { version: 2, keys: ['a', 'b'] }
+        const out = resolvePluginCustomStorageByDirectory(dir, { a: '1', b: '2', orphan_deleted: 'ghost' })
+        expect(out).toEqual({ a: '1', b: '2' })
+        expect('orphan_deleted' in out).toBe(false) // a marker-only-deleted key does NOT resurrect
+    })
+
+    it('FAILS CLOSED when a listed key is missing from the fetched payload', () => {
+        const dir = { version: 2, keys: ['a', 'b'] }
+        expect(() => resolvePluginCustomStorageByDirectory(dir, { a: '1' })).toThrow(/fail closed|missing/i)
+        expect(() => resolvePluginCustomStorageByDirectory(dir, null)).toThrow(/fail closed|missing/i)
+    })
+
+    it('empty marker → {} without needing any payload (no 404-on-empty)', () => {
+        expect(resolvePluginCustomStorageByDirectory({ version: 2, keys: [] }, null)).toEqual({})
+    })
+
+    it('malformed / wrong-version marker → fail closed', () => {
+        expect(() => resolvePluginCustomStorageByDirectory({ keys: ['a'] }, { a: '1' })).toThrow(/fail closed|version/i)
+        expect(() => resolvePluginCustomStorageByDirectory({ version: 1, keys: ['a'] }, { a: '1' })).toThrow(/fail closed|version/i)
+        expect(() => resolvePluginCustomStorageByDirectory(null, {})).toThrow(/fail closed|malformed/i)
+    })
+
+    it('hydrate drops orphans: a marker-only delete stays deleted on reload', async () => {
+        // marker lists only [keep]; the server payload still has the deleted orphan.
+        const db: any = { characters: [], [PLUGIN_STORAGE_SIDECAR_MARKER]: { version: 2, keys: ['keep'] } }
+        await hydratePluginCustomStorage(db, async () => ({ keep: 'v', deleted_orphan: 'ghost' }))
+        expect(db.pluginCustomStorage).toEqual({ keep: 'v' })
+        expect('deleted_orphan' in db.pluginCustomStorage).toBe(false)
     })
 })

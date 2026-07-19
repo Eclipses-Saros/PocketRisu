@@ -11,7 +11,8 @@ import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } fr
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
-import { hydratePluginCustomStorage } from "./storage/pluginStorageSidecar";
+import { setPluginStorageSidecarWriteEnabled, isPluginStorageSidecarWriteEnabled, planPcsBoot } from "./storage/pluginStorageSidecar";
+import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -24,6 +25,8 @@ import {
     forageStorage,
     saveDb,
     setPatchSyncBaseline,
+    resyncPluginStorageBaseline,
+    markPluginStorageMigration,
     getDbBackups,
     getUncleanables,
     getBasename,
@@ -36,11 +39,81 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
 /**
  * Loads the application data.
  */
+// Load pluginCustomStorage for a freshly decoded DB, reconciling the ACCOUNT-WIDE
+// server mode with this device's per-device opt-in.
+//
+// The server mode is authoritative and account-wide, so we ALWAYS probe it (even when
+// this device isn't opted in): once ANY device migrates the account out-of-band, every
+// device must read/write the sidecar or it would diverge from an empty inline block.
+// The GET is DISCRIMINATED and consumed as such — never collapsed to "empty":
+//   fetch() === null  → legacy (404): no per-key rows; inline in database.bin is authority.
+//   fetch() === object → initialized (200, even {}): the per-key store is authority.
+//   fetch() throws     → error (500/network): FAIL CLOSED — mode unknown, so send nothing
+//                        (never wipe the server rows) and use the decoded inline this session.
+async function loadPluginStorageInto(decodedDb: any): Promise<void> {
+    // The out-of-band pcs store is a patch-sync (server) feature. On non-server platforms
+    // there is no /api/plugin-storage endpoint, so pcs stays inline (legacy) — do not probe.
+    if (!supportsPatchSync) {
+        resyncPluginStorageBaseline(decodedDb?.pluginCustomStorage)
+        return
+    }
+    try {
+        // Whether the decoded DB carries a pcs field at all (drives the inline-strip migration —
+        // keyed on PRESENCE so an empty {} inline field is still stripped, not left dangling).
+        const inlineFieldPresent = !!decodedDb && typeof decodedDb === 'object' && Object.hasOwn(decodedDb, 'pluginCustomStorage')
+        const rawInline = inlineFieldPresent ? (decodedDb as any).pluginCustomStorage : undefined
+        // Only null/undefined normalize to {} (legitimately empty). A NON-plain legacy pcs
+        // (array / string / number / Map / instance) must NOT be silently coerced to {} — that
+        // would migrate an empty map over real data (a wipe). Fail closed.
+        let inlineObj: Record<string, any>
+        if (rawInline === null || rawInline === undefined) {
+            inlineObj = {}
+        } else if (typeof rawInline === 'object' && !Array.isArray(rawInline) &&
+                   (Object.getPrototypeOf(rawInline) === Object.prototype || Object.getPrototypeOf(rawInline) === null)) {
+            inlineObj = rawInline
+        } else {
+            throw new Error('[pluginStorage] legacy pluginCustomStorage is not a plain object — refusing to migrate (fail closed, no wipe)')
+        }
+
+        // planPcsBoot is the pure, unit-tested decision (404 / 200 {} / 500 / migrate). A probe
+        // failure THROWS out of here to BLOCK boot (fail closed — never boot into an initialized
+        // account read as empty). This is the thin applier of its plan.
+        const plan = await planPcsBoot({
+            localOptIn: isPluginStorageSidecarWriteEnabled(),
+            inlineObj,
+            inlineFieldPresent,
+            fetchSidecar: () => forageStorage.realStorage.fetchPluginStorageSidecar(),
+            initializeSidecar: (m) => forageStorage.realStorage.savePluginStorageInitialize(m),
+        })
+        if (plan.warn) console.error('[pluginStorage]', plan.warn)
+        setPluginStorageSidecarWriteEnabled(plan.enableSidecar)
+        if (plan.pcs !== null) decodedDb.pluginCustomStorage = plan.pcs
+        resyncPluginStorageBaseline(plan.baseline)
+        if (plan.markMigration) markPluginStorageMigration()
+    } catch (e: any) {
+        // A pcs mode/probe/validation failure is NOT save-file corruption. Tag it so the
+        // DB-decode backup-recovery path RE-THROWS (blocks boot + retry) instead of recovering
+        // an OLDER backup — recovering could migrate stale data over the current DB (R17).
+        if (e && typeof e === 'object') e.isPluginStorageBootError = true
+        throw e
+    }
+}
+
 export async function loadData() {
     const loaded = get(loadedStore)
     if (!loaded) {
         try {
             applyEarlyLanguage()
+            // Opt-in per-device enable for the pluginCustomStorage per-key sidecar
+            // (b3). Shipped default is OFF (byte-identical to today). Set
+            // localStorage 'pocketrisu_plugin_sidecar_write' = 'true' to turn it on
+            // for a real-app smoke without a rebuild; the coordinated default flip
+            // lands after that smoke passes. Inert unless the key is explicitly set.
+            try {
+                if (typeof localStorage !== 'undefined' && localStorage.getItem('pocketrisu_plugin_sidecar_write') === 'true') {
+                    setPluginStorageSidecarWriteEnabled(true)
+                }
+            } catch {}
             let createdFreshDatabase = false
             {
                 await forageStorage.Init()
@@ -55,11 +128,18 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
-                    await hydratePluginCustomStorage(decoded)
+                    // Real client loader (GET /api/plugin-storage) injected here so
+                    // pluginStorageSidecar.ts stays dependency-free (no import cycle
+                    // with globalApi). Inert while the write-enable flag is off (no
+                    // decoded DB carries the marker, so the loader is never invoked).
+                    await loadPluginStorageInto(decoded)
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
                 } catch (error) {
+                    // A pcs mode/probe/validation failure is NOT save-file corruption: block
+                    // boot (retry) rather than recovering an OLDER backup over the current DB.
+                    if ((error as any)?.isPluginStorageBootError) throw error
                     console.error(error)
                     const backups = await getDbBackups()
                     let backupLoaded = false
@@ -68,12 +148,15 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
-                            await hydratePluginCustomStorage(backupDecoded)
+                            await loadPluginStorageInto(backupDecoded)
                             setPatchSyncBaseline(safeStructuredClone(backupDecoded))
                             setDatabase(backupDecoded)
                             backupLoaded = true
                             break
-                        } catch (error) { }
+                        } catch (error) {
+                            // A pcs boot failure must not silently skip to an older backup either.
+                            if ((error as any)?.isPluginStorageBootError) throw error
+                        }
                     }
                     if (!backupLoaded) {
                         throw "Forage: Your save file is corrupted"

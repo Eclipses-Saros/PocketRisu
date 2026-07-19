@@ -480,6 +480,52 @@ function encodeRisuSaveLegacy(data, compression = 'noCompression') {
 // contract on purpose.
 const PLUGIN_STORAGE_SIDECAR_MARKER = 'pluginStorageSidecar';
 
+// Layout discriminator (mirror of the client's PLUGIN_STORAGE_LAYOUT_VERSION).
+// v2 = per-key store. A non-v2 marker is unrecognized → fail closed.
+const PLUGIN_STORAGE_LAYOUT_VERSION = 2;
+
+// Build the directory marker for a pluginCustomStorage map. Mirror of the client's
+// buildPluginStorageDirectory: values never go here, only the key list + version.
+function buildPluginStorageDirectory(pluginCustomStorage) {
+    // Keys SORTED for a deterministic marker — the client and server build it from
+    // independently-ordered maps and the array hash is order-sensitive (see the
+    // client mirror in pluginStorageSidecar.ts).
+    const keys = pluginCustomStorage && typeof pluginCustomStorage === 'object' ? Object.keys(pluginCustomStorage).sort() : [];
+    return { version: PLUGIN_STORAGE_LAYOUT_VERSION, keys };
+}
+
+// Validate a directory marker before any loader trusts it. Malformed marker
+// (missing/non-array keys, unrecognized version) FAILS CLOSED — never silently
+// "empty". Returns the validated key list.
+function validatePluginStorageDirectory(directory) {
+    if (!directory || typeof directory !== 'object') {
+        throw new Error('pluginCustomStorage directory marker malformed (not an object) — failing closed');
+    }
+    if (directory.version !== PLUGIN_STORAGE_LAYOUT_VERSION) {
+        throw new Error(`pluginCustomStorage directory marker version ${String(directory.version)} unrecognized (expected ${PLUGIN_STORAGE_LAYOUT_VERSION}) — failing closed`);
+    }
+    if (!Array.isArray(directory.keys) || !directory.keys.every((k) => typeof k === 'string')) {
+        throw new Error('pluginCustomStorage directory marker keys missing or not a string[] — failing closed');
+    }
+    return directory.keys;
+}
+
+// Strip inline pluginCustomStorage down to the directory marker, extracting the
+// values. This is the pcs analog of stripping chats to stubs: the marker rides
+// database.bin / dbCache (and is hashed), the values live per-key. Idempotent:
+// if the dbObj already carries the marker (already stripped), returns values=null.
+// Returns { db, values } where db is a shallow clone with the marker set and the
+// inline map removed. A dbObj with neither inline nor marker is returned unchanged.
+function stripPluginStorageToMarker(dbObj) {
+    if (!dbObj || typeof dbObj !== 'object') return { db: dbObj, values: null };
+    if (dbObj[PLUGIN_STORAGE_SIDECAR_MARKER]) return { db: dbObj, values: null }; // already marker form
+    if (!dbObj.pluginCustomStorage || typeof dbObj.pluginCustomStorage !== 'object') return { db: dbObj, values: null };
+    const values = dbObj.pluginCustomStorage;
+    const db = { ...dbObj, [PLUGIN_STORAGE_SIDECAR_MARKER]: buildPluginStorageDirectory(values) };
+    delete db.pluginCustomStorage;
+    return { db, values };
+}
+
 // Legacy (no directory): inline is authoritative, even when undefined — never
 // throws. New layout (directory present): the sidecar is authoritative and MUST
 // be present; a missing sidecar FAILS CLOSED rather than reporting empty.
@@ -638,7 +684,11 @@ module.exports = {
     loadPluginStorageSidecarServer,
     hydratePluginCustomStorageServer,
     assertPluginStorageResolved,
+    buildPluginStorageDirectory,
+    validatePluginStorageDirectory,
+    stripPluginStorageToMarker,
     PLUGIN_STORAGE_SIDECAR_MARKER,
+    PLUGIN_STORAGE_LAYOUT_VERSION,
 
     // Constants
     RisuSaveType,
